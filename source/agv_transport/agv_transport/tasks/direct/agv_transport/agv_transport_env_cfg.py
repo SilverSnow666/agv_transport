@@ -1,48 +1,141 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
+from __future__ import annotations
 
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
-
-from isaaclab.assets import ArticulationCfg
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
 
 
 @configclass
 class AgvTransportEnvCfg(DirectRLEnvCfg):
-    # env
+    """单 AGV 推箱子任务配置。
+
+    第一版简化假设：
+    - AGV 用一个可控方块表示；
+    - AGV 通过二维速度 [vx, vy] 在平面移动；
+    - payload 是一个动态刚体；
+    - 目标点固定在每个环境坐标系下的 x 正方向。
+    """
+    # Isaac Sim 自带 AGV / AMR 视觉模型
+    # 优先使用 Idealworks iwhub static，比较像工业 AGV
+    agv_visual_usd_path = f"{ISAAC_NUCLEUS_DIR}/Robots/Idealworks/iwhub/iw_hub_static.usd"
+
+    agv_visual_cfg = sim_utils.UsdFileCfg(
+        usd_path=agv_visual_usd_path,
+        scale=(0.65, 0.65, 0.65),
+    )
+
+    # 环境设置
     decimation = 2
-    episode_length_s = 5.0
-    # - spaces definition
-    action_space = 1
-    observation_space = 4
+    episode_length_s = 12.0
+
+    # 动作：差速 AGV 控制 [v, w]
+    # v: 线速度
+    # w: 角速度
+    action_space = 2
+
+    # 观测：
+    # agv_xy_rel, payload_xy_rel, target_xy_rel,
+    # agv_to_payload_xy, payload_to_target_xy,
+    # agv_heading_xy, agv_vel_xy, payload_vel_xy
+    # 维度 = 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 = 16
+    observation_space = 16
     state_space = 0
 
-    # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    # 仿真设置
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 120.0,
+        render_interval=decimation,
+    )
 
-    # robot(s)
-    robot_cfg: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    # 场景设置
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=128,
+        env_spacing=4.0,
+        replicate_physics=True,
+        clone_in_fabric=False,
+    )
 
-    # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    # 简化 AGV 参数
+    agv_size = (0.70, 0.45, 0.06)
+    agv_mass = 20.0
+    agv_init_pos = (-1.20, 0.0, 0.03)
 
-    # custom parameters/scales
-    # - controllable joint
-    cart_dof_name = "slider_to_cart"
-    pole_dof_name = "cart_to_pole"
-    # - action scale
-    action_scale = 100.0  # [N]
-    # - reward scales
-    rew_scale_alive = 1.0
-    rew_scale_terminated = -2.0
-    rew_scale_pole_pos = -1.0
-    rew_scale_cart_vel = -0.01
-    rew_scale_pole_vel = -0.005
-    # - reset states/conditions
-    initial_pole_angle_range = [-0.25, 0.25]  # pole angle sample range on reset [rad]
-    max_cart_pos = 3.0  # reset if cart exceeds this position [m]
+    # 货物参数
+    payload_size = (0.90, 0.60, 0.30)
+    payload_mass = 8.0
+    payload_init_pos = (0.0, 0.0, 0.15)
+
+    # 目标点，基于每个 env 原点的局部坐标
+    target_pos = (1.80, 0.0, 0.0)
+    target_radius = 0.18
+
+    # 工作空间限制，防止物体飞太远
+    workspace_limit = 2.5
+
+    # 差速 AGV 动作缩放
+    max_agv_linear_speed = 1.0
+    max_agv_angular_speed = 1.2
+
+    # 奖励权重
+    reward_progress_scale = 8.0
+    reward_distance_scale = 1.0
+    reward_agv_payload_distance_scale = 0.15
+    reward_action_penalty_scale = 0.02
+    reward_success = 20.0
+    reward_out_of_bounds = -10.0
+
+    # AGV：第一版设置为 kinematic，便于先跑通推箱子闭环
+    agv_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/AGV",
+        spawn=sim_utils.CuboidCfg(
+            size=agv_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=agv_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.02, 0.02, 0.02),
+                metallic=0.0,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=agv_init_pos,
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    # Payload：动态刚体，被 AGV 推动
+    payload_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Payload",
+        spawn=sim_utils.CuboidCfg(
+            size=payload_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=payload_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.9,
+                dynamic_friction=0.8,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.55, 0.0),
+                metallic=0.0,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=payload_init_pos,
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
