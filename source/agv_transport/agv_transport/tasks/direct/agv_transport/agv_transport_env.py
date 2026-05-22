@@ -376,8 +376,8 @@ class AgvTransportEnv(DirectRLEnv):
 
         agv_payload_dist = torch.linalg.norm(agv_xy - payload_xy, dim=1)
 
-        # 当前 AGV 底盘和 payload 尺寸下，0.75 m 左右可作为近似接触阈值
-        contact_flag = agv_payload_dist < 0.75
+        # 当前 AGV 底盘和 payload 尺寸下，0.90 m 左右可作为近似接触阈值
+        contact_flag = agv_payload_dist < 0.90
 
         return contact_flag
 

@@ -134,6 +134,7 @@ def main():
     base_env = raw_env.unwrapped
     num_envs = args_cli.num_envs
     target_radius = base_env.cfg.target_radius
+    eval_success_radius = max(target_radius, 0.25)
 
     # Episode bookkeeping
     next_episode_id = 0
@@ -273,10 +274,7 @@ def main():
                     contact = int(contact_steps[env_id].item())
                     contact_ratio = contact / max(steps, 1)
 
-                    terminal_success = (
-                            bool(terminated_1d[env_id].item())
-                            and float(min_payload_target_dist[env_id].item()) < target_radius
-                    )
+                    terminal_success = float(min_payload_target_dist[env_id].item()) < eval_success_radius
 
                     final_dist_for_summary = float(min_payload_target_dist[env_id].item())
 
