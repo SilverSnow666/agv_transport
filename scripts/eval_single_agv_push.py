@@ -49,6 +49,12 @@ parser.add_argument(
     default="logs/eval_single_agv_push",
     help="Directory for CSV outputs.",
 )
+parser.add_argument(
+    "--eval_contact_threshold",
+    type=float,
+    default=0.85,
+    help="Distance threshold used only for evaluation contact ratio.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -189,6 +195,7 @@ def main():
                 "target_x",
                 "target_y",
                 "payload_target_dist",
+                "agv_payload_dist",
                 "contact_flag",
                 "action_v",
                 "action_w",
@@ -217,7 +224,11 @@ def main():
                 target_xy = base_env._get_target_xy()
 
                 payload_target_dist = torch.linalg.norm(payload_xy - target_xy, dim=1)
-                contact_flag = base_env._compute_contact_flag()
+
+                # 评估用接触判断：只用于 contact_ratio 统计，不影响训练 reward
+                agv_payload_dist = torch.linalg.norm(agv_xy - payload_xy, dim=1)
+                contact_flag = agv_payload_dist < args_cli.eval_contact_threshold
+
                 success = payload_target_dist < target_radius
 
                 # Update episode statistics
@@ -251,6 +262,7 @@ def main():
                             float(target_xy[env_id, 0].item()),
                             float(target_xy[env_id, 1].item()),
                             float(payload_target_dist[env_id].item()),
+                            float(agv_payload_dist[env_id].item()),
                             bool(contact_flag[env_id].item()),
                             float(actions_cpu[env_id, 0].item()),
                             float(actions_cpu[env_id, 1].item()),
