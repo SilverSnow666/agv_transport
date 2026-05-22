@@ -63,7 +63,13 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 简化 AGV 参数
     agv_size = (0.70, 0.45, 0.06)
     agv_mass = 20.0
-    agv_init_pos = (-1.20, 0.0, 0.03)
+    agv_init_pos = (-1.20, 0.00, 0.03)
+
+    # 是否随机化 AGV 初始 y 位置
+    randomize_agv_init_y = True
+
+    # AGV 初始 y 随机范围
+    agv_init_y_range = (-0.20, 0.20)
 
     # 货物参数
     payload_size = (0.90, 0.60, 0.30)

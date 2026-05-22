@@ -330,7 +330,20 @@ class AgvTransportEnv(DirectRLEnv):
 
         # AGV 初始状态
         agv_state = self.agv.data.default_root_state[env_ids].clone()
-        agv_offset = torch.tensor(self.cfg.agv_init_pos, device=self.device).repeat(num_reset, 1)
+        agv_offset = torch.tensor(
+            self.cfg.agv_init_pos,
+            device=self.device,
+        ).repeat(num_reset, 1)
+
+        # 随机化 AGV 初始 y 位置，用于提高策略泛化能力
+        if self.cfg.randomize_agv_init_y:
+            y_min, y_max = self.cfg.agv_init_y_range
+            random_y = y_min + (y_max - y_min) * torch.rand(
+                num_reset,
+                device=self.device,
+            )
+            agv_offset[:, 1] = random_y
+
         agv_state[:, :3] = env_origins + agv_offset
         agv_state[:, 3:7] = torch.tensor((1.0, 0.0, 0.0, 0.0), device=self.device).repeat(num_reset, 1)
         agv_state[:, 7:] = 0.0
