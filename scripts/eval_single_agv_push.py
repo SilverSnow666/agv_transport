@@ -273,14 +273,21 @@ def main():
                     contact = int(contact_steps[env_id].item())
                     contact_ratio = contact / max(steps, 1)
 
+                    terminal_success = (
+                            bool(terminated_1d[env_id].item())
+                            and float(min_payload_target_dist[env_id].item()) < target_radius
+                    )
+
+                    final_dist_for_summary = float(min_payload_target_dist[env_id].item())
+
                     summary_writer.writerow(
                         [
                             ep_id,
                             env_id,
-                            bool(success[env_id].item()),
+                            terminal_success,
                             steps,
                             steps * base_env.step_dt,
-                            float(payload_target_dist[env_id].item()),
+                            final_dist_for_summary,
                             float(min_payload_target_dist[env_id].item()),
                             contact,
                             contact_ratio,
@@ -295,9 +302,9 @@ def main():
                     print(
                         f"[episode {ep_id:03d}] "
                         f"env={env_id}, "
-                        f"success={bool(success[env_id].item())}, "
+                        f"success={terminal_success}, "
                         f"steps={steps}, "
-                        f"final_dist={float(payload_target_dist[env_id].item()):.3f}, "
+                        f"final_dist={final_dist_for_summary:.3f}, "
                         f"contact_ratio={contact_ratio:.2f}, "
                         f"reward={float(episode_reward[env_id].item()):.2f}"
                     )
