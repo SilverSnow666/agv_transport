@@ -26,7 +26,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     agv_visual_cfg = sim_utils.UsdFileCfg(
         usd_path=agv_visual_usd_path,
-        scale=(0.65, 0.65, 0.65),
+        scale=(0.50, 0.50, 0.50),
     )
 
     # 环境设置
@@ -36,14 +36,14 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
     # w: 角速度
-    action_space = 2
+    action_space = 6
 
     # 观测：
     # agv_xy_rel, payload_xy_rel, target_xy_rel,
     # agv_to_payload_xy, payload_to_target_xy,
     # agv_heading_xy, agv_vel_xy, payload_vel_xy
     # 维度 = 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 = 16
-    observation_space = 16
+    observation_space = 32
     state_space = 0
 
     # 仿真设置
@@ -63,17 +63,25 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 简化 AGV 参数
     agv_size = (0.70, 0.45, 0.06)
     agv_mass = 20.0
-    agv_init_pos = (-1.20, 0.00, 0.03)
+    # 三台 AGV 初始位置
+    agv_init_positions = (
+        (-1.60, 0.00, 0.03),  # 中间 AGV
+        (-1.60, 0.65, 0.03),  # 上侧 AGV
+        (-1.60, -0.65, 0.03),  # 下侧 AGV
+    )
+
+    # 为兼容部分旧代码，保留单个 agv_init_pos
+    agv_init_pos = agv_init_positions[0]
 
     # 是否随机化 AGV 初始 y 位置
-    randomize_agv_init_y = True
+    randomize_agv_init_y = False
 
     # AGV 初始 y 随机范围
-    agv_init_y_range = (-0.20, 0.20)
+    agv_init_y_range = (-0.30, 0.30)
 
     # 货物参数
-    payload_size = (0.90, 0.60, 0.30)
-    payload_mass = 8.0
+    payload_size = (1.20, 1.60, 0.30)
+    payload_mass = 30.0
     payload_init_pos = (0.0, 0.0, 0.15)
 
     # 目标点，基于每个 env 原点的局部坐标
@@ -84,7 +92,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     workspace_limit = 2.5
 
     # 差速 AGV 动作缩放
-    max_agv_linear_speed = 1.0
+    max_agv_linear_speed = 0.5
     max_agv_angular_speed = 1.2
 
     # 奖励权重
@@ -96,8 +104,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     reward_out_of_bounds = -10.0
 
     # AGV：第一版设置为 kinematic，便于先跑通推箱子闭环
-    agv_cfg: RigidObjectCfg = RigidObjectCfg(
-        prim_path="/World/envs/env_.*/AGV",
+    agv1_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/AGV1",
         spawn=sim_utils.CuboidCfg(
             size=agv_size,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -117,7 +125,59 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=agv_init_pos,
+            pos=agv_init_positions[0],
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    agv2_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/AGV2",
+        spawn=sim_utils.CuboidCfg(
+            size=agv_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=agv_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.02, 0.02, 0.02),
+                metallic=0.0,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=agv_init_positions[1],
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    agv3_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/AGV3",
+        spawn=sim_utils.CuboidCfg(
+            size=agv_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=agv_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.02, 0.02, 0.02),
+                metallic=0.0,
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=agv_init_positions[2],
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
