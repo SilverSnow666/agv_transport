@@ -197,6 +197,7 @@ class AgvTransportEnv(DirectRLEnv):
         target_xy_rel = target_xy - env_xy
         payload_to_target_xy = target_xy - payload_xy
 
+        # 原 32 维观测的前 8 维
         obs_parts = [
             payload_xy_rel,
             target_xy_rel,
@@ -204,6 +205,7 @@ class AgvTransportEnv(DirectRLEnv):
             payload_vel_xy,
         ]
 
+        # 原 32 维观测中，每台 AGV 8 维
         for i, agv in enumerate(self.agvs):
             agv_xy = agv.data.root_pos_w[:, :2]
             agv_vel_xy = agv.data.root_lin_vel_w[:, :2]
@@ -228,6 +230,32 @@ class AgvTransportEnv(DirectRLEnv):
                 ]
             )
 
+        # 追加 6 维 PPO 辅助观测：
+        # payload_heading 2 维
+        # payload_yaw_rate 1 维
+        # contact_flags 3 维
+        payload_yaw = self._get_payload_yaw()
+
+        payload_heading = torch.stack(
+            (
+                torch.cos(payload_yaw),
+                torch.sin(payload_yaw),
+            ),
+            dim=1,
+        )
+
+        payload_yaw_rate = self._get_payload_yaw_rate().unsqueeze(-1)
+
+        contact_flags = self._compute_contact_flags().float()
+
+        obs_parts.extend(
+            [
+                payload_heading,
+                payload_yaw_rate,
+                contact_flags,
+            ]
+        )
+
         obs = torch.cat(obs_parts, dim=-1)
 
         return {"policy": obs}
@@ -236,39 +264,58 @@ class AgvTransportEnv(DirectRLEnv):
         payload_xy = self.payload.data.root_pos_w[:, :2]
         target_xy = self._get_target_xy()
 
-        payload_goal_dist = torch.linalg.norm(payload_xy - target_xy, dim=1)
-
-        agv_payload_dists = []
-        for agv in self.agvs:
-            agv_xy = agv.data.root_pos_w[:, :2]
-            agv_payload_dists.append(torch.linalg.norm(agv_xy - payload_xy, dim=1))
-
-        agv_payload_dists = torch.stack(agv_payload_dists, dim=1)
-        mean_agv_payload_dist = agv_payload_dists.mean(dim=1)
+        payload_goal_dist = torch.linalg.norm(
+            payload_xy - target_xy,
+            dim=1,
+        )
 
         payload_progress = self.prev_payload_goal_dist - payload_goal_dist
         self.prev_payload_goal_dist = payload_goal_dist.detach()
 
+        payload_yaw = self._get_payload_yaw()
+
         contact_flags = self._compute_contact_flags()
-        any_contact = torch.any(contact_flags, dim=1)
         contact_count = contact_flags.float().sum(dim=1)
+
+        formation_errors = self._compute_formation_errors()
+        formation_error_mean = formation_errors.mean(dim=1)
 
         success = payload_goal_dist < self.cfg.target_radius
         out_of_bounds = self._compute_out_of_bounds()
 
-        action_penalty = torch.sum(torch.square(self.actions), dim=1)
-        action_rate_penalty = torch.sum(torch.square(self.actions - self.prev_actions), dim=1)
+        action_penalty = torch.sum(
+            torch.square(self.actions),
+            dim=1,
+        )
+
+        action_rate_penalty = torch.sum(
+            torch.square(self.actions - self.prev_actions),
+            dim=1,
+        )
 
         reward = (
-                15.0 * payload_progress
-                - 0.5 * payload_goal_dist
-                - 0.2 * mean_agv_payload_dist
-                + 0.5 * any_contact.float()
-                + 0.2 * contact_count
+            # 最核心：payload 向目标移动
+                20.0 * payload_progress
+
+                # 保持 payload 靠近目标
+                - 0.8 * payload_goal_dist
+
+                # 抑制 payload 偏航
+                - 2.0 * torch.abs(payload_yaw)
+
+                # 鼓励多 AGV 同时参与推送
+                + 0.5 * contact_count
+
+                # 鼓励三车保持并排队形
+                - 0.5 * formation_error_mean
+
+                # 动作不要过大、不要突变
                 - 0.005 * action_penalty
                 - 0.01 * action_rate_penalty
-                + 50.0 * success.float()
-                - 20.0 * out_of_bounds.float()
+
+                # 成功奖励和越界惩罚
+                + 80.0 * success.float()
+                - 30.0 * out_of_bounds.float()
         )
 
         return reward
@@ -375,12 +422,17 @@ class AgvTransportEnv(DirectRLEnv):
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
         contact_flags = []
+
         for agv in self.agvs:
             agv_xy = agv.data.root_pos_w[:, :2]
-            agv_payload_dist = torch.linalg.norm(agv_xy - payload_xy, dim=1)
+            agv_payload_dist = torch.linalg.norm(
+                agv_xy - payload_xy,
+                dim=1,
+            )
 
-            # 三车环境建模阶段先沿用较严格训练阈值
-            contact_flags.append(agv_payload_dist < 0.75)
+            contact_flags.append(
+                agv_payload_dist < self.cfg.train_contact_threshold
+            )
 
         return torch.stack(contact_flags, dim=1)
 
@@ -388,6 +440,91 @@ class AgvTransportEnv(DirectRLEnv):
         """兼容旧接口：任意一台 AGV 接近 payload 即认为有接触。"""
         contact_flags = self._compute_contact_flags()
         return torch.any(contact_flags, dim=1)
+
+    def _quat_to_yaw_wxyz(self, quat: torch.Tensor) -> torch.Tensor:
+        """将 wxyz 四元数转换为 yaw。"""
+        w = quat[:, 0]
+        x = quat[:, 1]
+        y = quat[:, 2]
+        z = quat[:, 3]
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+
+        return torch.atan2(siny_cosp, cosy_cosp)
+
+    def _get_payload_yaw(self) -> torch.Tensor:
+        """获取 payload 偏航角。"""
+        payload_data = self.payload.data
+
+        if hasattr(payload_data, "root_quat_w"):
+            quat = payload_data.root_quat_w
+        else:
+            quat = payload_data.root_state_w[:, 3:7]
+
+        return self._quat_to_yaw_wxyz(quat)
+
+    def _get_payload_yaw_rate(self) -> torch.Tensor:
+        """获取 payload yaw rate。"""
+        payload_data = self.payload.data
+
+        if hasattr(payload_data, "root_ang_vel_w"):
+            return payload_data.root_ang_vel_w[:, 2]
+
+        return payload_data.root_state_w[:, 12]
+
+    def _compute_formation_errors(self) -> torch.Tensor:
+        """计算三台 AGV 相对 payload 后方目标队形点的误差。
+
+        Returns:
+            Tensor shape = [num_envs, 3]
+        """
+        payload_xy = self.payload.data.root_pos_w[:, :2]
+        target_xy = self._get_target_xy()
+
+        payload_to_target = target_xy - payload_xy
+        dist_to_target = torch.linalg.norm(
+            payload_to_target,
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+
+        push_dir = payload_to_target / dist_to_target
+
+        lateral_dir = torch.stack(
+            (-push_dir[:, 1], push_dir[:, 0]),
+            dim=1,
+        )
+
+        stand_off_distances = torch.tensor(
+            self.cfg.formation_stand_off_distances,
+            device=self.device,
+        )
+
+        lateral_offsets = torch.tensor(
+            self.cfg.formation_lateral_offsets,
+            device=self.device,
+        )
+
+        errors = []
+
+        for i, agv in enumerate(self.agvs):
+            agv_xy = agv.data.root_pos_w[:, :2]
+
+            desired_xy = (
+                    payload_xy
+                    - push_dir * stand_off_distances[i]
+                    + lateral_dir * lateral_offsets[i]
+            )
+
+            error = torch.linalg.norm(
+                agv_xy - desired_xy,
+                dim=1,
+            )
+
+            errors.append(error)
+
+        return torch.stack(errors, dim=1)
 
     def _compute_out_of_bounds(self) -> torch.Tensor:
         """判断三台 AGV 或 payload 是否超出当前环境工作空间。"""
