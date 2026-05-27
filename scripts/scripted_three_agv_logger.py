@@ -341,6 +341,111 @@ def get_payload_quat(base_env) -> torch.Tensor:
 
     return payload_data.root_state_w[:, 3:7]
 
+def compute_single_agv_actions(obs_policy: torch.Tensor) -> torch.Tensor:
+    """Case A: only AGV1 pushes the large payload.
+
+    AGV2 and AGV3 are disabled.
+    Action layout:
+        [v1, w1, 0, 0, 0, 0]
+    """
+    device = obs_policy.device
+    num_envs = obs_policy.shape[0]
+
+    payload_xy = obs_policy[:, 0:2]
+    payload_to_target = obs_policy[:, 4:6]
+
+    dist_to_target = torch.linalg.norm(
+        payload_to_target,
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1e-6)
+
+    push_dir = payload_to_target / dist_to_target
+
+    # AGV1 observation
+    agv1_start = 8
+    agv1_xy = obs_policy[:, agv1_start : agv1_start + 2]
+    agv1_heading = obs_policy[:, agv1_start + 4 : agv1_start + 6]
+
+    agv1_yaw = torch.atan2(agv1_heading[:, 1], agv1_heading[:, 0])
+
+    # Desired position behind payload
+    stand_off_distance = 0.90
+    lateral_dir = torch.stack(
+        (-push_dir[:, 1], push_dir[:, 0]),
+        dim=1,
+    )
+
+    single_lateral_offset = -0.55
+
+    desired_xy = (
+            payload_xy
+            - push_dir * stand_off_distance
+            + lateral_dir * single_lateral_offset
+    )
+
+    agv_to_desired = desired_xy - agv1_xy
+    dist_to_desired = torch.linalg.norm(
+        agv_to_desired,
+        dim=1,
+        keepdim=True,
+    ).clamp_min(1e-6)
+
+    approach_dir = agv_to_desired / dist_to_desired
+
+    # If AGV1 is close to the pushing position, start pushing.
+    ready_to_push = dist_to_desired.squeeze(-1) < 0.25
+
+    desired_vec = torch.where(
+        ready_to_push.unsqueeze(-1),
+        push_dir,
+        approach_dir,
+    )
+
+    desired_yaw = torch.atan2(desired_vec[:, 1], desired_vec[:, 0])
+
+    yaw_error = torch.atan2(
+        torch.sin(desired_yaw - agv1_yaw),
+        torch.cos(desired_yaw - agv1_yaw),
+    )
+
+    w1 = torch.clamp(1.2 * yaw_error, -1.0, 1.0)
+
+    heading_quality = torch.clamp(
+        torch.cos(yaw_error),
+        min=0.0,
+        max=1.0,
+    )
+
+    approach_speed = torch.clamp(
+        dist_to_desired.squeeze(-1) / 0.8,
+        min=0.15,
+        max=0.75,
+    )
+
+    push_speed = torch.clamp(
+        dist_to_target.squeeze(-1) / 1.2,
+        min=0.25,
+        max=0.75,
+    )
+
+    base_speed = torch.where(
+        ready_to_push,
+        push_speed,
+        approach_speed,
+    )
+
+    v1 = heading_quality * base_speed
+
+    actions = torch.zeros(
+        (num_envs, 6),
+        device=device,
+    )
+
+    actions[:, 0] = v1
+    actions[:, 1] = w1
+
+    return torch.clamp(actions, -1.0, 1.0)
 
 def main():
     output_dir = Path(args_cli.output_dir)
@@ -478,7 +583,7 @@ def main():
                 else:
                     obs_policy = obs
 
-                actions = compute_scripted_actions(obs_policy)
+                actions = compute_single_agv_actions(obs_policy)
 
                 obs, rewards, terminated, truncated, info = env.step(actions)
 
