@@ -272,8 +272,12 @@ class AgvTransportEnv(DirectRLEnv):
 
         push_dir = payload_to_target / payload_goal_dist.unsqueeze(-1).clamp_min(1e-6)
 
+        # payload 前进量
         payload_progress = self.prev_payload_goal_dist - payload_goal_dist
         self.prev_payload_goal_dist = payload_goal_dist.detach()
+
+        positive_progress = torch.clamp(payload_progress, min=0.0)
+        negative_progress = torch.clamp(-payload_progress, min=0.0)
 
         payload_yaw = self._get_payload_yaw()
 
@@ -284,20 +288,12 @@ class AgvTransportEnv(DirectRLEnv):
         at_least_two_contact = (contact_count >= 2.0).float()
         all_three_contact = (contact_count >= 3.0).float()
 
-        # 接触不均衡惩罚：防止只有一辆或两辆车长期接触
-        contact_balance_penalty = torch.var(contact_values, dim=1)
-
         formation_errors = self._compute_formation_errors()
         formation_error_mean = formation_errors.mean(dim=1)
         formation_error_max = formation_errors.max(dim=1).values
 
-        # 队形不均衡惩罚：重点惩罚掉队最严重的车
-        formation_balance_penalty = formation_error_max - formation_error_mean
-
-        # 三台 AGV 的车头朝向误差
-        heading_errors = []
+        # 三台 AGV 车头朝向目标推送方向
         heading_alignments = []
-
         desired_yaw = torch.atan2(push_dir[:, 1], push_dir[:, 0])
 
         for i in range(3):
@@ -308,15 +304,12 @@ class AgvTransportEnv(DirectRLEnv):
                 torch.cos(desired_yaw - agv_yaw_i),
             )
 
-            heading_errors.append(torch.abs(yaw_error))
             heading_alignments.append(torch.cos(yaw_error))
 
-        heading_errors = torch.stack(heading_errors, dim=1)
-        heading_alignments = torch.stack(heading_alignments, dim=1)
-
-        heading_error_mean = heading_errors.mean(dim=1)
-        heading_error_max = heading_errors.max(dim=1).values
-        heading_alignment_mean = heading_alignments.mean(dim=1)
+        heading_alignment_mean = torch.stack(
+            heading_alignments,
+            dim=1,
+        ).mean(dim=1)
 
         success = payload_goal_dist < self.cfg.target_radius
         out_of_bounds = self._compute_out_of_bounds()
@@ -331,54 +324,63 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        # 单独惩罚角速度，抑制某辆车持续偏航/乱转
         angular_action_penalty = torch.sum(
             torch.square(self.actions[:, [1, 3, 5]]),
             dim=1,
         )
 
-        angular_rate_penalty = torch.sum(
-            torch.square(self.actions[:, [1, 3, 5]] - self.prev_actions[:, [1, 3, 5]]),
-            dim=1,
+        # 关键：三车协同推动奖励，必须和 payload 正向前进绑定
+        cooperative_push_reward = positive_progress * (
+                1.0
+                + 0.8 * contact_count
+                + 1.2 * at_least_two_contact
+                + 0.8 * all_three_contact
         )
 
+        # 卡住惩罚：多车接触但 payload 几乎不动
+        stuck = (
+                (contact_count >= 2.0)
+                & (positive_progress < 0.0005)
+                & (~success)
+        ).float()
+
         reward = (
-            # 仍然以 payload 向目标移动为主
-                25.0 * payload_progress
+            # 主要目标：payload 朝目标前进
+                35.0 * positive_progress
+                - 12.0 * negative_progress
                 - 0.8 * payload_goal_dist
 
-                # 抑制 payload 自身偏航
-                - 2.5 * torch.abs(payload_yaw)
+                # 协同奖励必须服务于“推动前进”
+                + 60.0 * cooperative_push_reward
 
-                # 鼓励多车参与，但不过度奖励“只接触不推进”
-                + 0.3 * contact_count
-                + 0.8 * at_least_two_contact
-                + 0.8 * all_three_contact
+                # 保留少量接触奖励，但不能主导
+                + 0.10 * contact_count
+                + 0.20 * at_least_two_contact
+                + 0.10 * all_three_contact
 
-                # 惩罚接触不均衡，避免一辆车主推、另一辆游离
-                - 0.8 * contact_balance_penalty
+                # 姿态稳定
+                - 2.0 * torch.abs(payload_yaw)
 
-                # 队形约束：平均误差 + 最差车辆误差 + 不均衡误差
-                - 0.5 * formation_error_mean
-                - 0.8 * formation_error_max
-                - 0.5 * formation_balance_penalty
+                # 队形约束降低，避免过度保守
+                - 0.25 * formation_error_mean
+                - 0.20 * formation_error_max
 
-                # 车头方向约束：重点压制最差那台车的偏航
-                + 0.3 * heading_alignment_mean
-                - 0.8 * heading_error_mean
-                - 0.6 * heading_error_max
+                # 车头方向适度奖励
+                + 0.30 * heading_alignment_mean
 
-                # 动作平滑和角速度约束
-                - 0.005 * action_penalty
-                - 0.01 * action_rate_penalty
-                - 0.02 * angular_action_penalty
-                - 0.02 * angular_rate_penalty
+                # 防止三车贴住但不推
+                - 0.30 * stuck
 
-                # 轻微时间惩罚，避免一直贴着不完成
-                - 0.02
+                # 动作惩罚降低，避免车不敢用力
+                - 0.003 * action_penalty
+                - 0.006 * action_rate_penalty
+                - 0.006 * angular_action_penalty
 
-                # 成功奖励与越界惩罚
-                + 100.0 * success.float()
+                # 时间惩罚，鼓励尽快完成
+                - 0.03
+
+                # 成功奖励
+                + 120.0 * success.float()
                 - 30.0 * out_of_bounds.float()
         )
 
