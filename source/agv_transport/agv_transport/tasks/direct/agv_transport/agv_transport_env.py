@@ -265,10 +265,7 @@ class AgvTransportEnv(DirectRLEnv):
         target_xy = self._get_target_xy()
 
         payload_to_target = target_xy - payload_xy
-        payload_goal_dist = torch.linalg.norm(
-            payload_to_target,
-            dim=1,
-        )
+        payload_goal_dist = torch.linalg.norm(payload_to_target, dim=1)
 
         push_dir = payload_to_target / payload_goal_dist.unsqueeze(-1).clamp_min(1e-6)
 
@@ -284,7 +281,6 @@ class AgvTransportEnv(DirectRLEnv):
         formation_error_mean = formation_errors.mean(dim=1)
         formation_error_max = formation_errors.max(dim=1).values
 
-        # 1. 三台 AGV 的车头朝向推送方向
         heading_alignments = []
         for i in range(3):
             agv_heading_xy = torch.stack(
@@ -294,65 +290,47 @@ class AgvTransportEnv(DirectRLEnv):
                 ),
                 dim=1,
             )
+            heading_alignments.append(torch.sum(agv_heading_xy * push_dir, dim=1))
 
-            alignment = torch.sum(agv_heading_xy * push_dir, dim=1)
-            heading_alignments.append(alignment)
+        heading_alignment_mean = torch.stack(heading_alignments, dim=1).mean(dim=1)
 
-        heading_alignment_mean = torch.stack(
-            heading_alignments,
-            dim=1,
-        ).mean(dim=1)
-
-        # 2. 鼓励至少两台 / 三台同时参与
         at_least_two_contact = (contact_count >= 2.0).float()
         all_three_contact = (contact_count >= 3.0).float()
-
-        # 3. 防止某一台车严重掉队
-        formation_balance_penalty = formation_error_max - formation_error_mean
 
         success = payload_goal_dist < self.cfg.target_radius
         out_of_bounds = self._compute_out_of_bounds()
 
-        action_penalty = torch.sum(
-            torch.square(self.actions),
-            dim=1,
-        )
-
-        action_rate_penalty = torch.sum(
-            torch.square(self.actions - self.prev_actions),
-            dim=1,
-        )
+        action_penalty = torch.sum(torch.square(self.actions), dim=1)
+        action_rate_penalty = torch.sum(torch.square(self.actions - self.prev_actions), dim=1)
 
         reward = (
-            # payload 向目标前进，最重要
-                20.0 * payload_progress
-
-                # 目标距离惩罚
+            # 仍然以 payload 向目标移动为主
+                25.0 * payload_progress
                 - 0.8 * payload_goal_dist
 
-                # 更强地抑制 payload 偏航
-                - 4.0 * torch.abs(payload_yaw)
+                # 姿态约束保留，但不要太强
+                - 2.5 * torch.abs(payload_yaw)
 
-                # 鼓励三台车接近/接触 payload
-                + 0.8 * contact_count
+                # 多车参与奖励降低，避免只为接触而拖延
+                + 0.4 * contact_count
+                + 0.8 * at_least_two_contact
+                + 0.5 * all_three_contact
 
-                # 明确鼓励多车同时参与，而不是只有一台车推
-                + 1.5 * at_least_two_contact
-                + 1.0 * all_three_contact
+                # 队形约束中等强度
+                - 0.6 * formation_error_mean
+                - 0.3 * formation_error_max
 
-                # 队形保持：平均误差 + 最大掉队误差
-                - 1.0 * formation_error_mean
-                - 0.5 * formation_balance_penalty
+                # 车头朝向奖励保留
+                + 0.5 * heading_alignment_mean
 
-                # 车头方向一致性，减少某辆车斜着推、横着推
-                + 0.8 * heading_alignment_mean
-
-                # 动作平滑
+                # 动作约束
                 - 0.005 * action_penalty
                 - 0.01 * action_rate_penalty
 
-                # 成功奖励与越界惩罚
-                + 80.0 * success.float()
+                # 给一点时间惩罚，避免拖着不完成
+                - 0.02
+
+                + 100.0 * success.float()
                 - 30.0 * out_of_bounds.float()
         )
 
