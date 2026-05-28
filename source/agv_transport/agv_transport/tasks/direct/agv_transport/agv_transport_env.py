@@ -279,6 +279,7 @@ class AgvTransportEnv(DirectRLEnv):
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
+        all_three_contact = (contact_count >= 3.0).float()
 
         formation_errors = self._compute_formation_errors()
         formation_error_mean = formation_errors.mean(dim=1)
@@ -326,6 +327,7 @@ class AgvTransportEnv(DirectRLEnv):
 
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
+                + 0.8 * all_three_contact
 
                 # 队形约束，保持中等强度
                 - 0.5 * formation_error_mean
@@ -343,6 +345,20 @@ class AgvTransportEnv(DirectRLEnv):
         )
 
         return reward
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        payload_xy = self.payload.data.root_pos_w[:, :2]
+        target_xy = self._get_target_xy()
+
+        payload_goal_dist = torch.linalg.norm(payload_xy - target_xy, dim=1)
+        success = payload_goal_dist < self.cfg.target_radius
+
+        out_of_bounds = self._compute_out_of_bounds()
+
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        terminated = success | out_of_bounds
+
+        return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None):
         if env_ids is None:
@@ -450,6 +466,7 @@ class AgvTransportEnv(DirectRLEnv):
         """兼容旧接口：任意一台 AGV 接近 payload 即认为有接触。"""
         contact_flags = self._compute_contact_flags()
         return torch.any(contact_flags, dim=1)
+
 
     def _quat_to_yaw_wxyz(self, quat: torch.Tensor) -> torch.Tensor:
         """将 wxyz 四元数转换为 yaw。"""
