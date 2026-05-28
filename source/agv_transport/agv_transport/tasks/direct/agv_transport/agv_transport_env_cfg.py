@@ -70,6 +70,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
         (-1.60, -0.65, 0.03),
     )
 
+
     # 三车并排推送队形参数
     formation_stand_off_distances = (0.90, 0.90, 0.90)
     formation_lateral_offsets = (0.0, 0.65, -0.65)
@@ -77,8 +78,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # PPO 训练用近似接触阈值
     train_contact_threshold = 1.20
 
-    # 三车 PPO 阶段建议成功半径
-    target_radius = 0.25
+
 
     # 为兼容部分旧代码，保留单个 agv_init_pos
     agv_init_pos = agv_init_positions[0]
@@ -96,7 +96,13 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 目标点，基于每个 env 原点的局部坐标
     target_pos = (1.80, 0.0, 0.0)
-    target_radius = 0.18
+
+    # payload 到达目标时允许的位置误差
+    target_radius = 0.20
+
+    # payload 到达目标时允许的最大偏航角，单位 rad
+    # 0.15 rad ≈ 8.6 度
+    target_yaw_radius = 0.15
 
     # 工作空间限制，防止物体飞太远
     workspace_limit = 2.5

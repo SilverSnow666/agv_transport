@@ -316,7 +316,10 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         ).mean(dim=1)
 
-        success = payload_goal_dist < self.cfg.target_radius
+        position_success = payload_goal_dist < self.cfg.target_radius
+        yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
+        success = position_success & yaw_success
+
         out_of_bounds = self._compute_out_of_bounds()
 
         action_penalty = torch.sum(
@@ -361,16 +364,33 @@ class AgvTransportEnv(DirectRLEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """判断 episode 是否结束。
+
+        terminated:
+            - payload 到达目标位置，并且 yaw 满足要求
+            - AGV 或 payload 越界
+
+        time_out:
+            - episode 达到最大步数
+        """
         payload_xy = self.payload.data.root_pos_w[:, :2]
         target_xy = self._get_target_xy()
 
-        payload_goal_dist = torch.linalg.norm(payload_xy - target_xy, dim=1)
-        success = payload_goal_dist < self.cfg.target_radius
+        payload_goal_dist = torch.linalg.norm(
+            payload_xy - target_xy,
+            dim=1,
+        )
 
+        payload_yaw = self._get_payload_yaw()
+
+        position_success = payload_goal_dist < self.cfg.target_radius
+        yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
+
+        success = position_success & yaw_success
         out_of_bounds = self._compute_out_of_bounds()
 
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
         terminated = success | out_of_bounds
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         return terminated, time_out
 
