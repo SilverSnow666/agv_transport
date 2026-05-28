@@ -78,6 +78,13 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # PPO 训练用近似接触阈值
     train_contact_threshold = 1.20
 
+    # AGV-AGV 安全距离约束
+    # agv_size = (0.70, 0.45, 0.06)，并排 y 间距 0.65，因此安全距离先取 0.55
+    agv_safe_distance = 0.55
+
+    # 若两车中心距离小于该值，认为发生严重重叠/碰撞
+    agv_collision_distance = 0.42
+
 
 
     # 为兼容部分旧代码，保留单个 agv_init_pos

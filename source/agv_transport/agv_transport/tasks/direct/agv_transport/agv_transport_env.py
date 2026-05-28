@@ -332,6 +332,18 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        pairwise_distances = self._compute_agv_pairwise_distances()
+
+        agv_overlap_penalty = torch.sum(
+            torch.square(
+                torch.clamp(
+                    self.cfg.agv_safe_distance - pairwise_distances,
+                    min=0.0,
+                )
+            ),
+            dim=1,
+        )
+
         reward = (
             # 核心目标：payload 向目标移动
                 25.0 * payload_progress
@@ -355,6 +367,8 @@ class AgvTransportEnv(DirectRLEnv):
                 # 动作平滑
                 - 0.005 * action_penalty
                 - 0.01 * action_rate_penalty
+
+                - 2.0 * agv_overlap_penalty
 
                 # 成功奖励
                 + 100.0 * success.float()
@@ -388,8 +402,9 @@ class AgvTransportEnv(DirectRLEnv):
 
         success = position_success & yaw_success
         out_of_bounds = self._compute_out_of_bounds()
+        agv_collision = self._compute_agv_collision()
 
-        terminated = success | out_of_bounds
+        terminated = success | out_of_bounds | agv_collision
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         return terminated, time_out
@@ -601,6 +616,31 @@ class AgvTransportEnv(DirectRLEnv):
             errors.append(error)
 
         return torch.stack(errors, dim=1)
+
+    def _compute_agv_pairwise_distances(self) -> torch.Tensor:
+        """计算三台 AGV 两两之间的距离。
+
+        Returns:
+            Tensor shape = [num_envs, 3]
+            columns = [d12, d13, d23]
+        """
+        agv1_xy = self.agv1.data.root_pos_w[:, :2]
+        agv2_xy = self.agv2.data.root_pos_w[:, :2]
+        agv3_xy = self.agv3.data.root_pos_w[:, :2]
+
+        d12 = torch.linalg.norm(agv1_xy - agv2_xy, dim=1)
+        d13 = torch.linalg.norm(agv1_xy - agv3_xy, dim=1)
+        d23 = torch.linalg.norm(agv2_xy - agv3_xy, dim=1)
+
+        return torch.stack((d12, d13, d23), dim=1)
+
+    def _compute_agv_collision(self) -> torch.Tensor:
+        """判断 AGV 之间是否发生严重重叠。"""
+        pairwise_distances = self._compute_agv_pairwise_distances()
+        return torch.any(
+            pairwise_distances < self.cfg.agv_collision_distance,
+            dim=1,
+        )
 
     def _compute_out_of_bounds(self) -> torch.Tensor:
         """判断三台 AGV 或 payload 是否超出当前环境工作空间。"""
