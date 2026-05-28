@@ -149,20 +149,7 @@ class AgvTransportEnv(DirectRLEnv):
         for i, agv in enumerate(self.agvs):
             agv_state = agv.data.root_state_w.clone()
 
-            linear_action = torch.clamp(
-                self.actions[:, 2 * i],
-                min=-0.35,
-                max=1.0,
-            )
-
-            angular_action = torch.clamp(
-                self.actions[:, 2 * i + 1],
-                min=-1.0,
-                max=1.0,
-            )
-
-            linear_speed = linear_action * self.cfg.max_agv_linear_speed
-            angular_speed = angular_action * self.cfg.max_agv_angular_speed
+            linear_speed = self.actions[:, 2 * i] * self.cfg.max_agv_linear_speed
             angular_speed = self.actions[:, 2 * i + 1] * self.cfg.max_agv_angular_speed
 
             self.agv_yaw[:, i] = self.agv_yaw[:, i] + angular_speed * dt
@@ -285,75 +272,19 @@ class AgvTransportEnv(DirectRLEnv):
 
         push_dir = payload_to_target / payload_goal_dist.unsqueeze(-1).clamp_min(1e-6)
 
-        # payload progress
         payload_progress = self.prev_payload_goal_dist - payload_goal_dist
         self.prev_payload_goal_dist = payload_goal_dist.detach()
-
-        positive_progress = torch.clamp(payload_progress, min=0.0)
-        negative_progress = torch.clamp(-payload_progress, min=0.0)
 
         payload_yaw = self._get_payload_yaw()
 
         contact_flags = self._compute_contact_flags()
-        contact_values = contact_flags.float()
-        contact_count = contact_values.sum(dim=1)
+        contact_count = contact_flags.float().sum(dim=1)
 
-        at_least_two_contact = (contact_count >= 2.0).float()
-        all_three_contact = (contact_count >= 3.0).float()
+        formation_errors = self._compute_formation_errors()
+        formation_error_mean = formation_errors.mean(dim=1)
 
-        # formation target
-        lateral_dir = torch.stack(
-            (-push_dir[:, 1], push_dir[:, 0]),
-            dim=1,
-        )
-
-        stand_off_distances = torch.tensor(
-            self.cfg.formation_stand_off_distances,
-            device=self.device,
-        )
-
-        lateral_offsets = torch.tensor(
-            self.cfg.formation_lateral_offsets,
-            device=self.device,
-        )
-
-        formation_errors = []
         heading_alignments = []
-        wrong_heading_penalties = []
-        wrong_motion_penalties = []
-
-        for i, agv in enumerate(self.agvs):
-            agv_xy = agv.data.root_pos_w[:, :2]
-            agv_vel_xy = agv.data.root_lin_vel_w[:, :2]
-
-            desired_xy = (
-                    payload_xy
-                    - push_dir * stand_off_distances[i]
-                    + lateral_dir * lateral_offsets[i]
-            )
-
-            agv_to_desired = desired_xy - agv_xy
-            dist_to_desired = torch.linalg.norm(
-                agv_to_desired,
-                dim=1,
-                keepdim=True,
-            ).clamp_min(1e-6)
-
-            formation_error = dist_to_desired.squeeze(-1)
-            formation_errors.append(formation_error)
-
-            approach_dir = agv_to_desired / dist_to_desired
-
-            # 如果已经接近自己的队形点，就主要沿 push_dir 推；
-            # 如果还没到队形点，就朝自己的队形点走。
-            close_to_formation = formation_error < 0.25
-
-            desired_motion_dir = torch.where(
-                close_to_formation.unsqueeze(-1),
-                push_dir,
-                approach_dir,
-            )
-
+        for i in range(3):
             agv_heading_xy = torch.stack(
                 (
                     torch.cos(self.agv_yaw[:, i]),
@@ -362,48 +293,13 @@ class AgvTransportEnv(DirectRLEnv):
                 dim=1,
             )
 
-            heading_alignment = torch.sum(
-                agv_heading_xy * desired_motion_dir,
-                dim=1,
-            )
+            alignment = torch.sum(agv_heading_xy * push_dir, dim=1)
+            heading_alignments.append(alignment)
 
-            heading_alignments.append(heading_alignment)
-
-            # 车头朝反方向时惩罚
-            wrong_heading = torch.clamp(
-                -heading_alignment,
-                min=0.0,
-            )
-            wrong_heading_penalties.append(wrong_heading)
-
-            # 车辆实际速度朝错误方向时惩罚
-            motion_projection = torch.sum(
-                agv_vel_xy * desired_motion_dir,
-                dim=1,
-            )
-
-            wrong_motion = torch.clamp(
-                -motion_projection,
-                min=0.0,
-            )
-            wrong_motion_penalties.append(wrong_motion)
-
-        formation_errors = torch.stack(formation_errors, dim=1)
-        heading_alignments = torch.stack(heading_alignments, dim=1)
-        wrong_heading_penalties = torch.stack(wrong_heading_penalties, dim=1)
-        wrong_motion_penalties = torch.stack(wrong_motion_penalties, dim=1)
-
-        formation_error_mean = formation_errors.mean(dim=1)
-        formation_error_max = formation_errors.max(dim=1).values
-
-        heading_alignment_mean = heading_alignments.mean(dim=1)
-        heading_alignment_min = heading_alignments.min(dim=1).values
-
-        wrong_heading_max = wrong_heading_penalties.max(dim=1).values
-        wrong_motion_mean = wrong_motion_penalties.mean(dim=1)
-
-        # 接触不均衡惩罚
-        contact_balance_penalty = torch.var(contact_values, dim=1)
+        heading_alignment_mean = torch.stack(
+            heading_alignments,
+            dim=1,
+        ).mean(dim=1)
 
         success = payload_goal_dist < self.cfg.target_radius
         out_of_bounds = self._compute_out_of_bounds()
@@ -418,103 +314,35 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        angular_action_penalty = torch.sum(
-            torch.square(self.actions[:, [1, 3, 5]]),
-            dim=1,
-        )
-
-        angular_rate_penalty = torch.sum(
-            torch.square(
-                self.actions[:, [1, 3, 5]]
-                - self.prev_actions[:, [1, 3, 5]]
-            ),
-            dim=1,
-        )
-
-        # 协同推动奖励：必须和 payload 正向前进绑定
-        cooperative_push_reward = positive_progress * (
-                1.0
-                + 0.6 * contact_count
-                + 1.0 * at_least_two_contact
-                + 0.6 * all_three_contact
-        )
-
-        # 多车接触但 payload 几乎没前进，说明可能卡住
-        stuck = (
-                (contact_count >= 2.0)
-                & (positive_progress < 0.0005)
-                & (~success)
-        ).float()
-
-        reverse_action_penalty = torch.sum(
-            torch.square(torch.clamp(-self.actions[:, [0, 2, 4]], min=0.0)),
-            dim=1,
-        )
         reward = (
-            # 推进优先
-                35.0 * positive_progress
-                - 12.0 * negative_progress
+            # 核心目标：payload 向目标移动
+                25.0 * payload_progress
+
+                # 目标距离
                 - 0.8 * payload_goal_dist
 
-                # 协同推动奖励，必须绑定 payload progress
-                + 60.0 * cooperative_push_reward
-
-                # 少量接触奖励
-                + 0.08 * contact_count
-                + 0.15 * at_least_two_contact
-                + 0.08 * all_three_contact
-
-                # 姿态稳定
+                # payload 姿态约束，先不要太强
                 - 2.0 * torch.abs(payload_yaw)
 
-                # 队形约束，不能太强
-                - 0.25 * formation_error_mean
-                - 0.20 * formation_error_max
+                # 鼓励多车接近 payload，但不要主导训练
+                + 0.4 * contact_count
 
-                # 每台车都要朝自己的正确方向走
-                + 0.40 * heading_alignment_mean
-                + 0.20 * heading_alignment_min
+                # 队形约束，保持中等强度
+                - 0.5 * formation_error_mean
 
-                - 0.40 * wrong_heading_max
-                - 0.80 * wrong_motion_mean
+                # 车头大致朝推送方向
+                + 0.4 * heading_alignment_mean
 
-                - 0.01 * reverse_action_penalty
-
-                # 接触不均衡惩罚，防止一台车游离
-                - 0.30 * contact_balance_penalty
-
-                # 防止贴住不推
-                - 0.30 * stuck
-
-                # 动作惩罚
-                - 0.003 * action_penalty
-                - 0.006 * action_rate_penalty
-                - 0.015 * angular_action_penalty
-                - 0.015 * angular_rate_penalty
-
-                # 时间惩罚
-                - 0.03
+                # 动作平滑
+                - 0.005 * action_penalty
+                - 0.01 * action_rate_penalty
 
                 # 成功奖励
-                + 120.0 * success.float()
+                + 100.0 * success.float()
                 - 30.0 * out_of_bounds.float()
         )
 
         return reward
-
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        payload_xy = self.payload.data.root_pos_w[:, :2]
-        target_xy = self._get_target_xy()
-
-        payload_goal_dist = torch.linalg.norm(payload_xy - target_xy, dim=1)
-        success = payload_goal_dist < self.cfg.target_radius
-
-        out_of_bounds = self._compute_out_of_bounds()
-
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        terminated = success | out_of_bounds
-
-        return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None):
         if env_ids is None:
