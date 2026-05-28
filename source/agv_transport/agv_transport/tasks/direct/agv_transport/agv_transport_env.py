@@ -248,11 +248,25 @@ class AgvTransportEnv(DirectRLEnv):
 
         contact_flags = self._compute_contact_flags().float()
 
+        # 三台 AGV 到各自目标队形点的向量，每台 2 维，共 6 维
+        desired_positions = self._compute_formation_target_xy()
+
+        formation_target_vecs = []
+
+        for i, agv in enumerate(self.agvs):
+            agv_xy = agv.data.root_pos_w[:, :2]
+            desired_xy = desired_positions[:, i, :]
+            agv_to_formation_xy = desired_xy - agv_xy
+            formation_target_vecs.append(agv_to_formation_xy)
+
+        formation_target_vecs = torch.cat(formation_target_vecs, dim=1)
+
         obs_parts.extend(
             [
                 payload_heading,
                 payload_yaw_rate,
                 contact_flags,
+                formation_target_vecs,
             ]
         )
 
@@ -279,7 +293,7 @@ class AgvTransportEnv(DirectRLEnv):
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
-        all_three_contact = (contact_count >= 3.0).float()
+
 
         formation_errors = self._compute_formation_errors()
         formation_error_mean = formation_errors.mean(dim=1)
@@ -327,7 +341,7 @@ class AgvTransportEnv(DirectRLEnv):
 
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
-                + 0.8 * all_three_contact
+
 
                 # 队形约束，保持中等强度
                 - 0.5 * formation_error_mean
@@ -500,11 +514,11 @@ class AgvTransportEnv(DirectRLEnv):
 
         return payload_data.root_state_w[:, 12]
 
-    def _compute_formation_errors(self) -> torch.Tensor:
-        """计算三台 AGV 相对 payload 后方目标队形点的误差。
+    def _compute_formation_target_xy(self) -> torch.Tensor:
+        """计算三台 AGV 的目标队形点。
 
         Returns:
-            Tensor shape = [num_envs, 3]
+            Tensor shape = [num_envs, 3, 2]
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
         target_xy = self._get_target_xy()
@@ -533,16 +547,31 @@ class AgvTransportEnv(DirectRLEnv):
             device=self.device,
         )
 
-        errors = []
+        desired_positions = []
 
-        for i, agv in enumerate(self.agvs):
-            agv_xy = agv.data.root_pos_w[:, :2]
-
+        for i in range(3):
             desired_xy = (
                     payload_xy
                     - push_dir * stand_off_distances[i]
                     + lateral_dir * lateral_offsets[i]
             )
+            desired_positions.append(desired_xy)
+
+        return torch.stack(desired_positions, dim=1)
+
+    def _compute_formation_errors(self) -> torch.Tensor:
+        """计算三台 AGV 相对目标队形点的误差。
+
+        Returns:
+            Tensor shape = [num_envs, 3]
+        """
+        desired_positions = self._compute_formation_target_xy()
+
+        errors = []
+
+        for i, agv in enumerate(self.agvs):
+            agv_xy = agv.data.root_pos_w[:, :2]
+            desired_xy = desired_positions[:, i, :]
 
             error = torch.linalg.norm(
                 agv_xy - desired_xy,

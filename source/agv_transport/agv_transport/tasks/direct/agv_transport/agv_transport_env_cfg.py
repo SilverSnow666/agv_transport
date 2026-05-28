@@ -43,7 +43,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # agv_to_payload_xy, payload_to_target_xy,
     # agv_heading_xy, agv_vel_xy, payload_vel_xy
     # 维度 = 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 = 16
-    observation_space = 38
+    observation_space = 44
     state_space = 0
 
     # 仿真设置
@@ -65,9 +65,9 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     agv_mass = 20.0
     # 三台 AGV 初始位置
     agv_init_positions = (
-        (-1.60, 0.00, 0.03),  # 中间 AGV
-        (-1.60, 0.65, 0.03),  # 上侧 AGV
-        (-1.60, -0.65, 0.03),  # 下侧 AGV
+        (-1.60, 0.00, 0.03),
+        (-1.60, 0.65, 0.03),
+        (-1.60, -0.65, 0.03),
     )
 
     # 三车并排推送队形参数
