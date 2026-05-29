@@ -108,8 +108,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # V4.0 多 waypoint 路径
     # 先用轻微折线路径，不要一开始太难
     waypoints = (
-        (0.60, 0.00),
-        (1.20, 0.00),
+        (0.80, 0.00),
+        (1.40, 0.35),
         (1.80, 0.00),
     )
 
