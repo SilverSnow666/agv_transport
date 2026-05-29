@@ -235,7 +235,6 @@ class AgvTransportEnv(DirectRLEnv):
         # payload_yaw_rate 1 维
         # contact_flags 3 维
         payload_yaw = self._get_payload_yaw()
-
         payload_heading = torch.stack(
             (
                 torch.cos(payload_yaw),
@@ -290,16 +289,52 @@ class AgvTransportEnv(DirectRLEnv):
         self.prev_payload_goal_dist = payload_goal_dist.detach()
 
         payload_yaw = self._get_payload_yaw()
+        payload_yaw_abs = torch.abs(payload_yaw)
+        payload_yaw_rate_abs = torch.abs(self._get_payload_yaw_rate())
+
+        payload_speed = torch.linalg.norm(
+            self.payload.data.root_lin_vel_w[:, :2],
+            dim=1,
+        )
+
+        near_goal = (payload_goal_dist < 0.45).float()
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
 
+        # 队形误差 + 角色相关朝向奖励
+        desired_positions = self._compute_formation_target_xy()
 
-        formation_errors = self._compute_formation_errors()
-        formation_error_mean = formation_errors.mean(dim=1)
-
+        formation_errors = []
         heading_alignments = []
-        for i in range(3):
+
+        for i, agv in enumerate(self.agvs):
+            agv_xy = agv.data.root_pos_w[:, :2]
+            desired_xy = desired_positions[:, i, :]
+
+            agv_to_formation = desired_xy - agv_xy
+
+            dist_to_formation = torch.linalg.norm(
+                agv_to_formation,
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+
+            formation_error = dist_to_formation.squeeze(-1)
+            formation_errors.append(formation_error)
+
+            approach_dir = agv_to_formation / dist_to_formation
+
+            # 没到自己的队形点时，朝自己的队形点走；
+            # 到队形点附近后，再朝 payload 推送方向走。
+            close_to_formation = formation_error < 0.30
+
+            desired_heading_dir = torch.where(
+                close_to_formation.unsqueeze(-1),
+                push_dir,
+                approach_dir,
+            )
+
             agv_heading_xy = torch.stack(
                 (
                     torch.cos(self.agv_yaw[:, i]),
@@ -308,13 +343,21 @@ class AgvTransportEnv(DirectRLEnv):
                 dim=1,
             )
 
-            alignment = torch.sum(agv_heading_xy * push_dir, dim=1)
+            alignment = torch.sum(
+                agv_heading_xy * desired_heading_dir,
+                dim=1,
+            )
+
             heading_alignments.append(alignment)
 
-        heading_alignment_mean = torch.stack(
-            heading_alignments,
-            dim=1,
-        ).mean(dim=1)
+        formation_errors = torch.stack(formation_errors, dim=1)
+        heading_alignments = torch.stack(heading_alignments, dim=1)
+
+        formation_error_mean = formation_errors.mean(dim=1)
+        formation_error_max = formation_errors.max(dim=1).values
+
+        heading_alignment_mean = heading_alignments.mean(dim=1)
+        heading_alignment_min = heading_alignments.min(dim=1).values
 
         position_success = payload_goal_dist < self.cfg.target_radius
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
@@ -329,6 +372,19 @@ class AgvTransportEnv(DirectRLEnv):
 
         action_rate_penalty = torch.sum(
             torch.square(self.actions - self.prev_actions),
+            dim=1,
+        )
+
+        angular_action_penalty = torch.sum(
+            torch.square(self.actions[:, [1, 3, 5]]),
+            dim=1,
+        )
+
+        angular_rate_penalty = torch.sum(
+            torch.square(
+                self.actions[:, [1, 3, 5]]
+                - self.prev_actions[:, [1, 3, 5]]
+            ),
             dim=1,
         )
 
@@ -351,23 +407,34 @@ class AgvTransportEnv(DirectRLEnv):
                 # 目标距离
                 - 0.8 * payload_goal_dist
 
-                # payload 姿态约束，先不要太强
-                - 2.0 * torch.abs(payload_yaw)
+                # payload 姿态稳定
+                - 2.0 * payload_yaw_abs
+
+                # 接近目标后加强位姿稳定
+                - 2.0 * near_goal * payload_yaw_abs
+                - 0.8 * near_goal * payload_yaw_rate_abs
+                - 0.4 * near_goal * payload_speed
 
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
 
-
-                # 队形约束，保持中等强度
+                # 队形约束
                 - 0.5 * formation_error_mean
+                - 0.15 * formation_error_max
 
-                # 车头大致朝推送方向
-                + 0.4 * heading_alignment_mean
+                # 角色相关朝向奖励
+                + 0.45 * heading_alignment_mean
+                + 0.15 * heading_alignment_min
 
                 # 动作平滑
                 - 0.005 * action_penalty
-                - 0.01 * action_rate_penalty
+                - 0.015 * action_rate_penalty
 
+                # 抑制角速度抖动
+                - 0.010 * angular_action_penalty
+                - 0.020 * angular_rate_penalty
+
+                # AGV 间软分离
                 - 2.0 * agv_overlap_penalty
 
                 # 成功奖励
@@ -395,16 +462,16 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        payload_yaw = self._get_payload_yaw()
 
+
+        payload_yaw = self._get_payload_yaw()
         position_success = payload_goal_dist < self.cfg.target_radius
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
         success = position_success & yaw_success
         out_of_bounds = self._compute_out_of_bounds()
-        agv_collision = self._compute_agv_collision()
 
-        terminated = success | out_of_bounds | agv_collision
+        terminated = success | out_of_bounds
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         return terminated, time_out

@@ -109,7 +109,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # payload 到达目标时允许的最大偏航角，单位 rad
     # 0.15 rad ≈ 8.6 度
-    target_yaw_radius = 0.15
+    target_yaw_radius = 0.20
 
     # 工作空间限制，防止物体飞太远
     workspace_limit = 2.5
