@@ -432,7 +432,7 @@ def main(env_cfg, agent_cfg):
                 formation_error_max_step = formation_errors.max(dim=1).values
 
                 payload_yaw_abs = torch.abs(payload_yaw)
-                
+
                 position_success = payload_target_dist < target_radius
                 yaw_success = payload_yaw_abs < target_yaw_radius
                 success = position_success & yaw_success

@@ -32,6 +32,19 @@ class AgvTransportEnv(DirectRLEnv):
         self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.prev_payload_goal_dist = torch.zeros(self.num_envs, device=self.device)
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
+        # V4.0：每个环境当前跟踪的 waypoint 编号
+        self.current_waypoint_idx = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        self.prev_waypoint_idx = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+
         self.last_success = torch.zeros(
             self.num_envs,
             dtype=torch.bool,
@@ -330,7 +343,14 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        near_goal = (payload_goal_dist < 0.45).float()
+        num_waypoints = len(self.cfg.waypoints)
+        final_waypoint_idx = num_waypoints - 1
+        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
+
+        near_goal = (
+                is_final_waypoint.float()
+                * (payload_goal_dist < 0.45).float()
+        )
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
@@ -392,10 +412,24 @@ class AgvTransportEnv(DirectRLEnv):
         heading_alignment_mean = heading_alignments.mean(dim=1)
         heading_alignment_min = heading_alignments.min(dim=1).values
 
-        position_success = payload_goal_dist < self.cfg.target_radius
+        num_waypoints = len(self.cfg.waypoints)
+        final_waypoint_idx = num_waypoints - 1
+        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
+
+        position_success = (
+                is_final_waypoint
+                & (payload_goal_dist < self.cfg.target_radius)
+        )
+
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
+
         success = position_success & yaw_success
 
+        waypoint_advance = (
+                self.current_waypoint_idx > self.prev_waypoint_idx
+        ).float()
+
+        self.prev_waypoint_idx[:] = self.current_waypoint_idx
         out_of_bounds = self._compute_out_of_bounds()
 
         action_penalty = torch.sum(
@@ -448,6 +482,7 @@ class AgvTransportEnv(DirectRLEnv):
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
 
+                + 20.0 * waypoint_advance
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
 
@@ -473,6 +508,7 @@ class AgvTransportEnv(DirectRLEnv):
                 # 成功奖励
                 + 100.0 * success.float()
                 - 30.0 * out_of_bounds.float()
+
         )
 
         return reward
@@ -480,28 +516,75 @@ class AgvTransportEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """判断 episode 是否结束。
 
-        terminated:
-            - payload 到达目标位置，并且 yaw 满足要求
-            - AGV 或 payload 越界
-
-        time_out:
-            - episode 达到最大步数
+        V4.0:
+            - payload 到达中间 waypoint 后，切换到下一个 waypoint；
+            - payload 到达最后 waypoint 且 yaw 满足要求，任务成功；
+            - AGV 或 payload 越界则失败终止；
+            - 达到最大步数则 time_out。
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
-        target_xy = self._get_target_xy()
+
+        waypoints_xy = self._get_waypoints_xy()
+
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
 
         payload_goal_dist = torch.linalg.norm(
             payload_xy - target_xy,
             dim=1,
         )
 
+        num_waypoints = len(self.cfg.waypoints)
+        final_waypoint_idx = num_waypoints - 1
 
+        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
+
+        reached_current_waypoint = payload_goal_dist < self.cfg.waypoint_radius
+
+        # 到达中间 waypoint：切换到下一个 waypoint，但不结束 episode
+        should_advance = reached_current_waypoint & (~is_final_waypoint)
+
+        if torch.any(should_advance):
+            self.current_waypoint_idx[should_advance] += 1
+
+            # 切换 waypoint 后，重新设置 prev_payload_goal_dist，
+            # 避免 progress 因目标突然切换产生异常大负值。
+            new_target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
+            new_payload_goal_dist = torch.linalg.norm(
+                payload_xy - new_target_xy,
+                dim=1,
+            )
+
+            self.prev_payload_goal_dist[should_advance] = new_payload_goal_dist[
+                should_advance
+            ].detach()
+
+        # 切换后重新计算当前目标和距离
+        target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
+
+        payload_goal_dist = torch.linalg.norm(
+            payload_xy - target_xy,
+            dim=1,
+        )
+
+        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
 
         payload_yaw = self._get_payload_yaw()
-        position_success = payload_goal_dist < self.cfg.target_radius
+
+        position_success = (
+                is_final_waypoint
+                & (payload_goal_dist < self.cfg.target_radius)
+        )
+
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
         success = position_success & yaw_success
+
         out_of_bounds = self._compute_out_of_bounds()
 
         # 保存 terminal 判断时刻的真实状态，供评估脚本读取
@@ -578,6 +661,9 @@ class AgvTransportEnv(DirectRLEnv):
         self.actions[env_ids_tensor] = 0.0
         self.prev_actions[env_ids_tensor] = 0.0
         self.agv_yaw[env_ids_tensor, :] = 0.0
+        # V4.0：每个 episode 从第 0 个 waypoint 开始
+        self.current_waypoint_idx[env_ids_tensor] = 0
+        self.prev_waypoint_idx[env_ids_tensor] = 0
 
         target_xy = self._get_target_xy()[env_ids_tensor]
         payload_xy = payload_state[:, :2]
@@ -595,10 +681,31 @@ class AgvTransportEnv(DirectRLEnv):
                 dim=1,
             )
 
+    def _get_waypoints_xy(self) -> torch.Tensor:
+        """返回所有 waypoint 的世界坐标。
+
+        Returns:
+            Tensor shape = [num_envs, num_waypoints, 2]
+        """
+        waypoint_offsets = torch.tensor(
+            self.cfg.waypoints,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        return self.scene.env_origins[:, None, :2] + waypoint_offsets[None, :, :]
+
     def _get_target_xy(self) -> torch.Tensor:
-        """返回每个环境中的目标点世界坐标 xy。"""
-        target_offset_xy = torch.tensor(self.cfg.target_pos[:2], device=self.device).unsqueeze(0)
-        return self.scene.env_origins[:, :2] + target_offset_xy
+        """返回当前 waypoint 的世界坐标 xy。"""
+        waypoints_xy = self._get_waypoints_xy()
+
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        return waypoints_xy[env_ids, self.current_waypoint_idx]
 
     def _compute_contact_flags(self) -> torch.Tensor:
         """返回三台 AGV 的近似接触状态，shape = [num_envs, 3]。"""

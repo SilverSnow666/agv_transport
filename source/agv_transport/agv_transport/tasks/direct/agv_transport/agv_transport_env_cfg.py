@@ -31,7 +31,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 12.0
+    episode_length_s = 20.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -102,13 +102,27 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     payload_init_pos = (0.0, 0.0, 0.15)
 
     # 目标点，基于每个 env 原点的局部坐标
+    #用于兼容旧模型
     target_pos = (1.80, 0.0, 0.0)
 
-    # payload 到达目标时允许的位置误差
+    # V4.0 多 waypoint 路径
+    # 先用轻微折线路径，不要一开始太难
+    waypoints = (
+        (0.60, 0.00),
+        (1.20, 0.00),
+        (1.80, 0.00),
+    )
+
+    # 中间 waypoint 的通过半径
+    waypoint_radius = 0.22
+
+    # 最终目标点位置误差
     target_radius = 0.20
 
-    # payload 到达目标时允许的最大偏航角，单位 rad
+    # 最终目标点 yaw 误差
     target_yaw_radius = 0.20
+
+
 
     # 工作空间限制，防止物体飞太远
     workspace_limit = 2.5
