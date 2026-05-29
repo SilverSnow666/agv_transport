@@ -32,39 +32,6 @@ class AgvTransportEnv(DirectRLEnv):
         self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.prev_payload_goal_dist = torch.zeros(self.num_envs, device=self.device)
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
-        self.last_success = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-
-        self.last_position_success = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-
-        self.last_yaw_success = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-
-        self.last_out_of_bounds = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
-
-        self.last_payload_goal_dist = torch.zeros(
-            self.num_envs,
-            device=self.device,
-        )
-
-        self.last_payload_yaw_abs = torch.zeros(
-            self.num_envs,
-            device=self.device,
-        )
 
         # AGV 朝向角，单位 rad
         self.agv_yaw = torch.zeros((self.num_envs, 3), device=self.device)
@@ -503,14 +470,6 @@ class AgvTransportEnv(DirectRLEnv):
 
         success = position_success & yaw_success
         out_of_bounds = self._compute_out_of_bounds()
-
-        # 保存 terminal 判断时刻的真实状态，供评估脚本读取
-        self.last_success[:] = success.detach()
-        self.last_position_success[:] = position_success.detach()
-        self.last_yaw_success[:] = yaw_success.detach()
-        self.last_out_of_bounds[:] = out_of_bounds.detach()
-        self.last_payload_goal_dist[:] = payload_goal_dist.detach()
-        self.last_payload_yaw_abs[:] = torch.abs(payload_yaw).detach()
 
         terminated = success | out_of_bounds
         time_out = self.episode_length_buf >= self.max_episode_length - 1
