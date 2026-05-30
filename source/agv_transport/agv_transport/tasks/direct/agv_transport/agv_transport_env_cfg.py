@@ -31,7 +31,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 20.0
+    episode_length_s = 24.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -107,14 +107,17 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # V4.0 多 waypoint 路径
     # 先用轻微折线路径，不要一开始太难
+    # V4.1A 平滑折线路径
     waypoints = (
-        (0.80, 0.00),
-        (1.40, 0.35),
-        (1.80, 0.00),
+        (0.60, 0.00),
+        (0.95, 0.20),
+        (1.30, 0.30),
+        (1.60, 0.10),
+        (1.90, 0.00),
     )
 
     # 中间 waypoint 的通过半径
-    waypoint_radius = 0.22
+    waypoint_radius = 0.20
 
     # 最终目标点位置误差
     target_radius = 0.20

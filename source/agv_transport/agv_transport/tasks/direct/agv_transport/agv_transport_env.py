@@ -139,19 +139,32 @@ class AgvTransportEnv(DirectRLEnv):
         )
 
         # 在 env_0 中创建目标点可视化标记，后续会被 clone 到其它环境
-        target_marker_cfg = sim_utils.CuboidCfg(
-            size=(0.18, 0.18, 0.02),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.0, 1.0, 0.0),
-                metallic=0.0,
-            ),
-        )
+        # V4.0：可视化所有 waypoint
+        # 中间 waypoint 用黄色，最终 waypoint 用绿色
+        for i, waypoint in enumerate(self.cfg.waypoints):
+            is_final = i == len(self.cfg.waypoints) - 1
 
-        target_marker_cfg.func(
-            "/World/envs/env_0/TargetMarker",
-            target_marker_cfg,
-            translation=(self.cfg.target_pos[0], self.cfg.target_pos[1], 0.02),
-        )
+            marker_color = (
+                (0.0, 1.0, 0.0) if is_final else (1.0, 1.0, 0.0)
+            )
+
+            marker_size = (
+                (0.22, 0.22, 0.025) if is_final else (0.16, 0.16, 0.02)
+            )
+
+            waypoint_marker_cfg = sim_utils.CuboidCfg(
+                size=marker_size,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=marker_color,
+                    metallic=0.0,
+                ),
+            )
+
+            waypoint_marker_cfg.func(
+                f"/World/envs/env_0/WaypointMarker_{i}",
+                waypoint_marker_cfg,
+                translation=(waypoint[0], waypoint[1], 0.02),
+            )
 
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
@@ -343,6 +356,8 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        path_lateral_error = self._compute_path_lateral_error()
+
         num_waypoints = len(self.cfg.waypoints)
         final_waypoint_idx = num_waypoints - 1
         is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
@@ -474,6 +489,8 @@ class AgvTransportEnv(DirectRLEnv):
                 # 目标距离
                 - 0.8 * payload_goal_dist
 
+                - 1.0 * path_lateral_error
+
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
 
@@ -482,7 +499,7 @@ class AgvTransportEnv(DirectRLEnv):
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
 
-                + 20.0 * waypoint_advance
+                + 8.0 * waypoint_advance
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
 
@@ -706,6 +723,65 @@ class AgvTransportEnv(DirectRLEnv):
         )
 
         return waypoints_xy[env_ids, self.current_waypoint_idx]
+
+    def _compute_path_lateral_error(self) -> torch.Tensor:
+        """计算 payload 到当前路径段的横向偏差。
+
+        当前路径段：
+            waypoint_idx = 0: payload 初始点 -> waypoint_0
+            waypoint_idx > 0: waypoint_{idx-1} -> waypoint_idx
+
+        Returns:
+            Tensor shape = [num_envs]
+        """
+        payload_xy = self.payload.data.root_pos_w[:, :2]
+        waypoints_xy = self._get_waypoints_xy()
+
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        current_idx = self.current_waypoint_idx
+        current_target = waypoints_xy[env_ids, current_idx]
+
+        # 第 0 段从 payload 初始位置开始
+        start_offset = torch.tensor(
+            self.cfg.payload_init_pos[:2],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        segment_start = self.scene.env_origins[:, :2] + start_offset
+
+        has_prev = current_idx > 0
+
+        prev_idx = torch.clamp(current_idx - 1, min=0)
+        prev_waypoint = waypoints_xy[env_ids, prev_idx]
+
+        segment_start = torch.where(
+            has_prev.unsqueeze(-1),
+            prev_waypoint,
+            segment_start,
+        )
+
+        segment_vec = current_target - segment_start
+        payload_vec = payload_xy - segment_start
+
+        segment_len_sq = torch.sum(segment_vec * segment_vec, dim=1).clamp_min(1e-6)
+
+        t = torch.sum(payload_vec * segment_vec, dim=1) / segment_len_sq
+        t = torch.clamp(t, 0.0, 1.0)
+
+        closest_point = segment_start + t.unsqueeze(-1) * segment_vec
+
+        lateral_error = torch.linalg.norm(
+            payload_xy - closest_point,
+            dim=1,
+        )
+
+        return lateral_error
 
     def _compute_contact_flags(self) -> torch.Tensor:
         """返回三台 AGV 的近似接触状态，shape = [num_envs, 3]。"""
