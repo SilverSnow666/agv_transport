@@ -31,6 +31,10 @@ class AgvTransportEnv(DirectRLEnv):
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.prev_payload_goal_dist = torch.zeros(self.num_envs, device=self.device)
+        self.prev_path_progress = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
         # V4.0：每个环境当前跟踪的 waypoint 编号
         self.current_waypoint_idx = torch.zeros(
@@ -85,12 +89,20 @@ class AgvTransportEnv(DirectRLEnv):
         self._agv_height = self.cfg.agv_init_pos[2]
         self._identity_quat = torch.tensor((1.0, 0.0, 0.0, 0.0), device=self.device).repeat(self.num_envs, 1)
         # 初始化一次距离缓存
-        target_xy = self._get_target_xy()
+        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities()
+
         payload_xy = self.payload.data.root_pos_w[:, :2]
         agv_xy = self.agv.data.root_pos_w[:, :2]
 
-        self.prev_payload_goal_dist[:] = torch.linalg.norm(payload_xy - target_xy, dim=1)
-        self.prev_agv_payload_dist[:] = torch.linalg.norm(agv_xy - payload_xy, dim=1)
+        self.prev_path_progress[:] = path_progress.detach()
+        self.prev_payload_goal_dist[:] = torch.linalg.norm(
+            payload_xy - target_xy,
+            dim=1,
+        )
+        self.prev_agv_payload_dist[:] = torch.linalg.norm(
+            agv_xy - payload_xy,
+            dim=1,
+        )
 
     def _hide_agv_collision_visual(self) -> None:
         """隐藏三台简化 AGV 碰撞体的视觉显示，只保留小车 USD 外观。"""
@@ -334,9 +346,13 @@ class AgvTransportEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         payload_xy = self.payload.data.root_pos_w[:, :2]
-        target_xy = self._get_target_xy()
+
+        target_xy, path_lateral_error, path_progress, _ = (
+            self._compute_path_tracking_quantities()
+        )
 
         payload_to_target = target_xy - payload_xy
+
         payload_goal_dist = torch.linalg.norm(
             payload_to_target,
             dim=1,
@@ -344,8 +360,11 @@ class AgvTransportEnv(DirectRLEnv):
 
         push_dir = payload_to_target / payload_goal_dist.unsqueeze(-1).clamp_min(1e-6)
 
-        payload_progress = self.prev_payload_goal_dist - payload_goal_dist
-        self.prev_payload_goal_dist = payload_goal_dist.detach()
+        # V4.1C：沿路径方向的连续进度奖励
+        path_progress_delta = path_progress - self.prev_path_progress
+        self.prev_path_progress[:] = path_progress.detach()
+
+        self.prev_payload_goal_dist[:] = payload_goal_dist.detach()
 
         payload_yaw = self._get_payload_yaw()
         payload_yaw_abs = torch.abs(payload_yaw)
@@ -356,16 +375,18 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        path_lateral_error = self._compute_path_lateral_error()
-
         num_waypoints = len(self.cfg.waypoints)
         final_waypoint_idx = num_waypoints - 1
         is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
 
-        near_goal = (
-                is_final_waypoint.float()
-                * (payload_goal_dist < 0.45).float()
+        final_target_xy = self._get_final_target_xy()
+
+        final_goal_dist = torch.linalg.norm(
+            payload_xy - final_target_xy,
+            dim=1,
         )
+
+        near_goal = (final_goal_dist < 0.45).float()
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
@@ -427,24 +448,12 @@ class AgvTransportEnv(DirectRLEnv):
         heading_alignment_mean = heading_alignments.mean(dim=1)
         heading_alignment_min = heading_alignments.min(dim=1).values
 
-        num_waypoints = len(self.cfg.waypoints)
-        final_waypoint_idx = num_waypoints - 1
-        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
-
-        position_success = (
-                is_final_waypoint
-                & (payload_goal_dist < self.cfg.target_radius)
-        )
+        position_success = final_goal_dist < self.cfg.target_radius
 
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
         success = position_success & yaw_success
 
-        waypoint_advance = (
-                self.current_waypoint_idx > self.prev_waypoint_idx
-        ).float()
-
-        self.prev_waypoint_idx[:] = self.current_waypoint_idx
         out_of_bounds = self._compute_out_of_bounds()
 
         action_penalty = torch.sum(
@@ -484,12 +493,12 @@ class AgvTransportEnv(DirectRLEnv):
 
         reward = (
             # 核心目标：payload 向目标移动
-                25.0 * payload_progress
+                25.0 * path_progress_delta
 
                 # 目标距离
                 - 0.8 * payload_goal_dist
 
-                - 1.0 * path_lateral_error
+                - 0.3 * path_lateral_error
 
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
@@ -498,8 +507,6 @@ class AgvTransportEnv(DirectRLEnv):
                 - 2.0 * near_goal * payload_yaw_abs
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
-
-                + 8.0 * waypoint_advance
                 # 鼓励多车接近 payload，但不要主导训练
                 + 0.4 * contact_count
 
@@ -533,70 +540,23 @@ class AgvTransportEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         """判断 episode 是否结束。
 
-        V4.0:
-            - payload 到达中间 waypoint 后，切换到下一个 waypoint；
-            - payload 到达最后 waypoint 且 yaw 满足要求，任务成功；
-            - AGV 或 payload 越界则失败终止；
-            - 达到最大步数则 time_out。
+        V4.1C:
+            - 不再进行离散 waypoint 切换；
+            - target 由路径 lookahead 连续生成；
+            - 只有到达最终路径终点并满足 yaw，才认为成功。
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
-        waypoints_xy = self._get_waypoints_xy()
+        final_target_xy = self._get_final_target_xy()
 
-        env_ids = torch.arange(
-            self.num_envs,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
-
-        payload_goal_dist = torch.linalg.norm(
-            payload_xy - target_xy,
+        final_goal_dist = torch.linalg.norm(
+            payload_xy - final_target_xy,
             dim=1,
         )
-
-        num_waypoints = len(self.cfg.waypoints)
-        final_waypoint_idx = num_waypoints - 1
-
-        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
-
-        reached_current_waypoint = payload_goal_dist < self.cfg.waypoint_radius
-
-        # 到达中间 waypoint：切换到下一个 waypoint，但不结束 episode
-        should_advance = reached_current_waypoint & (~is_final_waypoint)
-
-        if torch.any(should_advance):
-            self.current_waypoint_idx[should_advance] += 1
-
-            # 切换 waypoint 后，重新设置 prev_payload_goal_dist，
-            # 避免 progress 因目标突然切换产生异常大负值。
-            new_target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
-            new_payload_goal_dist = torch.linalg.norm(
-                payload_xy - new_target_xy,
-                dim=1,
-            )
-
-            self.prev_payload_goal_dist[should_advance] = new_payload_goal_dist[
-                should_advance
-            ].detach()
-
-        # 切换后重新计算当前目标和距离
-        target_xy = waypoints_xy[env_ids, self.current_waypoint_idx]
-
-        payload_goal_dist = torch.linalg.norm(
-            payload_xy - target_xy,
-            dim=1,
-        )
-
-        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
 
         payload_yaw = self._get_payload_yaw()
 
-        position_success = (
-                is_final_waypoint
-                & (payload_goal_dist < self.cfg.target_radius)
-        )
+        position_success = final_goal_dist < self.cfg.target_radius
 
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
@@ -609,10 +569,11 @@ class AgvTransportEnv(DirectRLEnv):
         self.last_position_success[:] = position_success.detach()
         self.last_yaw_success[:] = yaw_success.detach()
         self.last_out_of_bounds[:] = out_of_bounds.detach()
-        self.last_payload_goal_dist[:] = payload_goal_dist.detach()
+        self.last_payload_goal_dist[:] = final_goal_dist.detach()
         self.last_payload_yaw_abs[:] = torch.abs(payload_yaw).detach()
 
         terminated = success | out_of_bounds
+
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         return terminated, time_out
@@ -682,8 +643,14 @@ class AgvTransportEnv(DirectRLEnv):
         self.current_waypoint_idx[env_ids_tensor] = 0
         self.prev_waypoint_idx[env_ids_tensor] = 0
 
-        target_xy = self._get_target_xy()[env_ids_tensor]
+        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities()
+
+        target_xy = target_xy[env_ids_tensor]
+        path_progress = path_progress[env_ids_tensor]
+
         payload_xy = payload_state[:, :2]
+
+        self.prev_path_progress[env_ids_tensor] = path_progress.detach()
 
         self.prev_payload_goal_dist[env_ids_tensor] = torch.linalg.norm(
             payload_xy - target_xy,
@@ -712,75 +679,162 @@ class AgvTransportEnv(DirectRLEnv):
 
         return self.scene.env_origins[:, None, :2] + waypoint_offsets[None, :, :]
 
-    def _get_target_xy(self) -> torch.Tensor:
-        """返回当前 waypoint 的世界坐标 xy。"""
-        waypoints_xy = self._get_waypoints_xy()
+    def _get_path_points_xy(self) -> torch.Tensor:
+        """返回路径点序列。
 
-        env_ids = torch.arange(
-            self.num_envs,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        return waypoints_xy[env_ids, self.current_waypoint_idx]
-
-    def _compute_path_lateral_error(self) -> torch.Tensor:
-        """计算 payload 到当前路径段的横向偏差。
-
-        当前路径段：
-            waypoint_idx = 0: payload 初始点 -> waypoint_0
-            waypoint_idx > 0: waypoint_{idx-1} -> waypoint_idx
+        路径点包括：
+            payload 初始点 + cfg.waypoints
 
         Returns:
-            Tensor shape = [num_envs]
+            Tensor shape = [num_envs, num_points, 2]
         """
-        payload_xy = self.payload.data.root_pos_w[:, :2]
-        waypoints_xy = self._get_waypoints_xy()
-
-        env_ids = torch.arange(
-            self.num_envs,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        current_idx = self.current_waypoint_idx
-        current_target = waypoints_xy[env_ids, current_idx]
-
-        # 第 0 段从 payload 初始位置开始
         start_offset = torch.tensor(
             self.cfg.payload_init_pos[:2],
             device=self.device,
             dtype=torch.float32,
-        )
+        ).view(1, 1, 2)
 
-        segment_start = self.scene.env_origins[:, :2] + start_offset
+        start_xy = self.scene.env_origins[:, None, :2] + start_offset
 
-        has_prev = current_idx > 0
+        waypoints_xy = self._get_waypoints_xy()
 
-        prev_idx = torch.clamp(current_idx - 1, min=0)
-        prev_waypoint = waypoints_xy[env_ids, prev_idx]
-
-        segment_start = torch.where(
-            has_prev.unsqueeze(-1),
-            prev_waypoint,
-            segment_start,
-        )
-
-        segment_vec = current_target - segment_start
-        payload_vec = payload_xy - segment_start
-
-        segment_len_sq = torch.sum(segment_vec * segment_vec, dim=1).clamp_min(1e-6)
-
-        t = torch.sum(payload_vec * segment_vec, dim=1) / segment_len_sq
-        t = torch.clamp(t, 0.0, 1.0)
-
-        closest_point = segment_start + t.unsqueeze(-1) * segment_vec
-
-        lateral_error = torch.linalg.norm(
-            payload_xy - closest_point,
+        return torch.cat(
+            (start_xy, waypoints_xy),
             dim=1,
         )
 
+    def _get_final_target_xy(self) -> torch.Tensor:
+        """返回最终路径终点。"""
+        waypoints_xy = self._get_waypoints_xy()
+        return waypoints_xy[:, -1, :]
+
+    def _compute_path_tracking_quantities(self):
+        """计算连续路径跟踪所需的前视目标点、横向误差和路径进度。
+
+        Returns:
+            target_xy: 前视目标点，shape = [num_envs, 2]
+            lateral_error: payload 到路径段的横向误差，shape = [num_envs]
+            progress_s: payload 沿路径的投影进度，shape = [num_envs]
+            segment_idx: payload 当前所在路径段编号，shape = [num_envs]
+        """
+        payload_xy = self.payload.data.root_pos_w[:, :2]
+
+        path_points = self._get_path_points_xy()
+
+        segment_start = path_points[:, :-1, :]
+        segment_end = path_points[:, 1:, :]
+
+        segment_vec = segment_end - segment_start
+
+        segment_len = torch.linalg.norm(
+            segment_vec,
+            dim=2,
+        ).clamp_min(1e-6)
+
+        segment_len_sq = segment_len * segment_len
+
+        payload_vec = payload_xy[:, None, :] - segment_start
+
+        t = torch.sum(
+            payload_vec * segment_vec,
+            dim=2,
+        ) / segment_len_sq
+
+        t = torch.clamp(t, 0.0, 1.0)
+
+        closest_points = segment_start + t.unsqueeze(-1) * segment_vec
+
+        distances = torch.linalg.norm(
+            payload_xy[:, None, :] - closest_points,
+            dim=2,
+        )
+
+        segment_idx = torch.argmin(
+            distances,
+            dim=1,
+        )
+
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        best_t = t[env_ids, segment_idx]
+
+        lateral_error = distances[env_ids, segment_idx]
+
+        cumulative_start = torch.cat(
+            (
+                torch.zeros(
+                    (self.num_envs, 1),
+                    device=self.device,
+                ),
+                torch.cumsum(segment_len[:, :-1], dim=1),
+            ),
+            dim=1,
+        )
+
+        progress_s = (
+                cumulative_start[env_ids, segment_idx]
+                + best_t * segment_len[env_ids, segment_idx]
+        )
+
+        total_length = torch.sum(
+            segment_len,
+            dim=1,
+        )
+
+        lookahead_dist = getattr(
+            self.cfg,
+            "path_lookahead_dist",
+            0.25,
+        )
+
+        target_s = torch.clamp(
+            progress_s + lookahead_dist,
+            max=total_length,
+        )
+
+        cumulative_end = cumulative_start + segment_len
+
+        target_segment_mask = target_s.unsqueeze(1) <= cumulative_end + 1e-6
+
+        target_segment_idx = torch.argmax(
+            target_segment_mask.to(torch.int64),
+            dim=1,
+        )
+
+        target_local_s = (
+                target_s
+                - cumulative_start[env_ids, target_segment_idx]
+        )
+
+        target_t = torch.clamp(
+            target_local_s / segment_len[env_ids, target_segment_idx],
+            0.0,
+            1.0,
+        )
+
+        target_xy = (
+                segment_start[env_ids, target_segment_idx]
+                + target_t.unsqueeze(-1) * segment_vec[env_ids, target_segment_idx]
+        )
+
+        # 这里保留 current_waypoint_idx，用于评估 CSV 中观察路径进度。
+        # 在 V4.1C 中它表示“当前最近路径段编号”，不再表示离散 waypoint 是否通过。
+        self.current_waypoint_idx[:] = segment_idx.detach()
+
+        return target_xy, lateral_error, progress_s, segment_idx
+
+    def _get_target_xy(self) -> torch.Tensor:
+        """返回连续路径跟踪的 lookahead target。"""
+        target_xy, _, _, _ = self._compute_path_tracking_quantities()
+        return target_xy
+
+    def _compute_path_lateral_error(self) -> torch.Tensor:
+        """返回 payload 到当前路径的横向误差。"""
+        _, lateral_error, _, _ = self._compute_path_tracking_quantities()
         return lateral_error
 
     def _compute_contact_flags(self) -> torch.Tensor:

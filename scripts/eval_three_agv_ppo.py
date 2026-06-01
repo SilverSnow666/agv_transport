@@ -362,7 +362,7 @@ def main(env_cfg, agent_cfg):
                 "payload_y",
                 "target_x",
                 "target_y",
-                "waypoint_idx",
+                "path_segment_idx",
                 "payload_target_dist",
                 "payload_yaw",
                 "agv1_x",
