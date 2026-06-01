@@ -390,6 +390,22 @@ class AgvTransportEnv(DirectRLEnv):
 
         contact_flags = self._compute_contact_flags()
         contact_count = contact_flags.float().sum(dim=1)
+        all_three_contact = torch.all(
+            contact_flags,
+            dim=1,
+        ).float()
+
+        # 只有沿路径真实前进时，才给接触奖励
+        progress_gate = torch.clamp(
+            path_progress_delta / 0.005,
+            min=0.0,
+            max=1.0,
+        )
+
+        contact_reward = progress_gate * (
+                0.25 * contact_count
+                + 0.8 * all_three_contact
+        )
 
         # 队形误差 + 角色相关朝向奖励
         desired_positions = self._compute_formation_target_xy()
@@ -493,10 +509,13 @@ class AgvTransportEnv(DirectRLEnv):
 
         reward = (
             # 核心目标：payload 向目标移动
-                25.0 * path_progress_delta
+                30.0 * path_progress_delta
 
                 # 目标距离
                 - 0.8 * payload_goal_dist
+
+                # 距离最终终点
+                - 0.6 * final_goal_dist
 
                 - 0.3 * path_lateral_error
 
@@ -508,7 +527,7 @@ class AgvTransportEnv(DirectRLEnv):
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
                 # 鼓励多车接近 payload，但不要主导训练
-                + 0.4 * contact_count
+                + contact_reward
 
                 # 队形约束
                 - 0.5 * formation_error_mean
@@ -530,7 +549,7 @@ class AgvTransportEnv(DirectRLEnv):
                 - 2.0 * agv_overlap_penalty
 
                 # 成功奖励
-                + 100.0 * success.float()
+                + 150.0 * success.float()
                 - 30.0 * out_of_bounds.float()
 
         )
