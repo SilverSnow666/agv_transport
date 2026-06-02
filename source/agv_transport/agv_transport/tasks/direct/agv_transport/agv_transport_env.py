@@ -35,6 +35,10 @@ class AgvTransportEnv(DirectRLEnv):
             self.num_envs,
             device=self.device,
         )
+        self.last_path_lateral_error = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
         # V4.0：每个环境当前跟踪的 waypoint 编号
         self.current_waypoint_idx = torch.zeros(
@@ -375,10 +379,6 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
-        num_waypoints = len(self.cfg.waypoints)
-        final_waypoint_idx = num_waypoints - 1
-        is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
-
         final_target_xy = self._get_final_target_xy()
 
         final_goal_dist = torch.linalg.norm(
@@ -472,6 +472,7 @@ class AgvTransportEnv(DirectRLEnv):
 
         out_of_bounds = self._compute_out_of_bounds()
 
+
         action_penalty = torch.sum(
             torch.square(self.actions),
             dim=1,
@@ -507,6 +508,12 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        agv_collision = self._compute_agv_collision()
+
+        path_out_of_corridor = (
+                path_lateral_error > self.cfg.path_corridor_radius
+        )
+
         reward = (
             # 核心目标：payload 向目标移动
                 30.0 * path_progress_delta
@@ -517,7 +524,7 @@ class AgvTransportEnv(DirectRLEnv):
                 # 距离最终终点
                 - 0.6 * final_goal_dist
 
-                - 0.3 * path_lateral_error
+                - 1.0 * path_lateral_error
 
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
@@ -546,12 +553,13 @@ class AgvTransportEnv(DirectRLEnv):
                 - 0.020 * angular_rate_penalty
 
                 # AGV 间软分离
-                - 2.0 * agv_overlap_penalty
+                - 6.0 * agv_overlap_penalty
+                - 50.0 * agv_collision.float()
 
                 # 成功奖励
                 + 150.0 * success.float()
                 - 30.0 * out_of_bounds.float()
-
+                - 30.0 * path_out_of_corridor.float()
         )
 
         return reward
@@ -583,15 +591,23 @@ class AgvTransportEnv(DirectRLEnv):
 
         out_of_bounds = self._compute_out_of_bounds()
 
-        # 保存 terminal 判断时刻的真实状态，供评估脚本读取
+        _, path_lateral_error, _, _ = self._compute_path_tracking_quantities()
+
+        path_out_of_corridor = (
+                path_lateral_error > self.cfg.path_corridor_radius
+        )
+
+        agv_collision = self._compute_agv_collision()
+
         self.last_success[:] = success.detach()
         self.last_position_success[:] = position_success.detach()
         self.last_yaw_success[:] = yaw_success.detach()
         self.last_out_of_bounds[:] = out_of_bounds.detach()
         self.last_payload_goal_dist[:] = final_goal_dist.detach()
         self.last_payload_yaw_abs[:] = torch.abs(payload_yaw).detach()
+        self.last_path_lateral_error[:] = path_lateral_error.detach()
 
-        terminated = success | out_of_bounds
+        terminated = success | out_of_bounds | path_out_of_corridor | agv_collision
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 

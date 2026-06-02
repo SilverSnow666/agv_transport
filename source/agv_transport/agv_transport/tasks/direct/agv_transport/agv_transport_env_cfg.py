@@ -31,7 +31,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 24.0
+    episode_length_s = 28.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -109,18 +109,23 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 先用轻微折线路径，不要一开始太难
     # V4.1A 平滑折线路径
     waypoints = (
-        (0.85, 0.00),
-        (1.20, 0.12),
-        (1.55, 0.20),
-        (1.80, 0.08),
-        (1.95, 0.00),
+        (0.70, 0.00),
+        (1.10, 0.25),
+        (1.55, 0.40),
+        (2.00, 0.20),
+        (2.35, 0.00),
     )
 
     # V4.1C 连续路径跟踪前视距离
-    path_lookahead_dist = 0.25
+    path_lookahead_dist = 0.20
+
+    # V4.1-Visual-2：路径走廊半径
+    # payload 中心偏离规划路径超过该距离，则认为路径跟踪失败
+    path_corridor_radius = 0.30
 
     # 中间 waypoint 的通过半径
     waypoint_radius = 0.20
+
 
     # 最终目标点位置误差
     target_radius = 0.20
