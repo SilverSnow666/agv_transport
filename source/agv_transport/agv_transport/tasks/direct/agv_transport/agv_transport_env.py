@@ -12,24 +12,28 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from .agv_transport_env_cfg import AgvTransportEnvCfg
 from pxr import Usd, UsdGeom
 
-class AgvTransportEnv(DirectRLEnv):
-    """单 AGV 推箱子任务。
 
-    当前版本是最小闭环：
-    - 一个蓝色方块代表 AGV；
-    - 一个橙色方块代表 payload；
-    - AGV 使用 [v, w] 差速运动学控制；
-    - 目标是把 payload 推到固定目标点。
+class AgvTransportEnv(DirectRLEnv):
+    """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
+
+    当前版本用于 V4.2-B0-easy-contact：AGV1 Dropout 接触课程训练。
+    训练时通过配置中的 ``agv_speed_scales`` 控制各 AGV 的实际动作幅值，
+    先禁用 AGV1，并把禁用 AGV 停到待命区；随后用接近推送位奖励和
+    预接触奖励，引导 AGV2/AGV3 先学会靠近 payload、接触 payload，
+    再逐步学习推进和姿态调整。
     """
 
     cfg: AgvTransportEnvCfg
 
-
     def __init__(self, cfg: AgvTransportEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
-        self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
+        self.actions = torch.zeros(
+            (self.num_envs, self.cfg.action_space), device=self.device
+        )
+        self.prev_actions = torch.zeros(
+            (self.num_envs, self.cfg.action_space), device=self.device
+        )
         self.prev_payload_goal_dist = torch.zeros(self.num_envs, device=self.device)
         self.prev_path_progress = torch.zeros(
             self.num_envs,
@@ -38,12 +42,6 @@ class AgvTransportEnv(DirectRLEnv):
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
         # V4.0：每个环境当前跟踪的 waypoint 编号
         self.current_waypoint_idx = torch.zeros(
-            self.num_envs,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        self.path_segment_idx = torch.zeros(
             self.num_envs,
             dtype=torch.long,
             device=self.device,
@@ -79,6 +77,12 @@ class AgvTransportEnv(DirectRLEnv):
             device=self.device,
         )
 
+        self.last_obstacle_collision = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
         self.last_payload_goal_dist = torch.zeros(
             self.num_envs,
             device=self.device,
@@ -89,15 +93,39 @@ class AgvTransportEnv(DirectRLEnv):
             device=self.device,
         )
 
+        self.prev_formation_error_mean = torch.zeros(
+            self.num_envs,
+            device=self.device,
+        )
+
         # AGV 朝向角，单位 rad
         self.agv_yaw = torch.zeros((self.num_envs, 3), device=self.device)
 
         self._agv_height = self.cfg.agv_init_pos[2]
-        self._identity_quat = torch.tensor((1.0, 0.0, 0.0, 0.0), device=self.device).repeat(self.num_envs, 1)
-        # 初始化一次距离缓存
-        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities(
-            update_segment=False
+        self._identity_quat = torch.tensor(
+            (1.0, 0.0, 0.0, 0.0), device=self.device
+        ).repeat(self.num_envs, 1)
+
+        # V4.2-B0：AGV 动作缩放 / Dropout mask。
+        # 例如 (0.0, 1.0, 1.0) 表示禁用 AGV1，只训练 AGV2/AGV3。
+        self._agv_speed_scales = torch.tensor(
+            self.cfg.agv_speed_scales,
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, 3)
+        self._action_scale_mask = torch.repeat_interleave(
+            self._agv_speed_scales, repeats=2, dim=1
         )
+        self._active_agv_mask = (self._agv_speed_scales > 1e-6).float()
+        self._num_active_agvs = torch.clamp(
+            self._active_agv_mask.sum(dim=1), min=1.0
+        )
+        self._required_contact_count = torch.clamp(
+            self._num_active_agvs, max=2.0
+        )
+
+        # 初始化一次距离缓存
+        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities()
 
         payload_xy = self.payload.data.root_pos_w[:, :2]
         agv_xy = self.agv.data.root_pos_w[:, :2]
@@ -111,6 +139,13 @@ class AgvTransportEnv(DirectRLEnv):
             agv_xy - payload_xy,
             dim=1,
         )
+
+        formation_errors = self._compute_formation_errors()
+        formation_error_mean = (
+            torch.sum(formation_errors * self._active_agv_mask, dim=1)
+            / self._num_active_agvs
+        )
+        self.prev_formation_error_mean[:] = formation_error_mean.detach()
 
     def _hide_agv_collision_visual(self) -> None:
         """隐藏三台简化 AGV 碰撞体的视觉显示，只保留小车 USD 外观。"""
@@ -186,6 +221,23 @@ class AgvTransportEnv(DirectRLEnv):
                 translation=(waypoint[0], waypoint[1], 0.02),
             )
 
+        # V4.2-A：可视化虚拟障碍物区域
+        # 注意：这是用于显示的标记；真正的碰撞/失败判定在 _compute_obstacle_collision() 中完成。
+        if hasattr(self.cfg, "obstacle_box"):
+            x_min, x_max, y_min, y_max = self.cfg.obstacle_box
+            obstacle_marker_cfg = sim_utils.CuboidCfg(
+                size=(x_max - x_min, y_max - y_min, 0.035),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.05, 0.05),
+                    metallic=0.0,
+                ),
+            )
+            obstacle_marker_cfg.func(
+                "/World/envs/env_0/VirtualObstacleMarker",
+                obstacle_marker_cfg,
+                translation=((x_min + x_max) * 0.5, (y_min + y_max) * 0.5, 0.018),
+            )
+
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
         for agv_name in ["AGV1", "AGV2", "AGV3"]:
@@ -215,12 +267,16 @@ class AgvTransportEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.prev_actions[:] = self.actions
         self.actions = torch.clamp(actions, -1.0, 1.0)
+        self.actions = self.actions * self._action_scale_mask
 
     def _apply_action(self) -> None:
         """三 AGV 差速运动学。
 
         actions:
             [v1, w1, v2, w2, v3, w3]
+
+        注意：self.actions 已在 _pre_physics_step 中乘以 agv_speed_scales，
+        因此这里使用的已经是执行动作。
         """
         dt = self.cfg.sim.dt * self.cfg.decimation
         env_xy = self.scene.env_origins[:, :2]
@@ -356,7 +412,7 @@ class AgvTransportEnv(DirectRLEnv):
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
         target_xy, path_lateral_error, path_progress, _ = (
-            self._compute_path_tracking_quantities(update_segment=True)
+            self._compute_path_tracking_quantities()
         )
 
         payload_to_target = target_xy - payload_xy
@@ -386,6 +442,7 @@ class AgvTransportEnv(DirectRLEnv):
         num_waypoints = len(self.cfg.waypoints)
         final_waypoint_idx = num_waypoints - 1
         is_final_waypoint = self.current_waypoint_idx == final_waypoint_idx
+        final_goal_gate = is_final_waypoint.float()
 
         final_target_xy = self._get_final_target_xy()
 
@@ -396,23 +453,67 @@ class AgvTransportEnv(DirectRLEnv):
 
         near_goal = (final_goal_dist < 0.45).float()
 
-        contact_flags = self._compute_contact_flags()
-        contact_count = contact_flags.float().sum(dim=1)
-        all_three_contact = torch.all(
-            contact_flags,
-            dim=1,
-        ).float()
+        contact_flags = self._compute_contact_flags().float()
+        active_contact_flags = contact_flags * self._active_agv_mask
+        contact_count = active_contact_flags.sum(dim=1)
 
-        # 只有沿路径真实前进时，才给接触奖励
+        # 只有沿路径真实前进时，才给接触奖励。
+        # B0 阶段只统计 active AGV，禁用的 AGV1 不参与接触计数。
         progress_gate = torch.clamp(
             path_progress_delta / 0.005,
             min=0.0,
             max=1.0,
         )
 
-        contact_reward = progress_gate * (
-                0.25 * contact_count
-                + 0.8 * all_three_contact
+        # B0-easy-contact：接触本身给小奖励，避免 AGV2/AGV3 在尚未推动
+        # payload 前完全拿不到正反馈。推动产生路径进度后，再叠加进度门控奖励。
+        pre_contact_reward = 0.15 * torch.clamp(contact_count, max=2.0)
+        contact_reward = pre_contact_reward + progress_gate * (
+            0.20 * torch.clamp(contact_count, max=2.0)
+        )
+
+        one_agv_only_progress = (
+            (path_progress_delta > 0.001)
+            & (contact_count < self._required_contact_count)
+        ).float()
+
+        agv_payload_dists = []
+
+        for agv in self.agvs:
+            agv_xy = agv.data.root_pos_w[:, :2]
+            agv_payload_dist = torch.linalg.norm(
+                agv_xy - payload_xy,
+                dim=1,
+            )
+            agv_payload_dists.append(agv_payload_dist)
+
+        agv_payload_dists = torch.stack(agv_payload_dists, dim=1)
+
+        agv_activity = torch.stack(
+            [
+                torch.linalg.norm(self.actions[:, 0:2], dim=1),
+                torch.linalg.norm(self.actions[:, 2:4], dim=1),
+                torch.linalg.norm(self.actions[:, 4:6], dim=1),
+            ],
+            dim=1,
+        )
+
+        non_contact_activity = torch.sum(
+            self._active_agv_mask * (1.0 - contact_flags) * agv_activity,
+            dim=1,
+        )
+
+        # active AGV 允许不接触 payload，但应保持在可重新接入的待命区。
+        standby_too_far = torch.clamp(agv_payload_dists - 1.80, min=0.0)
+        standby_too_close = torch.clamp(0.75 - agv_payload_dists, min=0.0)
+
+        standby_penalty = torch.sum(
+            self._active_agv_mask
+            * (
+                standby_too_far * standby_too_far
+                + standby_too_close * standby_too_close
+            ),
+            dim=1,
         )
 
         # 队形误差 + 角色相关朝向奖励
@@ -466,11 +567,42 @@ class AgvTransportEnv(DirectRLEnv):
         formation_errors = torch.stack(formation_errors, dim=1)
         heading_alignments = torch.stack(heading_alignments, dim=1)
 
-        formation_error_mean = formation_errors.mean(dim=1)
-        formation_error_max = formation_errors.max(dim=1).values
+        active_mask = self._active_agv_mask
+        active_mask_bool = active_mask.bool()
 
-        heading_alignment_mean = heading_alignments.mean(dim=1)
-        heading_alignment_min = heading_alignments.min(dim=1).values
+        formation_error_mean = torch.sum(
+            formation_errors * active_mask, dim=1
+        ) / self._num_active_agvs
+        formation_error_max = torch.max(
+            torch.where(
+                active_mask_bool,
+                formation_errors,
+                torch.zeros_like(formation_errors),
+            ),
+            dim=1,
+        ).values
+
+        heading_alignment_mean = torch.sum(
+            heading_alignments * active_mask, dim=1
+        ) / self._num_active_agvs
+        heading_alignment_min = torch.min(
+            torch.where(
+                active_mask_bool,
+                heading_alignments,
+                torch.ones_like(heading_alignments),
+            ),
+            dim=1,
+        ).values
+
+        # B0-easy-contact：在 payload 尚未移动前，引导 active AGV 靠近各自
+        # 推送队形点。只要 formation error 比上一时刻减小，就给正反馈。
+        formation_progress = self.prev_formation_error_mean - formation_error_mean
+        self.prev_formation_error_mean[:] = formation_error_mean.detach()
+        approach_reward = torch.clamp(
+            formation_progress / 0.005,
+            min=-1.0,
+            max=1.0,
+        )
 
         position_success = final_goal_dist < self.cfg.target_radius
 
@@ -479,6 +611,18 @@ class AgvTransportEnv(DirectRLEnv):
         success = position_success & yaw_success
 
         out_of_bounds = self._compute_out_of_bounds()
+
+        heading_reward = progress_gate * (
+                0.45 * heading_alignment_mean
+                + 0.15 * heading_alignment_min
+        )
+
+        not_success = (~success).float()
+
+        stall = (
+                (path_progress_delta < 0.001)
+                & (payload_speed < 0.02)
+        ).float()
 
         action_penalty = torch.sum(
             torch.square(self.actions),
@@ -515,51 +659,51 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        obstacle_collision = self._compute_obstacle_collision()
+        backward_progress = torch.clamp(-path_progress_delta, min=0.0)
+        agv_collision = self._compute_agv_collision()
+
         reward = (
-            # 核心目标：payload 向目标移动
                 30.0 * path_progress_delta
 
-                # 目标距离
                 - 0.8 * payload_goal_dist
+                - 0.15 * final_goal_gate * final_goal_dist
+                - 1.2 * path_lateral_error
 
-                # 距离最终终点
-                - 0.6 * final_goal_dist
-
-                - 0.3 * path_lateral_error
-
-                # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
 
-                # 接近目标后加强位姿稳定
                 - 2.0 * near_goal * payload_yaw_abs
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
-                # 鼓励多车接近 payload，但不要主导训练
-                + contact_reward
 
-                # 队形约束
+                + contact_reward
+                + 1.5 * approach_reward
+
                 - 0.5 * formation_error_mean
                 - 0.15 * formation_error_max
 
-                # 角色相关朝向奖励
-                + 0.45 * heading_alignment_mean
-                + 0.15 * heading_alignment_min
+                + heading_reward
 
-                # 动作平滑
                 - 0.005 * action_penalty
                 - 0.015 * action_rate_penalty
 
-                # 抑制角速度抖动
                 - 0.010 * angular_action_penalty
                 - 0.020 * angular_rate_penalty
 
-                # AGV 间软分离
-                - 2.0 * agv_overlap_penalty
+                - 8.0 * agv_overlap_penalty
+                - 20.0 * agv_collision.float()
 
-                # 成功奖励
+                - 0.0 * one_agv_only_progress
+                - 0.02 * non_contact_activity
+                - 0.20 * standby_penalty
+
+                - 10.0 * backward_progress
+                - 0.60 * stall * not_success
+                - 0.03 * not_success
+
                 + 150.0 * success.float()
                 - 30.0 * out_of_bounds.float()
-
+                - 0.0 * obstacle_collision.float()
         )
 
         return reward
@@ -594,8 +738,11 @@ class AgvTransportEnv(DirectRLEnv):
         # 保存 terminal 判断时刻的真实状态，供评估脚本读取
         self.last_success[:] = success.detach()
         self.last_position_success[:] = position_success.detach()
+        obstacle_collision = self._compute_obstacle_collision()
+
         self.last_yaw_success[:] = yaw_success.detach()
         self.last_out_of_bounds[:] = out_of_bounds.detach()
+        self.last_obstacle_collision[:] = obstacle_collision.detach()
         self.last_payload_goal_dist[:] = final_goal_dist.detach()
         self.last_payload_yaw_abs[:] = torch.abs(payload_yaw).detach()
 
@@ -635,8 +782,19 @@ class AgvTransportEnv(DirectRLEnv):
         for i, agv in enumerate(self.agvs):
             agv_state = agv.data.default_root_state[env_ids_tensor].clone()
 
+            # B0-easy-contact：被禁用的 AGV 不应挡在 payload 后方。
+            # 若 speed scale 为 0，则把该 AGV 停到待命区，只作为场景中
+            # 的静止实体存在，不参与当前课程训练。
+            if (
+                self._agv_speed_scales[0, i] <= 1e-6
+                and hasattr(self.cfg, "inactive_agv_park_positions")
+            ):
+                agv_init_position = self.cfg.inactive_agv_park_positions[i]
+            else:
+                agv_init_position = self.cfg.agv_init_positions[i]
+
             agv_offset = torch.tensor(
-                self.cfg.agv_init_positions[i],
+                agv_init_position,
                 device=self.device,
             ).repeat(num_reset, 1)
 
@@ -669,11 +827,8 @@ class AgvTransportEnv(DirectRLEnv):
         # V4.0：每个 episode 从第 0 个 waypoint 开始
         self.current_waypoint_idx[env_ids_tensor] = 0
         self.prev_waypoint_idx[env_ids_tensor] = 0
-        self.path_segment_idx[env_ids_tensor] = 0
 
-        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities(
-            update_segment=False
-        )
+        target_xy, _, path_progress, _ = self._compute_path_tracking_quantities()
 
         target_xy = target_xy[env_ids_tensor]
         path_progress = path_progress[env_ids_tensor]
@@ -687,6 +842,15 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        formation_errors = self._compute_formation_errors()
+        formation_error_mean = (
+            torch.sum(formation_errors * self._active_agv_mask, dim=1)
+            / self._num_active_agvs
+        )
+        self.prev_formation_error_mean[env_ids_tensor] = formation_error_mean[
+            env_ids_tensor
+        ].detach()
+
         # 兼容旧变量，如果你代码里还保留 prev_agv_payload_dist
         if hasattr(self, "prev_agv_payload_dist"):
             agv1_xy = self.agv1.data.root_pos_w[env_ids_tensor, :2]
@@ -694,6 +858,8 @@ class AgvTransportEnv(DirectRLEnv):
                 agv1_xy - payload_xy,
                 dim=1,
             )
+
+            
 
     def _get_waypoints_xy(self) -> torch.Tensor:
         """返回所有 waypoint 的世界坐标。
@@ -738,42 +904,85 @@ class AgvTransportEnv(DirectRLEnv):
         waypoints_xy = self._get_waypoints_xy()
         return waypoints_xy[:, -1, :]
 
-    def _compute_path_tracking_quantities(self, update_segment: bool = False):
+    def _compute_obstacle_collision(self) -> torch.Tensor:
+        """判断 payload 中心点是否进入虚拟障碍物区域。
+
+        obstacle_box 使用每个 env 原点下的局部坐标：
+            (x_min, x_max, y_min, y_max)
+
+        当前 B0 课程中该项只保留为评估指标，reward 中的权重为 0。
+        """
+        if not hasattr(self.cfg, "obstacle_box"):
+            return torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+        env_xy = self.scene.env_origins[:, :2]
+
+        x_min, x_max, y_min, y_max = self.cfg.obstacle_box
+
+        def inside_box(world_xy: torch.Tensor) -> torch.Tensor:
+            local_xy = world_xy - env_xy
+            x = local_xy[:, 0]
+            y = local_xy[:, 1]
+
+            return (
+                (x > x_min)
+                & (x < x_max)
+                & (y > y_min)
+                & (y < y_max)
+            )
+
+        collision = inside_box(self.payload.data.root_pos_w[:, :2])
+        return collision
+
+    def _compute_path_tracking_quantities(self):
         """计算连续路径跟踪所需的前视目标点、横向误差和路径进度。
 
-        V4.1B-OrderedPath:
-            - 不再使用“全局最近路径段”；
-            - 每个环境维护 path_segment_idx；
-            - payload 只能按路径段顺序前进；
-            - 防止 payload 直线抄近路、跳到后面的路径段。
-
-        Args:
-            update_segment:
-                True 时允许更新 path_segment_idx。
-                只应该在 _get_rewards() 中设为 True，
-                其他地方保持 False，避免一次 step 内多次跳段。
-
         Returns:
-            target_xy: lookahead 目标点, shape = [num_envs, 2]
-            lateral_error: payload 到当前路径段的横向误差, shape = [num_envs]
-            progress_s: payload 沿路径的累计进度, shape = [num_envs]
-            current_idx: 当前路径段编号, shape = [num_envs]
+            target_xy: 前视目标点，shape = [num_envs, 2]
+            lateral_error: payload 到路径段的横向误差，shape = [num_envs]
+            progress_s: payload 沿路径的投影进度，shape = [num_envs]
+            segment_idx: payload 当前所在路径段编号，shape = [num_envs]
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
         path_points = self._get_path_points_xy()
 
-        segment_start_all = path_points[:, :-1, :]
-        segment_end_all = path_points[:, 1:, :]
+        segment_start = path_points[:, :-1, :]
+        segment_end = path_points[:, 1:, :]
 
-        segment_vec_all = segment_end_all - segment_start_all
+        segment_vec = segment_end - segment_start
 
-        segment_len_all = torch.linalg.norm(
-            segment_vec_all,
+        segment_len = torch.linalg.norm(
+            segment_vec,
             dim=2,
         ).clamp_min(1e-6)
 
-        num_segments = segment_start_all.shape[1]
+        segment_len_sq = segment_len * segment_len
+
+        payload_vec = payload_xy[:, None, :] - segment_start
+
+        t = torch.sum(
+            payload_vec * segment_vec,
+            dim=2,
+        ) / segment_len_sq
+
+        t = torch.clamp(t, 0.0, 1.0)
+
+        closest_points = segment_start + t.unsqueeze(-1) * segment_vec
+
+        distances = torch.linalg.norm(
+            payload_xy[:, None, :] - closest_points,
+            dim=2,
+        )
+
+        segment_idx = torch.argmin(
+            distances,
+            dim=1,
+        )
 
         env_ids = torch.arange(
             self.num_envs,
@@ -781,70 +990,9 @@ class AgvTransportEnv(DirectRLEnv):
             dtype=torch.long,
         )
 
-        current_idx = torch.clamp(
-            self.path_segment_idx,
-            min=0,
-            max=num_segments - 1,
-        )
+        best_t = t[env_ids, segment_idx]
 
-        # 只在当前段上投影
-        segment_start = segment_start_all[env_ids, current_idx]
-        segment_vec = segment_vec_all[env_ids, current_idx]
-        segment_len = segment_len_all[env_ids, current_idx]
-
-        payload_vec = payload_xy - segment_start
-
-        t = torch.sum(
-            payload_vec * segment_vec,
-            dim=1,
-        ) / (segment_len * segment_len)
-
-        t = torch.clamp(t, 0.0, 1.0)
-
-        # 只有 update_segment=True 时，才允许路径段向前切换
-        if update_segment:
-            switch_t = getattr(
-                self.cfg,
-                "path_segment_switch_t",
-                0.85,
-            )
-
-            should_advance = (
-                    (t > switch_t)
-                    & (current_idx < num_segments - 1)
-            )
-
-            if torch.any(should_advance):
-                current_idx = torch.where(
-                    should_advance,
-                    current_idx + 1,
-                    current_idx,
-                )
-
-                self.path_segment_idx[:] = current_idx
-
-                # 切换到新段后重新计算投影
-                segment_start = segment_start_all[env_ids, current_idx]
-                segment_vec = segment_vec_all[env_ids, current_idx]
-                segment_len = segment_len_all[env_ids, current_idx]
-
-                payload_vec = payload_xy - segment_start
-
-                t = torch.sum(
-                    payload_vec * segment_vec,
-                    dim=1,
-                ) / (segment_len * segment_len)
-
-                t = torch.clamp(t, 0.0, 1.0)
-            else:
-                self.path_segment_idx[:] = current_idx
-
-        closest_point = segment_start + t.unsqueeze(-1) * segment_vec
-
-        lateral_error = torch.linalg.norm(
-            payload_xy - closest_point,
-            dim=1,
-        )
+        lateral_error = distances[env_ids, segment_idx]
 
         cumulative_start = torch.cat(
             (
@@ -852,18 +1000,18 @@ class AgvTransportEnv(DirectRLEnv):
                     (self.num_envs, 1),
                     device=self.device,
                 ),
-                torch.cumsum(segment_len_all[:, :-1], dim=1),
+                torch.cumsum(segment_len[:, :-1], dim=1),
             ),
             dim=1,
         )
 
         progress_s = (
-                cumulative_start[env_ids, current_idx]
-                + t * segment_len
+                cumulative_start[env_ids, segment_idx]
+                + best_t * segment_len[env_ids, segment_idx]
         )
 
         total_length = torch.sum(
-            segment_len_all,
+            segment_len,
             dim=1,
         )
 
@@ -878,7 +1026,7 @@ class AgvTransportEnv(DirectRLEnv):
             max=total_length,
         )
 
-        cumulative_end = cumulative_start + segment_len_all
+        cumulative_end = cumulative_start + segment_len
 
         target_segment_mask = target_s.unsqueeze(1) <= cumulative_end + 1e-6
 
@@ -893,21 +1041,21 @@ class AgvTransportEnv(DirectRLEnv):
         )
 
         target_t = torch.clamp(
-            target_local_s / segment_len_all[env_ids, target_segment_idx],
+            target_local_s / segment_len[env_ids, target_segment_idx],
             0.0,
             1.0,
         )
 
         target_xy = (
-                segment_start_all[env_ids, target_segment_idx]
-                + target_t.unsqueeze(-1)
-                * segment_vec_all[env_ids, target_segment_idx]
+                segment_start[env_ids, target_segment_idx]
+                + target_t.unsqueeze(-1) * segment_vec[env_ids, target_segment_idx]
         )
 
-        # 继续用 current_waypoint_idx 给 eval CSV 记录路径段编号
-        self.current_waypoint_idx[:] = current_idx.detach()
+        # 这里保留 current_waypoint_idx，用于评估 CSV 中观察路径进度。
+        # 在 V4.1C 中它表示“当前最近路径段编号”，不再表示离散 waypoint 是否通过。
+        self.current_waypoint_idx[:] = segment_idx.detach()
 
-        return target_xy, lateral_error, progress_s, current_idx
+        return target_xy, lateral_error, progress_s, segment_idx
 
     def _get_target_xy(self) -> torch.Tensor:
         """返回连续路径跟踪的 lookahead target。"""
@@ -942,7 +1090,6 @@ class AgvTransportEnv(DirectRLEnv):
         """兼容旧接口：任意一台 AGV 接近 payload 即认为有接触。"""
         contact_flags = self._compute_contact_flags()
         return torch.any(contact_flags, dim=1)
-
 
     def _quat_to_yaw_wxyz(self, quat: torch.Tensor) -> torch.Tensor:
         """将 wxyz 四元数转换为 yaw。"""
