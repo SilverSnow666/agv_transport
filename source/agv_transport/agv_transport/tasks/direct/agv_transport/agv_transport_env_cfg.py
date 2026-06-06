@@ -14,10 +14,9 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前配置用于 V4.2-B0-easy-contact：AGV1 Dropout 接触课程训练。
-    通过 ``agv_speed_scales`` 禁用或弱化 AGV1，并把禁用 AGV 停到待命区，
-    先让 AGV2/AGV3 学会靠近 payload、接触 payload，再逐步恢复曲线
-    路径与三车协同。
+    当前配置用于 V4.2-B1-front-contact：
+    在 AGV1 Dropout 课程下，约束 AGV2/AGV3 以前端或合理朝向接触 payload，
+    避免接触状态下用车尾倒推 payload。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -92,6 +91,27 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # PPO 训练用近似接触阈值
     train_contact_threshold = 1.20
+
+    # V4.2-B1-front-contact：约束接触推送的前后方向语义
+    # 目标：允许 AGV 倒车换位，但不允许接触 payload 时用车尾倒推。
+    front_rear_margin = 0.05
+    front_contact_heading_min = 0.20
+
+    # 前端合理接触奖励
+    front_contact_reward_scale = 0.20
+
+    # V4.2-B1-hard-front-contact
+    rear_contact_penalty_scale = 8.0
+    reverse_contact_penalty_scale = 8.0
+    contact_heading_penalty_scale = 3.0
+
+    # 明确禁止“车尾倒推 payload”
+    bad_rear_push_penalty_scale = 80.0
+    terminate_on_bad_rear_push = True
+
+    # 判断车尾倒推的阈值
+    bad_rear_heading_threshold = -0.10
+    bad_rear_reverse_threshold = -0.05
 
     # AGV-AGV 安全距离约束
     # agv_size = (0.70, 0.45, 0.06)，并排 y 间距 0.65，因此安全距离先取 0.55
