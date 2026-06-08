@@ -14,9 +14,11 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前配置用于 V4.2-B1-front-contact：
-    在 AGV1 Dropout 课程下，约束 AGV2/AGV3 以前端或合理朝向接触 payload，
-    避免接触状态下用车尾倒推 payload。
+    当前版本用于 V4.2-C0-three-agv-front-contact-soft：
+    - 保留 V4.1 三车成功模型的场景、路径、动作和观测结构；
+    - 三台 AGV 全部启用，不再走 B1/B2 的 AGV1 dropout 路线；
+    - 只加入“软”的前端接触/倒车接触惩罚，不做硬终止，
+      用于从 V4.1 成功 checkpoint 平滑续训。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -29,7 +31,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 30.0
+    episode_length_s = 24.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -58,11 +60,6 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
         clone_in_fabric=False,
     )
 
-    # V4.2-A：虚拟障碍物，用于阻挡直线路径
-    # 格式：(x_min, x_max, y_min, y_max)，基于每个 env 原点的局部坐标
-    # 该障碍物不作为真实物理刚体参与碰撞，而是在 reward / done 中作为失败区域判定。
-    obstacle_box = (1.10, 1.55, -0.12, 0.06)
-
     # 简化 AGV 参数
     agv_size = (0.70, 0.45, 0.06)
     agv_mass = 20.0
@@ -73,17 +70,6 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
         (-1.60, -0.65, 0.03),
     )
 
-    # V4.2-B0-easy-contact：AGV 动作缩放课程。
-    # (0.0, 1.0, 1.0) 表示禁用 AGV1，只训练 AGV2 + AGV3。
-    # 后续课程可依次改为 (0.5, 1.0, 1.0) 和 (1.0, 1.0, 1.0)。
-    agv_speed_scales: tuple[float, float, float] = (0.0, 1.0, 1.0)
-
-    # 被禁用 AGV 的停放位置，避免 AGV1 静止在 payload 后方挡住 AGV2/AGV3。
-    inactive_agv_park_positions = (
-        (-1.80, 1.80, 0.03),
-        (-1.80, 1.40, 0.03),
-        (-1.80, -1.40, 0.03),
-    )
 
     # 三车并排推送队形参数
     formation_stand_off_distances = (0.90, 0.90, 0.90)
@@ -92,34 +78,36 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # PPO 训练用近似接触阈值
     train_contact_threshold = 1.20
 
-    # V4.2-B1-front-contact：约束接触推送的前后方向语义
-    # 目标：允许 AGV 倒车换位，但不允许接触 payload 时用车尾倒推。
+    # V4.2-C0：软前端接触约束。
+    # 注意：C0 阶段不要硬终止，先保护 V4.1 三车成功策略。
     front_rear_margin = 0.05
     front_contact_heading_min = 0.20
 
-    # 前端合理接触奖励
-    front_contact_reward_scale = 0.20
+    # 前端合理接触的小奖励，权重很低，避免压过原 V4.1 推进/队形奖励。
+    front_contact_reward_scale = 0.10
 
-    # V4.2-B1-hard-front-contact
-    rear_contact_penalty_scale = 8.0
-    reverse_contact_penalty_scale = 8.0
-    contact_heading_penalty_scale = 3.0
+    # 车尾接触、接触倒车、接触朝向不合理的软惩罚。
+    rear_contact_penalty_scale = 1.0
+    reverse_contact_penalty_scale = 1.0
+    contact_heading_penalty_scale = 0.5
 
-    # 明确禁止“车尾倒推 payload”
-    bad_rear_push_penalty_scale = 80.0
-    terminate_on_bad_rear_push = True
-
-    # 判断车尾倒推的阈值
+    # 明显车尾倒推 payload 的软惩罚；C0 阶段不终止。
+    bad_rear_push_penalty_scale = 5.0
+    terminate_on_bad_rear_push = False
     bad_rear_heading_threshold = -0.10
     bad_rear_reverse_threshold = -0.05
 
     # AGV-AGV 安全距离约束
     # agv_size = (0.70, 0.45, 0.06)，并排 y 间距 0.65，因此安全距离先取 0.55
-    agv_safe_distance = 0.75
-
-    # 若两车中心距离小于该值，认为发生严重重叠/碰撞
+    # V4.2-C1：加强三车间距，防止最后阶段 AGV1 挤压 AGV2/AGV3
+    agv_safe_distance = 0.65
     agv_collision_distance = 0.50
 
+    agv_overlap_penalty_scale = 8.0
+    agv_collision_penalty_scale = 25.0
+
+    # 先不要一碰撞就终止，避免把 C0 成功策略直接打崩
+    terminate_on_agv_collision = False
 
 
     # 为兼容部分旧代码，保留单个 agv_init_pos
@@ -143,19 +131,16 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # V4.0 多 waypoint 路径
     # 先用轻微折线路径，不要一开始太难
     # V4.1A 平滑折线路径
-    # V4.2-A：绕过中部虚拟障碍物的上侧路径
-    # B0-easy-contact：先用近似直线路径，降低 AGV2/AGV3 初学接触与推送难度。
-    # 两车能够稳定接触并推动后，再恢复到 y=0.25 的轻微曲线路径。
     waypoints = (
-        (0.40, 0.00),
-        (0.85, 0.03),
-        (1.30, 0.05),
-        (1.80, 0.03),
-        (2.35, 0.00),
+        (0.85, 0.00),
+        (1.20, 0.12),
+        (1.55, 0.20),
+        (1.80, 0.08),
+        (1.95, 0.00),
     )
 
     # V4.1C 连续路径跟踪前视距离
-    path_lookahead_dist = 0.30
+    path_lookahead_dist = 0.25
 
     # 中间 waypoint 的通过半径
     waypoint_radius = 0.20
