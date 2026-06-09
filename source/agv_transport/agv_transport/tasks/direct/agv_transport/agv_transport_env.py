@@ -590,7 +590,9 @@ class AgvTransportEnv(DirectRLEnv):
             min=0.0,
             max=1.0,
         )
-        idle_gate = (two_pusher_gate > self.cfg.idle_two_pusher_gate_threshold).float()
+        idle_gate = (
+                two_pusher_gate > self.cfg.idle_two_pusher_gate_threshold
+        ).float()
 
         idle_action_penalty = torch.sum(
             idle_gate.unsqueeze(1) * low_utility_weight * agv_activity,

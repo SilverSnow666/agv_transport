@@ -55,7 +55,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 场景设置
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=128,
-        env_spacing=6.5,
+        env_spacing=6.8,
         replicate_physics=True,
         clone_in_fabric=False,
     )
@@ -137,24 +137,24 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 目标点，基于每个 env 原点的局部坐标
     #用于兼容旧模型
-    target_pos = (2.90, 0.0, 0.0)
+    target_pos = (3.10, 0.0, 0.0)
 
     # V4.3-D0A0d：中等曲率路径。
     # 比 D0A0c 略容易，重点先稳定两车持续推动，避免推到半途后断接触。
     waypoints = (
         (0.45, 0.00),
-        (0.95, 0.20),
-        (1.45, 0.32),
-        (2.00, 0.16),
-        (2.55, -0.12),
-        (2.90, 0.00),
+        (0.95, 0.28),
+        (1.45, 0.45),
+        (2.05, 0.20),
+        (2.65, -0.25),
+        (3.10, 0.00),
     )
 
     # V4.1C 连续路径跟踪前视距离
-    path_lookahead_dist = 0.30
+    path_lookahead_dist = 0.32
 
     # D0A0c reward 权重：封堵单车捷径，鼓励任意两台有效推动，并稳定第三台低贡献 AGV。
-    path_lateral_error_scale = 0.70
+    path_lateral_error_scale = 0.90
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
     progress_base_reward_scale = 10.0
@@ -185,9 +185,9 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
     # 这样保留“第三台 AGV 可不参与”的策略性，同时避免它原地前进后退抖动。
-    idle_action_penalty_scale = 0.12
-    idle_action_rate_penalty_scale = 0.10
-    idle_standby_penalty_scale = 0.08
+    idle_action_penalty_scale = 0.18
+    idle_action_rate_penalty_scale = 0.18
+    idle_standby_penalty_scale = 0.10
     idle_low_utility_threshold = 0.08
     idle_two_pusher_gate_threshold = 0.60
     idle_standby_min_dist = 0.80
@@ -211,7 +211,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
 
     # 工作空间限制，防止物体飞太远
-    workspace_limit = 3.6
+    workspace_limit = 3.8
 
     # 差速 AGV 动作缩放
     max_agv_linear_speed = 0.5
