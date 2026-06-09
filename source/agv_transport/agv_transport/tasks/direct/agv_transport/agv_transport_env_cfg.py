@@ -14,12 +14,11 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本用于 V4.3-D0A0b-two-pusher-credit-fix：
-    - 保留三 AGV 集中式控制、44 维观测与 6 维动作结构；
-    - 将 payload 改为较小矩形件，使曲线运动与姿态变化更明显；
-    - 使用更容易的接触启动课程：AGV 初始位置更靠近 payload 后方；
-    - 使用中低曲率路径，先学会接触、推动和短距离曲线跟踪；
-    - reward 改为 top-2 有效推送贡献 + 接触前队形靠近进度奖励。
+    当前版本用于 V4.3-D0A0d-stable-two-pusher：
+    - 延续 D0A0b 的 two-pusher credit，允许任意两台 AGV 有效推动；
+    - 不强制 AGV2 必须接触，但要求低贡献 AGV 在已有两车推动时保持低动作、低抖动；
+    - 将路径升级为中等偏强曲率，便于观察 payload 是否沿曲线路径运动；
+    - 保留宽而短的小矩形 payload 与前端几何接触判定。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -32,7 +31,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 40.0
+    episode_length_s = 45.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -56,7 +55,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 场景设置
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=128,
-        env_spacing=6.0,
+        env_spacing=6.5,
         replicate_physics=True,
         clone_in_fabric=False,
     )
@@ -100,7 +99,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 车尾接触、接触倒车、接触朝向不合理的软惩罚。
     rear_contact_penalty_scale = 1.0
-    reverse_contact_penalty_scale = 1.0
+    reverse_contact_penalty_scale = 1.5
     contact_heading_penalty_scale = 0.5
 
     # 明显车尾倒推 payload 的软惩罚；C0 阶段不终止。
@@ -138,28 +137,29 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 目标点，基于每个 env 原点的局部坐标
     #用于兼容旧模型
-    target_pos = (2.40, 0.0, 0.0)
+    target_pos = (2.90, 0.0, 0.0)
 
-    # V4.3-D0A0：接触启动用中低曲率路径。
-    # 比 V4.1 更明显弯曲，但比 D0A1 / 长 S 型路径更适合从零训练。
+    # V4.3-D0A0d：中等曲率路径。
+    # 比 D0A0c 略容易，重点先稳定两车持续推动，避免推到半途后断接触。
     waypoints = (
         (0.45, 0.00),
-        (0.95, 0.15),
-        (1.45, 0.25),
-        (1.95, 0.12),
-        (2.40, 0.00),
+        (0.95, 0.20),
+        (1.45, 0.32),
+        (2.00, 0.16),
+        (2.55, -0.12),
+        (2.90, 0.00),
     )
 
     # V4.1C 连续路径跟踪前视距离
-    path_lookahead_dist = 0.28
+    path_lookahead_dist = 0.30
 
-    # D0A0b reward 权重：封堵 AGV1 单车捷径，鼓励任意两台 AGV 有效推动。
-    path_lateral_error_scale = 0.50
+    # D0A0c reward 权重：封堵单车捷径，鼓励任意两台有效推动，并稳定第三台低贡献 AGV。
+    path_lateral_error_scale = 0.70
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
-    progress_base_reward_scale = 8.0
-    progress_two_pusher_bonus_scale = 24.0
-    backward_progress_penalty_scale = 10.0
+    progress_base_reward_scale = 10.0
+    progress_two_pusher_bonus_scale = 18.0
+    backward_progress_penalty_scale = 12.0
     two_pusher_gate_threshold = 0.20
     single_pusher_progress_penalty_scale = 12.0
 
@@ -178,9 +178,20 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     approach_reward_scale = 1.00
 
-    # 只有在已有两台有效推动时，才轻惩罚低贡献 AGV 的乱动，避免早期压制探索。
-    idle_when_payload_moving_penalty_scale = 0.03
-    idle_low_utility_threshold = 0.05
+    # D0A0d：两车接触保持与最大进度保持，减少推到半途后断接触/后退。
+    contact_persistence_reward_scale = 0.25
+    progress_drop_penalty_scale = 4.0
+    progress_drop_tolerance = 0.03
+
+    # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
+    # 这样保留“第三台 AGV 可不参与”的策略性，同时避免它原地前进后退抖动。
+    idle_action_penalty_scale = 0.12
+    idle_action_rate_penalty_scale = 0.10
+    idle_standby_penalty_scale = 0.08
+    idle_low_utility_threshold = 0.08
+    idle_two_pusher_gate_threshold = 0.60
+    idle_standby_min_dist = 0.80
+    idle_standby_max_dist = 1.70
 
     # 固定队形只做弱约束，避免强行要求三台 AGV 始终同时接触。
     formation_error_mean_scale = 0.10
@@ -192,7 +203,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     waypoint_radius = 0.20
 
     # 最终目标点位置误差
-    target_radius = 0.30
+    target_radius = 0.28
 
     # 最终目标点 yaw 误差
     target_yaw_radius = 0.30
@@ -200,7 +211,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
 
     # 工作空间限制，防止物体飞太远
-    workspace_limit = 3.2
+    workspace_limit = 3.6
 
     # 差速 AGV 动作缩放
     max_agv_linear_speed = 0.5
