@@ -15,11 +15,12 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.3-D0A0d-stable-two-pusher：
+    当前版本用于 V4.3-D0A0f-path-compliance：
     - 延续 D0A0c 的 top-2 有效推动 credit；
     - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
-    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到动作和动作变化率惩罚，减少抽搐；
-    - 增加最大路径进度保持与接触保持奖励，避免 payload 被推到半途后断接触或后退。
+    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到更强的动作和动作变化率惩罚，减少抽搐；
+    - 增加最大路径进度保持、接触保持奖励、软路径走廊惩罚和路径进度成功条件，
+      避免 payload 以近似直线 shortcut 进入目标半径。
     """
 
     cfg: AgvTransportEnvCfg
@@ -369,6 +370,8 @@ class AgvTransportEnv(DirectRLEnv):
         target_xy, path_lateral_error, path_progress, _ = (
             self._compute_path_tracking_quantities()
         )
+        total_path_length = self._compute_path_total_length()
+        path_progress_ratio = path_progress / total_path_length
 
         payload_to_target = target_xy - payload_xy
 
@@ -472,6 +475,13 @@ class AgvTransportEnv(DirectRLEnv):
             positive_progress / 0.005,
             min=0.0,
             max=1.0,
+        )
+
+        # D0A0f：软路径走廊惩罚。横向误差在 corridor 半宽内不额外惩罚，
+        # 超出后按平方惩罚，用于阻止 payload 近似直线 shortcut。
+        path_corridor_violation = torch.clamp(
+            path_lateral_error - self.cfg.path_corridor_half_width,
+            min=0.0,
         )
 
         # D0A0d：记录 episode 内最大路径进度，惩罚明显回退或中途丢失进度。
@@ -590,9 +600,7 @@ class AgvTransportEnv(DirectRLEnv):
             min=0.0,
             max=1.0,
         )
-        idle_gate = (
-                two_pusher_gate > self.cfg.idle_two_pusher_gate_threshold
-        ).float()
+        idle_gate = (two_pusher_gate > self.cfg.idle_two_pusher_gate_threshold).float()
 
         idle_action_penalty = torch.sum(
             idle_gate.unsqueeze(1) * low_utility_weight * agv_activity,
@@ -690,7 +698,9 @@ class AgvTransportEnv(DirectRLEnv):
 
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
-        success = position_success & yaw_success
+        progress_success = path_progress_ratio > self.cfg.success_progress_ratio
+
+        success = position_success & yaw_success & progress_success
 
         out_of_bounds = self._compute_out_of_bounds()
 
@@ -743,6 +753,7 @@ class AgvTransportEnv(DirectRLEnv):
                 - 0.6 * final_goal_dist
 
                 - self.cfg.path_lateral_error_scale * path_lateral_error
+                - self.cfg.path_corridor_penalty_scale * path_corridor_violation * path_corridor_violation
 
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
@@ -807,6 +818,10 @@ class AgvTransportEnv(DirectRLEnv):
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
+        _, _, path_progress, _ = self._compute_path_tracking_quantities()
+        total_path_length = self._compute_path_total_length()
+        path_progress_ratio = path_progress / total_path_length
+
         final_target_xy = self._get_final_target_xy()
 
         final_goal_dist = torch.linalg.norm(
@@ -820,7 +835,9 @@ class AgvTransportEnv(DirectRLEnv):
 
         yaw_success = torch.abs(payload_yaw) < self.cfg.target_yaw_radius
 
-        success = position_success & yaw_success
+        progress_success = path_progress_ratio > self.cfg.success_progress_ratio
+
+        success = position_success & yaw_success & progress_success
 
         out_of_bounds = self._compute_out_of_bounds()
 
@@ -981,6 +998,13 @@ class AgvTransportEnv(DirectRLEnv):
         """返回最终路径终点。"""
         waypoints_xy = self._get_waypoints_xy()
         return waypoints_xy[:, -1, :]
+
+    def _compute_path_total_length(self) -> torch.Tensor:
+        """返回每个环境中规划路径的总弧长，shape = [num_envs]."""
+        path_points = self._get_path_points_xy()
+        segment_vec = path_points[:, 1:, :] - path_points[:, :-1, :]
+        segment_len = torch.linalg.norm(segment_vec, dim=2)
+        return torch.sum(segment_len, dim=1).clamp_min(1e-6)
 
     def _compute_path_tracking_quantities(self):
         """计算连续路径跟踪所需的前视目标点、横向误差和路径进度。

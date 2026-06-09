@@ -14,10 +14,13 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本用于 V4.3-D0A0d-stable-two-pusher：
+    当前版本用于 V4.3-D0A0f-path-compliance：
     - 延续 D0A0b 的 two-pusher credit，允许任意两台 AGV 有效推动；
     - 不强制 AGV2 必须接触，但要求低贡献 AGV 在已有两车推动时保持低动作、低抖动；
-    - 将路径升级为中等偏强曲率，便于观察 payload 是否沿曲线路径运动；
+    - 保留任意两台 AGV 有效推动的 two-pusher credit；
+    - 不强制第三台 AGV 接触，但进一步抑制低贡献 AGV 抽搐；
+    - 收紧成功条件，并加入路径进度成功约束与软路径走廊惩罚，
+      用于封堵“近似直线进入目标半径”的 shortcut；
     - 保留宽而短的小矩形 payload 与前端几何接触判定。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
@@ -139,8 +142,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     #用于兼容旧模型
     target_pos = (3.10, 0.0, 0.0)
 
-    # V4.3-D0A0d：中等曲率路径。
-    # 比 D0A0c 略容易，重点先稳定两车持续推动，避免推到半途后断接触。
+    # V4.3-D0A0f：中等偏强曲率路径。
+    # 当前阶段不再加大曲率，而是通过 success progress 与 corridor penalty 强化路径遵从。
     waypoints = (
         (0.45, 0.00),
         (0.95, 0.28),
@@ -153,8 +156,16 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # V4.1C 连续路径跟踪前视距离
     path_lookahead_dist = 0.32
 
-    # D0A0c reward 权重：封堵单车捷径，鼓励任意两台有效推动，并稳定第三台低贡献 AGV。
-    path_lateral_error_scale = 0.90
+    # D0A0f：路径遵从约束。
+    # 当前模型已经能到终点，但存在近似直线 shortcut，因此提高横向误差惩罚，
+    # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
+    path_lateral_error_scale = 1.30
+    path_corridor_half_width = 0.22
+    path_corridor_penalty_scale = 8.0
+
+    # success 需要 payload 不仅进入目标半径，还要沿路径推进到足够靠近末端。
+    # 当前模型 final progress ratio 约 0.94，先设 0.96；稳定后可提高到 0.98。
+    success_progress_ratio = 0.96
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
     progress_base_reward_scale = 10.0
@@ -185,8 +196,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
     # 这样保留“第三台 AGV 可不参与”的策略性，同时避免它原地前进后退抖动。
-    idle_action_penalty_scale = 0.18
-    idle_action_rate_penalty_scale = 0.18
+    idle_action_penalty_scale = 0.25
+    idle_action_rate_penalty_scale = 0.30
     idle_standby_penalty_scale = 0.10
     idle_low_utility_threshold = 0.08
     idle_two_pusher_gate_threshold = 0.60
@@ -202,11 +213,11 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 中间 waypoint 的通过半径
     waypoint_radius = 0.20
 
-    # 最终目标点位置误差
-    target_radius = 0.28
+    # 最终目标点位置误差：D0A0f 收紧目标半径，减少“进入大半径即成功”的 shortcut。
+    target_radius = 0.22
 
     # 最终目标点 yaw 误差
-    target_yaw_radius = 0.30
+    target_yaw_radius = 0.25
 
 
 
