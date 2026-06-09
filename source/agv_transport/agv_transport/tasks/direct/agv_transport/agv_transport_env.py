@@ -15,10 +15,11 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.2-C0-three-agv-front-contact-soft：
-    在 V4.1 三车成功环境基础上，只加入软前端接触约束。
-    该版本不禁用 AGV1，也不使用 AGV1 dropout；建议从 V4.1 三车成功
-    checkpoint 续训。
+    当前版本用于 V4.3-D0A0b-two-pusher-credit-fix：
+    - 使用接触启动课程：AGV 初始位置更靠近 payload 后方；
+    - 不再奖励 all_three_contact，而是奖励 top-2 有效推送贡献；
+    - 加入接触前队形靠近进度奖励，帮助从零训练先学会接触；
+    - 非接触 AGV 在 payload 已经前进时受到轻微动作惩罚。
     """
 
     cfg: AgvTransportEnvCfg
@@ -35,6 +36,12 @@ class AgvTransportEnv(DirectRLEnv):
             device=self.device,
         )
         self.prev_agv_payload_dist = torch.zeros(self.num_envs, device=self.device)
+        self.prev_formation_error_mean = torch.zeros(self.num_envs, device=self.device)
+
+        # Episode-level credit for two-pusher behavior.
+        # 用于缩放 success reward，避免单车把 payload 推到终点也拿到满分。
+        self.episode_positive_progress = torch.zeros(self.num_envs, device=self.device)
+        self.episode_two_pusher_progress = torch.zeros(self.num_envs, device=self.device)
         # V4.0：每个环境当前跟踪的 waypoint 编号
         self.current_waypoint_idx = torch.zeros(
             self.num_envs,
@@ -108,6 +115,9 @@ class AgvTransportEnv(DirectRLEnv):
             agv_xy - payload_xy,
             dim=1,
         )
+
+        formation_errors = self._compute_formation_errors()
+        self.prev_formation_error_mean[:] = formation_errors.mean(dim=1).detach()
 
     def _hide_agv_collision_visual(self) -> None:
         """隐藏三台简化 AGV 碰撞体的视觉显示，只保留小车 USD 外观。"""
@@ -396,10 +406,6 @@ class AgvTransportEnv(DirectRLEnv):
         contact_flags = self._compute_contact_flags()
         contact_flags_float = contact_flags.float()
         contact_count = contact_flags_float.sum(dim=1)
-        all_three_contact = torch.all(
-            contact_flags,
-            dim=1,
-        ).float()
 
         (
             heading_to_payload,
@@ -455,25 +461,100 @@ class AgvTransportEnv(DirectRLEnv):
         _, bad_rear_push = self._compute_bad_rear_push(payload_xy)
         self.last_bad_rear_push[:] = bad_rear_push.detach()
 
-        # 只有沿路径真实前进时，才给接触奖励
+        # 沿路径真实前进时的 gate。只对正向进度开启，避免倒退时产生虚假接触奖励。
+        positive_progress = torch.clamp(path_progress_delta, min=0.0)
+        negative_progress = torch.clamp(-path_progress_delta, min=0.0)
         progress_gate = torch.clamp(
-            path_progress_delta / 0.005,
+            positive_progress / 0.005,
             min=0.0,
             max=1.0,
         )
 
-        near_goal_contact_gate = 1.0 - near_goal
-
-        contact_count_for_reward = torch.where(
-            near_goal > 0.5,
-            torch.clamp(contact_count, max=2.0),
-            torch.clamp(contact_count, max=3.0),
+        # D0A0b：有效推动贡献。不是奖励三车都贴上去，而是奖励任意两台 AGV
+        # 以前端接触、朝向合理、正向动作推动 payload。
+        push_utility = (
+            contact_flags_float
+            * front_facing_score
+            * torch.clamp(v_actions, min=0.0)
         )
 
-        contact_reward = progress_gate * (
-                0.25 * contact_count_for_reward
-                + 0.8 * near_goal_contact_gate * all_three_contact
+        sorted_push_utility, _ = torch.sort(
+            push_utility,
+            dim=1,
+            descending=True,
         )
+        top1_push_utility = sorted_push_utility[:, 0]
+        second_push_utility = sorted_push_utility[:, 1]
+        top2_push_utility = top1_push_utility + second_push_utility
+
+        # 如果只有一台 AGV 在推，second_push 接近 0，two_pusher_gate 接近 0；
+        # 第二台 AGV 也有效推时，主要 progress / success reward 才逐步放大。
+        two_pusher_gate = torch.clamp(
+            second_push_utility / self.cfg.two_pusher_gate_threshold,
+            min=0.0,
+            max=1.0,
+        )
+
+        progress_reward = (
+            self.cfg.progress_base_reward_scale * positive_progress
+            + self.cfg.progress_two_pusher_bonus_scale * positive_progress * two_pusher_gate
+            - self.cfg.backward_progress_penalty_scale * negative_progress
+        )
+        single_pusher_progress_penalty = positive_progress * (1.0 - two_pusher_gate)
+
+        # Episode-level two-pusher progress ratio，用于 success reward credit assignment。
+        two_pusher_progress = positive_progress * two_pusher_gate
+        self.episode_positive_progress += positive_progress.detach()
+        self.episode_two_pusher_progress += two_pusher_progress.detach()
+        two_pusher_progress_ratio = (
+            self.episode_two_pusher_progress
+            / self.episode_positive_progress.clamp_min(1e-6)
+        )
+        success_quality_gate = torch.clamp(
+            self.cfg.success_base_ratio
+            + self.cfg.success_two_pusher_ratio * two_pusher_progress_ratio,
+            min=0.0,
+            max=1.0,
+        )
+
+        # 冷启动辅助：只要已经形成前端接触且正向推，就给一点小奖励；
+        # 但第二台有效推动车的 credit 更高，避免 AGV1 单车捷径。
+        pre_push_reward = self.cfg.pre_push_reward_scale * top2_push_utility
+        contact_reward = pre_push_reward + progress_gate * (
+            self.cfg.effective_push_reward_scale * top2_push_utility
+            + self.cfg.second_pusher_reward_scale * second_push_utility
+            + self.cfg.front_contact_count_reward_scale
+            * torch.clamp(front_contact_count, max=2.0)
+        )
+
+        # 任意两台 AGV 靠近有效接触带的接触前引导奖励，不固定 AGV2/AGV3 身份。
+        contact_zone_errors = self._compute_contact_zone_errors(payload_xy)
+        sorted_zone_errors, _ = torch.sort(contact_zone_errors, dim=1)
+        best_two_zone_error = sorted_zone_errors[:, 0] + sorted_zone_errors[:, 1]
+        contact_zone_approach_reward = torch.clamp(
+            1.0 - best_two_zone_error / self.cfg.contact_zone_error_norm,
+            min=0.0,
+            max=1.0,
+        )
+
+        agv_activity = torch.stack(
+            (
+                torch.linalg.norm(self.actions[:, 0:2], dim=1),
+                torch.linalg.norm(self.actions[:, 2:4], dim=1),
+                torch.linalg.norm(self.actions[:, 4:6], dim=1),
+            ),
+            dim=1,
+        )
+
+        # 只有当已有两台 AGV 有效推动时，才轻惩罚低贡献 AGV 的乱动；
+        # 这样不会在探索早期压制 AGV2/AGV3 寻找接触点。
+        low_utility = (push_utility < self.cfg.idle_low_utility_threshold).float()
+        idle_when_payload_moving_penalty = (
+            progress_gate
+            * two_pusher_gate
+            * torch.sum(low_utility * agv_activity, dim=1)
+        )
+
         # 队形误差 + 角色相关朝向奖励
         desired_positions = self._compute_formation_target_xy()
 
@@ -528,6 +609,17 @@ class AgvTransportEnv(DirectRLEnv):
         formation_error_mean = formation_errors.mean(dim=1)
         formation_error_max = formation_errors.max(dim=1).values
 
+        # D0A0：接触前引导奖励。
+        # 在 payload 尚未明显前进时，模型仍可通过靠近队形目标点获得正反馈，
+        # 避免从零训练时长期停在起点或随机后退。
+        formation_progress = self.prev_formation_error_mean - formation_error_mean
+        self.prev_formation_error_mean[:] = formation_error_mean.detach()
+        approach_reward = torch.clamp(
+            formation_progress / 0.005,
+            min=-1.0,
+            max=1.0,
+        )
+
         heading_alignment_mean = heading_alignments.mean(dim=1)
         heading_alignment_min = heading_alignments.min(dim=1).values
 
@@ -577,8 +669,9 @@ class AgvTransportEnv(DirectRLEnv):
         agv_collision = self._compute_agv_collision()
 
         reward = (
-            # 核心目标：payload 向目标移动
-                30.0 * path_progress_delta
+            # 核心目标：payload 向目标移动。
+            # 单车推可以获得少量基础进度奖励；两台 AGV 有效推时才获得主要进度奖励。
+                progress_reward
 
                 # 目标距离
                 - 0.8 * payload_goal_dist
@@ -586,7 +679,7 @@ class AgvTransportEnv(DirectRLEnv):
                 # 距离最终终点
                 - 0.6 * final_goal_dist
 
-                - 0.3 * path_lateral_error
+                - self.cfg.path_lateral_error_scale * path_lateral_error
 
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
@@ -595,16 +688,20 @@ class AgvTransportEnv(DirectRLEnv):
                 - 2.0 * near_goal * payload_yaw_abs
                 - 0.8 * near_goal * payload_yaw_rate_abs
                 - 0.4 * near_goal * payload_speed
-                # 鼓励多车接近 payload，但不要主导训练
+                # D0A0：奖励 top-2 有效推送；接触前先奖励靠近推送队形点。
                 + contact_reward
+                + self.cfg.approach_reward_scale * approach_reward
+                + self.cfg.contact_zone_approach_reward_scale * contact_zone_approach_reward
+                - self.cfg.single_pusher_progress_penalty_scale * single_pusher_progress_penalty
+                - self.cfg.idle_when_payload_moving_penalty_scale * idle_when_payload_moving_penalty
 
-                # 队形约束
-                - 0.5 * formation_error_mean
-                - 0.15 * formation_error_max
+                # 队形约束（弱化固定队形，允许两车/三车策略性切换）
+                - self.cfg.formation_error_mean_scale * formation_error_mean
+                - self.cfg.formation_error_max_scale * formation_error_max
 
                 # 角色相关朝向奖励
-                + 0.45 * heading_alignment_mean
-                + 0.15 * heading_alignment_min
+                + self.cfg.heading_alignment_mean_scale * heading_alignment_mean
+                + self.cfg.heading_alignment_min_scale * heading_alignment_min
 
                 # 动作平滑
                 - 0.005 * action_penalty
@@ -625,8 +722,8 @@ class AgvTransportEnv(DirectRLEnv):
                 - self.cfg.contact_heading_penalty_scale * bad_contact_heading_penalty
                 - self.cfg.bad_rear_push_penalty_scale * bad_rear_push.float()
 
-                # 成功奖励
-                + 150.0 * success.float()
+                # 成功奖励按两车有效推动进度占比缩放，避免 AGV1 单车推到终点拿满分。
+                + self.cfg.success_reward_scale * success.float() * success_quality_gate
                 - 30.0 * out_of_bounds.float()
 
         )
@@ -753,11 +850,18 @@ class AgvTransportEnv(DirectRLEnv):
         payload_xy = payload_state[:, :2]
 
         self.prev_path_progress[env_ids_tensor] = path_progress.detach()
+        self.episode_positive_progress[env_ids_tensor] = 0.0
+        self.episode_two_pusher_progress[env_ids_tensor] = 0.0
 
         self.prev_payload_goal_dist[env_ids_tensor] = torch.linalg.norm(
             payload_xy - target_xy,
             dim=1,
         )
+
+        formation_errors = self._compute_formation_errors()
+        self.prev_formation_error_mean[env_ids_tensor] = formation_errors[
+            env_ids_tensor
+        ].mean(dim=1).detach()
 
         # 兼容旧变量，如果你代码里还保留 prev_agv_payload_dist
         if hasattr(self, "prev_agv_payload_dist"):
@@ -940,23 +1044,154 @@ class AgvTransportEnv(DirectRLEnv):
         return lateral_error
 
     def _compute_contact_flags(self) -> torch.Tensor:
-        """返回三台 AGV 的近似接触状态，shape = [num_envs, 3]。"""
+        """返回三台 AGV 的前端接触状态，shape = [num_envs, 3]。
+
+        D0A0b 使用 AGV 前边缘线段与 payload 后缘接触带的几何重叠判定。
+        相比只检查 front center，线段判定对侧车 AGV2/AGV3 更公平：
+        只要 AGV 前边缘有一部分与 payload 后缘横向区间重叠，就可判为有效前端接触。
+        """
         payload_xy = self.payload.data.root_pos_w[:, :2]
+        payload_yaw = self._get_payload_yaw()
+
+        cos_yaw = torch.cos(payload_yaw)
+        sin_yaw = torch.sin(payload_yaw)
+
+        payload_half_x = 0.5 * self.cfg.payload_size[0]
+        payload_half_y = 0.5 * self.cfg.payload_size[1]
+        agv_half_length = 0.5 * self.cfg.agv_size[0]
+        agv_half_width = 0.5 * self.cfg.agv_size[1]
+
+        rear_face_x = -payload_half_x
+        x_margin = getattr(self.cfg, "front_contact_x_margin", 0.12)
+        y_margin = getattr(self.cfg, "front_contact_y_margin", 0.08)
 
         contact_flags = []
 
-        for agv in self.agvs:
+        for i, agv in enumerate(self.agvs):
             agv_xy = agv.data.root_pos_w[:, :2]
-            agv_payload_dist = torch.linalg.norm(
-                agv_xy - payload_xy,
+            agv_heading_xy = torch.stack(
+                (
+                    torch.cos(self.agv_yaw[:, i]),
+                    torch.sin(self.agv_yaw[:, i]),
+                ),
+                dim=1,
+            )
+            agv_lateral_xy = torch.stack(
+                (-agv_heading_xy[:, 1], agv_heading_xy[:, 0]),
                 dim=1,
             )
 
-            contact_flags.append(
-                agv_payload_dist < self.cfg.train_contact_threshold
+            front_center_xy = agv_xy + agv_heading_xy * agv_half_length
+            front_left_xy = front_center_xy + agv_lateral_xy * agv_half_width
+            front_right_xy = front_center_xy - agv_lateral_xy * agv_half_width
+
+            def to_payload_local(points_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                rel = points_xy - payload_xy
+                local_x = cos_yaw * rel[:, 0] + sin_yaw * rel[:, 1]
+                local_y = -sin_yaw * rel[:, 0] + cos_yaw * rel[:, 1]
+                return local_x, local_y
+
+            front_center_x, _ = to_payload_local(front_center_xy)
+            left_x, left_y = to_payload_local(front_left_xy)
+            right_x, right_y = to_payload_local(front_right_xy)
+
+            front_x_min = torch.minimum(left_x, right_x)
+            front_x_max = torch.maximum(left_x, right_x)
+            front_y_min = torch.minimum(left_y, right_y)
+            front_y_max = torch.maximum(left_y, right_y)
+
+            rear_band_overlap = (
+                (front_x_max > rear_face_x - x_margin)
+                & (front_x_min < rear_face_x + x_margin)
+            )
+            # 如果前边缘与 payload 后缘近似平行，front_x_min/max 可能很窄；
+            # 再加一个 front center 的后缘带判断，避免数值抖动漏判。
+            rear_center_near = torch.abs(front_center_x - rear_face_x) < x_margin
+            rear_band_ok = rear_band_overlap | rear_center_near
+
+            lateral_overlap_ok = (
+                (front_y_max > -payload_half_y - y_margin)
+                & (front_y_min < payload_half_y + y_margin)
             )
 
+            to_payload = payload_xy - agv_xy
+            to_payload_dist = torch.linalg.norm(to_payload, dim=1, keepdim=True).clamp_min(1e-6)
+            dir_to_payload = to_payload / to_payload_dist
+            heading_to_payload = torch.sum(agv_heading_xy * dir_to_payload, dim=1)
+            front_facing = heading_to_payload > self.cfg.front_contact_heading_min
+
+            contact_flags.append(rear_band_ok & lateral_overlap_ok & front_facing)
+
         return torch.stack(contact_flags, dim=1)
+
+    def _compute_contact_zone_errors(self, payload_xy: torch.Tensor | None = None) -> torch.Tensor:
+        """计算每台 AGV 到 payload 后缘有效接触带的几何误差，shape = [num_envs, 3]。
+
+        误差越小，说明该 AGV 的前边缘越接近可推动的后缘接触区。
+        该量只用于接触前 shaping，不指定必须是哪两台 AGV 参与。
+        """
+        if payload_xy is None:
+            payload_xy = self.payload.data.root_pos_w[:, :2]
+
+        payload_yaw = self._get_payload_yaw()
+        cos_yaw = torch.cos(payload_yaw)
+        sin_yaw = torch.sin(payload_yaw)
+
+        payload_half_x = 0.5 * self.cfg.payload_size[0]
+        payload_half_y = 0.5 * self.cfg.payload_size[1]
+        agv_half_length = 0.5 * self.cfg.agv_size[0]
+        agv_half_width = 0.5 * self.cfg.agv_size[1]
+
+        rear_face_x = -payload_half_x
+        x_margin = getattr(self.cfg, "front_contact_x_margin", 0.12)
+        y_margin = getattr(self.cfg, "front_contact_y_margin", 0.08)
+
+        errors = []
+
+        for i, agv in enumerate(self.agvs):
+            agv_xy = agv.data.root_pos_w[:, :2]
+            agv_heading_xy = torch.stack(
+                (
+                    torch.cos(self.agv_yaw[:, i]),
+                    torch.sin(self.agv_yaw[:, i]),
+                ),
+                dim=1,
+            )
+            agv_lateral_xy = torch.stack(
+                (-agv_heading_xy[:, 1], agv_heading_xy[:, 0]),
+                dim=1,
+            )
+
+            front_center_xy = agv_xy + agv_heading_xy * agv_half_length
+            front_left_xy = front_center_xy + agv_lateral_xy * agv_half_width
+            front_right_xy = front_center_xy - agv_lateral_xy * agv_half_width
+
+            def to_payload_local(points_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                rel = points_xy - payload_xy
+                local_x = cos_yaw * rel[:, 0] + sin_yaw * rel[:, 1]
+                local_y = -sin_yaw * rel[:, 0] + cos_yaw * rel[:, 1]
+                return local_x, local_y
+
+            front_center_x, _ = to_payload_local(front_center_xy)
+            _, left_y = to_payload_local(front_left_xy)
+            _, right_y = to_payload_local(front_right_xy)
+
+            front_y_min = torch.minimum(left_y, right_y)
+            front_y_max = torch.maximum(left_y, right_y)
+
+            # 距离 payload 后缘 x 接触带。
+            dx = torch.clamp(torch.abs(front_center_x - rear_face_x) - x_margin, min=0.0)
+
+            # 距离 payload 横向可接触区间。若前边缘线段与区间重叠，则 dy=0。
+            lower = -payload_half_y - y_margin
+            upper = payload_half_y + y_margin
+            dy_below = torch.clamp(lower - front_y_max, min=0.0)
+            dy_above = torch.clamp(front_y_min - upper, min=0.0)
+            dy = dy_below + dy_above
+
+            errors.append(torch.sqrt(dx * dx + dy * dy))
+
+        return torch.stack(errors, dim=1)
 
     def _compute_contact_geometry(self, payload_xy: torch.Tensor | None = None):
         """计算 AGV 与 payload 的前后接触几何关系。
