@@ -15,12 +15,14 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.3-D0A0f-path-compliance：
+    当前版本用于 V4.3-D0A0h-plus-turn-control：
     - 延续 D0A0c 的 top-2 有效推动 credit；
     - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
-    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到更强的动作和动作变化率惩罚，减少抽搐；
-    - 增加最大路径进度保持、接触保持奖励、软路径走廊惩罚和路径进度成功条件，
-      避免 payload 以近似直线 shortcut 进入目标半径。
+    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到温和动作和动作变化率惩罚，减少抽搐；
+    - 使用 active waypoint 子目标驱动 payload 依次经过路径点；
+    - 当前 target、队形方向与距离奖励都围绕 active waypoint 更新；
+    - 增加接近子目标减速、active segment overshoot 惩罚和 payload yaw 引导；
+    - 重点解决第 4 个 waypoint 后 payload 不下拐、继续被直推过头的问题。
     """
 
     cfg: AgvTransportEnvCfg
@@ -46,6 +48,25 @@ class AgvTransportEnv(DirectRLEnv):
 
         # Episode 内最大路径进度，用于惩罚 payload 推到半途后明显后退。
         self.max_path_progress = torch.zeros(self.num_envs, device=self.device)
+
+        # D0A0h-plus：active waypoint 子目标编号。
+        # 当前 target、队形方向和子目标距离奖励都由 active_goal_idx 决定。
+        self.active_goal_idx = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.prev_active_goal_dist = torch.zeros(self.num_envs, device=self.device)
+
+        # D0A0g：waypoint gate 进度。
+        # next_gate_idx 表示当前 episode 中 payload 下一步必须经过的 waypoint 编号。
+        # 只有依次通过所有 waypoint gate，最终 success 才成立，避免开放空间 shortcut。
+        self.next_gate_idx = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+        )
+
         # V4.0：每个环境当前跟踪的 waypoint 编号
         self.current_waypoint_idx = torch.zeros(
             self.num_envs,
@@ -114,6 +135,11 @@ class AgvTransportEnv(DirectRLEnv):
         self.max_path_progress[:] = path_progress.detach()
         self.prev_payload_goal_dist[:] = torch.linalg.norm(
             payload_xy - target_xy,
+            dim=1,
+        )
+        active_goal_xy = self._get_active_goal_xy()
+        self.prev_active_goal_dist[:] = torch.linalg.norm(
+            payload_xy - active_goal_xy,
             dim=1,
         )
         self.prev_agv_payload_dist[:] = torch.linalg.norm(
@@ -367,11 +393,15 @@ class AgvTransportEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
-        target_xy, path_lateral_error, path_progress, _ = (
+        _, path_lateral_error, path_progress, _ = (
             self._compute_path_tracking_quantities()
         )
         total_path_length = self._compute_path_total_length()
         path_progress_ratio = path_progress / total_path_length
+
+        # D0A0h-plus：当前控制目标使用 active waypoint 子目标。
+        # 路径投影量仍保留给评估、progress ratio 和轻量路径误差项。
+        target_xy = self._get_target_xy()
 
         payload_to_target = target_xy - payload_xy
 
@@ -382,9 +412,17 @@ class AgvTransportEnv(DirectRLEnv):
 
         push_dir = payload_to_target / payload_goal_dist.unsqueeze(-1).clamp_min(1e-6)
 
-        # V4.1C：沿路径方向的连续进度奖励
+        # 路径投影进度只用于评估和最大进度保持；主推进奖励改为 active subgoal 距离减少。
         path_progress_delta = path_progress - self.prev_path_progress
         self.prev_path_progress[:] = path_progress.detach()
+
+        (
+            active_goal_dist,
+            subgoal_progress_delta,
+            subgoal_reached,
+            intermediate_subgoal_reached,
+            is_final_active_goal,
+        ) = self._update_active_subgoal(payload_xy)
 
         self.prev_payload_goal_dist[:] = payload_goal_dist.detach()
 
@@ -396,6 +434,14 @@ class AgvTransportEnv(DirectRLEnv):
             self.payload.data.root_lin_vel_w[:, :2],
             dim=1,
         )
+
+        # D0A0h-plus：当前 active segment 信息，用于接近子目标减速、越过子目标惩罚和 yaw 引导。
+        (
+            prev_subgoal_xy,
+            active_subgoal_xy,
+            active_segment_dir,
+            active_segment_len,
+        ) = self._get_active_segment_info()
 
         num_waypoints = len(self.cfg.waypoints)
         final_waypoint_idx = num_waypoints - 1
@@ -468,17 +514,18 @@ class AgvTransportEnv(DirectRLEnv):
         _, bad_rear_push = self._compute_bad_rear_push(payload_xy)
         self.last_bad_rear_push[:] = bad_rear_push.detach()
 
-        # 沿路径真实前进时的 gate。只对正向进度开启，避免倒退时产生虚假接触奖励。
-        positive_progress = torch.clamp(path_progress_delta, min=0.0)
-        negative_progress = torch.clamp(-path_progress_delta, min=0.0)
+        # D0A0h：主推进信号来自 active waypoint 子目标距离减少。
+        # 这样模型必须先接近当前 waypoint，再切换到下一个 waypoint，不能只沿直线找终点。
+        positive_progress = torch.clamp(subgoal_progress_delta, min=0.0)
+        negative_progress = torch.clamp(-subgoal_progress_delta, min=0.0)
         progress_gate = torch.clamp(
             positive_progress / 0.005,
             min=0.0,
             max=1.0,
         )
 
-        # D0A0f：软路径走廊惩罚。横向误差在 corridor 半宽内不额外惩罚，
-        # 超出后按平方惩罚，用于阻止 payload 近似直线 shortcut。
+        # D0A0g-easy：温和软路径走廊惩罚。
+        # 横向误差在较宽 corridor 半宽内不额外惩罚，超出后按平方轻惩罚。
         path_corridor_violation = torch.clamp(
             path_lateral_error - self.cfg.path_corridor_half_width,
             min=0.0,
@@ -519,11 +566,51 @@ class AgvTransportEnv(DirectRLEnv):
             max=1.0,
         )
 
-        progress_reward = (
-            self.cfg.progress_base_reward_scale * positive_progress
-            + self.cfg.progress_two_pusher_bonus_scale * positive_progress * two_pusher_gate
-            - self.cfg.backward_progress_penalty_scale * negative_progress
+        # D0A0g-easy：soft corridor-gated progress reward。
+        # 与上一版不同，这里不把偏离路径时的 progress reward 直接压到 0，
+        # 而是使用 0.5~1.0 的混合 gate，逐步压小 shortcut，同时保护已学到的两车推送能力。
+        corridor_gate = torch.clamp(
+            1.0 - path_lateral_error / self.cfg.progress_corridor_width,
+            min=0.0,
+            max=1.0,
         )
+        progress_gate_soft = 0.5 + 0.5 * corridor_gate
+
+        progress_reward = (
+            progress_gate_soft
+            * (
+                self.cfg.subgoal_progress_reward_scale * positive_progress
+                + self.cfg.progress_two_pusher_bonus_scale * positive_progress * two_pusher_gate
+            )
+            - self.cfg.subgoal_backward_penalty_scale * negative_progress
+        )
+
+        # D0A0h-plus：接近 active waypoint 时减速，避免到第 4 个 waypoint 后继续高速直推。
+        near_subgoal = torch.clamp(
+            1.0 - active_goal_dist / self.cfg.subgoal_slow_radius,
+            min=0.0,
+            max=1.0,
+        )
+
+        # D0A0h-plus：如果 payload 已经沿当前段方向越过 active waypoint，则给 overshoot 惩罚。
+        # 这项直接针对“到第 4 个 waypoint 后继续往前推、越过终点”的现象。
+        overshoot = torch.sum(
+            (payload_xy - active_subgoal_xy) * active_segment_dir,
+            dim=1,
+        )
+        subgoal_overshoot = torch.clamp(overshoot, min=0.0)
+
+        # D0A0h-plus：payload yaw 与当前 active segment 方向对齐，帮助转弯段提前调整姿态。
+        desired_segment_yaw = torch.atan2(
+            active_segment_dir[:, 1],
+            active_segment_dir[:, 0],
+        )
+        subgoal_yaw_error = torch.atan2(
+            torch.sin(payload_yaw - desired_segment_yaw),
+            torch.cos(payload_yaw - desired_segment_yaw),
+        )
+        subgoal_yaw_error_abs = torch.abs(subgoal_yaw_error)
+
         single_pusher_progress_penalty = positive_progress * (1.0 - two_pusher_gate)
 
         # Episode-level two-pusher progress ratio，用于 success reward credit assignment。
@@ -563,6 +650,36 @@ class AgvTransportEnv(DirectRLEnv):
             1.0 - best_two_zone_error / self.cfg.contact_zone_error_norm,
             min=0.0,
             max=1.0,
+        )
+
+        # D0A0g-easy：waypoint gate 先关闭，避免从 v4.3f 到强路径约束时任务骤崩。
+        # 后续当 path_lat_max 降到 0.25~0.30 后，再把 cfg.enable_waypoint_gate 设为 True。
+        if getattr(self.cfg, "enable_waypoint_gate", False):
+            waypoint_gate_passed, waypoint_gate_dist, all_waypoint_gates_passed = (
+                self._update_waypoint_gate(payload_xy)
+            )
+            waypoint_gate_reward = (
+                self.cfg.waypoint_gate_reward_scale * waypoint_gate_passed.float()
+            )
+        else:
+            waypoint_gate_passed = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            waypoint_gate_dist = torch.zeros(self.num_envs, device=self.device)
+            all_waypoint_gates_passed = torch.ones(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            waypoint_gate_reward = torch.zeros(self.num_envs, device=self.device)
+
+        # D0A0h-plus：通过中间子目标时给稠密而明确的小奖励。
+        # 只对中间 waypoint 给奖励；最终 goal 由 success reward 处理。
+        subgoal_reach_reward = (
+            self.cfg.subgoal_reach_reward_scale
+            * intermediate_subgoal_reached.float()
         )
 
         agv_activity = torch.stack(
@@ -623,6 +740,15 @@ class AgvTransportEnv(DirectRLEnv):
             idle_gate.unsqueeze(1)
             * low_utility_weight
             * (standby_too_far * standby_too_far + standby_too_close * standby_too_close),
+            dim=1,
+        )
+
+        # D0A0h-plus：已有两车有效推动时，低贡献、未接触 payload 的 AGV 不应持续向前空跑。
+        idle_forward_no_contact_penalty = torch.sum(
+            idle_gate.unsqueeze(1)
+            * low_utility_weight
+            * (~contact_flags).float()
+            * torch.clamp(v_actions, min=0.0),
             dim=1,
         )
 
@@ -700,7 +826,15 @@ class AgvTransportEnv(DirectRLEnv):
 
         progress_success = path_progress_ratio > self.cfg.success_progress_ratio
 
-        success = position_success & yaw_success & progress_success
+        path_success = path_lateral_error < self.cfg.success_path_lateral_error
+
+        # D0A0h-plus：最终成功要求 active waypoint 已推进到最后一个目标。
+        # 中间路径由 active_goal_idx 顺序切换保证，不再依赖强 waypoint gate。
+        success = (
+            is_final_active_goal
+            & position_success
+            & yaw_success
+        )
 
         out_of_bounds = self._compute_out_of_bounds()
 
@@ -708,6 +842,10 @@ class AgvTransportEnv(DirectRLEnv):
             torch.square(self.actions),
             dim=1,
         )
+
+        # D0A0h-plus：接近子目标时降低 AGV 总动作幅度，给 payload 转向和下一段对齐留出时间。
+        subgoal_action_slow_penalty = near_subgoal * action_penalty
+        subgoal_speed_penalty = near_subgoal * payload_speed
 
         action_rate_penalty = torch.sum(
             torch.square(self.actions - self.prev_actions),
@@ -755,6 +893,12 @@ class AgvTransportEnv(DirectRLEnv):
                 - self.cfg.path_lateral_error_scale * path_lateral_error
                 - self.cfg.path_corridor_penalty_scale * path_corridor_violation * path_corridor_violation
 
+                # D0A0h-plus：子目标转向稳定项。
+                - self.cfg.subgoal_speed_penalty_scale * subgoal_speed_penalty
+                - self.cfg.subgoal_action_slow_penalty_scale * subgoal_action_slow_penalty
+                - self.cfg.subgoal_overshoot_penalty_scale * subgoal_overshoot * subgoal_overshoot
+                - self.cfg.subgoal_yaw_alignment_scale * subgoal_yaw_error_abs
+
                 # payload 姿态稳定
                 - 2.0 * payload_yaw_abs
 
@@ -766,12 +910,15 @@ class AgvTransportEnv(DirectRLEnv):
                 + contact_reward
                 + self.cfg.approach_reward_scale * approach_reward
                 + self.cfg.contact_zone_approach_reward_scale * contact_zone_approach_reward
+                + waypoint_gate_reward
+                + subgoal_reach_reward
                 + self.cfg.contact_persistence_reward_scale * contact_persistence_reward
                 - self.cfg.single_pusher_progress_penalty_scale * single_pusher_progress_penalty
                 - self.cfg.progress_drop_penalty_scale * progress_drop
                 - self.cfg.idle_action_penalty_scale * idle_action_penalty
                 - self.cfg.idle_action_rate_penalty_scale * idle_action_rate_penalty
                 - self.cfg.idle_standby_penalty_scale * idle_standby_penalty
+                - self.cfg.idle_forward_no_contact_penalty_scale * idle_forward_no_contact_penalty
 
                 # 队形约束（弱化固定队形，允许两车/三车策略性切换）
                 - self.cfg.formation_error_mean_scale * formation_error_mean
@@ -818,7 +965,7 @@ class AgvTransportEnv(DirectRLEnv):
         """
         payload_xy = self.payload.data.root_pos_w[:, :2]
 
-        _, _, path_progress, _ = self._compute_path_tracking_quantities()
+        _, path_lateral_error, path_progress, _ = self._compute_path_tracking_quantities()
         total_path_length = self._compute_path_total_length()
         path_progress_ratio = path_progress / total_path_length
 
@@ -837,7 +984,18 @@ class AgvTransportEnv(DirectRLEnv):
 
         progress_success = path_progress_ratio > self.cfg.success_progress_ratio
 
-        success = position_success & yaw_success & progress_success
+        path_success = path_lateral_error < self.cfg.success_path_lateral_error
+
+        # D0A0h：中间 waypoint 是否按顺序通过由 active_goal_idx 记录。
+        # 只有 active goal 已推进到最后一个 waypoint 后，才允许最终 success。
+        final_idx = max(len(self.cfg.waypoints) - 1, 0)
+        is_final_active_goal = self.active_goal_idx >= final_idx
+
+        success = (
+            is_final_active_goal
+            & position_success
+            & yaw_success
+        )
 
         out_of_bounds = self._compute_out_of_bounds()
 
@@ -935,11 +1093,19 @@ class AgvTransportEnv(DirectRLEnv):
 
         self.prev_path_progress[env_ids_tensor] = path_progress.detach()
         self.max_path_progress[env_ids_tensor] = path_progress.detach()
+        self.active_goal_idx[env_ids_tensor] = 0
+        self.next_gate_idx[env_ids_tensor] = 0
         self.episode_positive_progress[env_ids_tensor] = 0.0
         self.episode_two_pusher_progress[env_ids_tensor] = 0.0
 
         self.prev_payload_goal_dist[env_ids_tensor] = torch.linalg.norm(
             payload_xy - target_xy,
+            dim=1,
+        )
+
+        active_goal_xy = self._get_active_goal_xy()[env_ids_tensor]
+        self.prev_active_goal_dist[env_ids_tensor] = torch.linalg.norm(
+            payload_xy - active_goal_xy,
             dim=1,
         )
 
@@ -998,6 +1164,180 @@ class AgvTransportEnv(DirectRLEnv):
         """返回最终路径终点。"""
         waypoints_xy = self._get_waypoints_xy()
         return waypoints_xy[:, -1, :]
+
+    def _get_active_segment_info(self):
+        """返回当前 active waypoint 所在路径段的信息。
+
+        active_goal_idx=k 对应路径点序列中的第 k+1 个点：
+        path_points = [payload_init_pos, waypoint_0, waypoint_1, ...]
+        因此当前段为 path_points[k] -> path_points[k+1]。
+
+        Returns:
+            prev_goal_xy: 当前段起点，shape=[num_envs, 2]
+            active_goal_xy: 当前 active waypoint，shape=[num_envs, 2]
+            segment_dir: 当前段单位方向，shape=[num_envs, 2]
+            segment_len: 当前段长度，shape=[num_envs]
+        """
+        path_points = self._get_path_points_xy()
+        num_points = path_points.shape[1]
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        goal_path_idx = torch.clamp(
+            self.active_goal_idx + 1,
+            min=1,
+            max=num_points - 1,
+        )
+        prev_path_idx = torch.clamp(
+            goal_path_idx - 1,
+            min=0,
+            max=num_points - 1,
+        )
+
+        prev_goal_xy = path_points[env_ids, prev_path_idx]
+        active_goal_xy = path_points[env_ids, goal_path_idx]
+        segment_vec = active_goal_xy - prev_goal_xy
+        segment_len = torch.linalg.norm(
+            segment_vec,
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+        segment_dir = segment_vec / segment_len
+
+        return prev_goal_xy, active_goal_xy, segment_dir, segment_len.squeeze(-1)
+
+    def _get_active_goal_xy(self) -> torch.Tensor:
+        """返回当前 active waypoint 子目标坐标。"""
+        waypoints_xy = self._get_waypoints_xy()
+        env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        num_goals = len(self.cfg.waypoints)
+        if num_goals <= 0:
+            return self._get_final_target_xy()
+
+        goal_idx = torch.clamp(
+            self.active_goal_idx,
+            min=0,
+            max=num_goals - 1,
+        )
+
+        return waypoints_xy[env_ids, goal_idx]
+
+    def _get_active_goal_radius(self) -> torch.Tensor:
+        """返回当前 active waypoint 的通过半径。"""
+        num_goals = len(self.cfg.waypoints)
+        final_idx = max(num_goals - 1, 0)
+
+        is_final_goal = self.active_goal_idx >= final_idx
+
+        subgoal_radius = torch.full(
+            (self.num_envs,),
+            float(getattr(self.cfg, "subgoal_radius", 0.32)),
+            device=self.device,
+        )
+        final_radius = torch.full(
+            (self.num_envs,),
+            float(getattr(self.cfg, "subgoal_final_radius", self.cfg.target_radius)),
+            device=self.device,
+        )
+
+        return torch.where(is_final_goal, final_radius, subgoal_radius)
+
+    def _update_active_subgoal(self, payload_xy: torch.Tensor):
+        """根据 payload 位置更新 active waypoint 子目标。
+
+        Returns:
+            active_goal_dist: 更新前到当前子目标的距离
+            subgoal_progress_delta: 相比上一控制步，当前子目标距离减少量
+            subgoal_reached: 当前子目标是否已到达
+            intermediate_subgoal_reached: 是否到达了中间子目标
+            is_final_active_goal: 更新后 active goal 是否已经是最后一个 waypoint
+        """
+        num_goals = len(self.cfg.waypoints)
+        if num_goals <= 0:
+            zeros = torch.zeros(self.num_envs, device=self.device)
+            flags = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            return zeros, zeros, flags, flags, flags
+
+        active_goal_xy = self._get_active_goal_xy()
+        active_goal_dist = torch.linalg.norm(
+            payload_xy - active_goal_xy,
+            dim=1,
+        )
+
+        subgoal_progress_delta = self.prev_active_goal_dist - active_goal_dist
+
+        final_idx = num_goals - 1
+        is_final_before_update = self.active_goal_idx >= final_idx
+        active_goal_radius = self._get_active_goal_radius()
+        subgoal_reached = active_goal_dist < active_goal_radius
+        intermediate_subgoal_reached = subgoal_reached & (~is_final_before_update)
+
+        # 到达中间 waypoint 后切到下一个 waypoint；最终 waypoint 不再继续增加。
+        self.active_goal_idx[:] = torch.where(
+            intermediate_subgoal_reached,
+            torch.clamp(self.active_goal_idx + 1, max=final_idx),
+            self.active_goal_idx,
+        )
+
+        new_active_goal_xy = self._get_active_goal_xy()
+        self.prev_active_goal_dist[:] = torch.linalg.norm(
+            payload_xy - new_active_goal_xy,
+            dim=1,
+        ).detach()
+
+        is_final_active_goal = self.active_goal_idx >= final_idx
+
+        return (
+            active_goal_dist,
+            subgoal_progress_delta,
+            subgoal_reached,
+            intermediate_subgoal_reached,
+            is_final_active_goal,
+        )
+
+    def _update_waypoint_gate(self, payload_xy: torch.Tensor):
+        """更新并返回 waypoint gate 状态。
+
+        Returns:
+            gate_passed: 当前步是否通过下一 waypoint gate，shape=[num_envs]
+            gate_dist: payload 到当前 gate 的距离，shape=[num_envs]
+            all_gates_passed: 是否已经依次通过所有 waypoint gate，shape=[num_envs]
+        """
+        num_gates = len(self.cfg.waypoints)
+        if num_gates <= 0:
+            gate_passed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            gate_dist = torch.zeros(self.num_envs, device=self.device)
+            all_gates_passed = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            return gate_passed, gate_dist, all_gates_passed
+
+        waypoints_xy = self._get_waypoints_xy()
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+
+        active_gate = self.next_gate_idx < num_gates
+        gate_idx = torch.clamp(self.next_gate_idx, max=num_gates - 1)
+        gate_xy = waypoints_xy[env_ids, gate_idx]
+        gate_dist = torch.linalg.norm(payload_xy - gate_xy, dim=1)
+
+        gate_passed = active_gate & (gate_dist < self.cfg.waypoint_gate_radius)
+        self.next_gate_idx[:] = torch.clamp(
+            self.next_gate_idx + gate_passed.long(),
+            max=num_gates,
+        )
+
+        all_gates_passed = self.next_gate_idx >= num_gates
+        return gate_passed, gate_dist, all_gates_passed
+
+    def _all_waypoint_gates_passed(self) -> torch.Tensor:
+        """返回是否已依次通过所有 waypoint gate。"""
+        return self.next_gate_idx >= len(self.cfg.waypoints)
 
     def _compute_path_total_length(self) -> torch.Tensor:
         """返回每个环境中规划路径的总弧长，shape = [num_envs]."""
@@ -1126,7 +1466,10 @@ class AgvTransportEnv(DirectRLEnv):
         return target_xy, lateral_error, progress_s, segment_idx
 
     def _get_target_xy(self) -> torch.Tensor:
-        """返回连续路径跟踪的 lookahead target。"""
+        """返回当前 active waypoint 子目标。"""
+        if getattr(self.cfg, "enable_subgoal_waypoint", True):
+            return self._get_active_goal_xy()
+
         target_xy, _, _, _ = self._compute_path_tracking_quantities()
         return target_xy
 
