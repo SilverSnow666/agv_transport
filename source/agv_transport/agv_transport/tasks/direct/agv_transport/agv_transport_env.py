@@ -15,13 +15,15 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.3-D0A0h-plus-turn-control：
+    当前版本用于 V4.3-D0A0i-turn-role-switch：
     - 延续 D0A0c 的 top-2 有效推动 credit；
     - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
     - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到温和动作和动作变化率惩罚，减少抽搐；
     - 使用 active waypoint 子目标驱动 payload 依次经过路径点；
     - 当前 target、队形方向与距离奖励都围绕 active waypoint 更新；
     - 增加接近子目标减速、active segment overshoot 惩罚和 payload yaw 引导；
+    - 在右转/下拐段使用 turn-aware role switching，招募 AGV2 靠近并参与推动，
+      轻微抑制 AGV3 继续过强直推。
     - 重点解决第 4 个 waypoint 后 payload 不下拐、继续被直推过头的问题。
     """
 
@@ -652,6 +654,24 @@ class AgvTransportEnv(DirectRLEnv):
             max=1.0,
         )
 
+        # D0A0i：转弯方向感知的角色切换。
+        # 当 active segment 的 y 分量明显为负时，说明当前段需要向下/右拐。
+        # 此时鼓励 AGV2 靠近有效接触带并产生有效推动，轻微抑制 AGV3 继续强推，
+        # 以给 payload 提供更合适的转向力矩。
+        right_turn_gate = (
+            active_segment_dir[:, 1] < -self.cfg.turn_role_y_threshold
+        ).float()
+
+        agv2_turn_push_reward = right_turn_gate * push_utility[:, 1]
+
+        agv2_turn_contact_zone_reward = right_turn_gate * torch.clamp(
+            1.0 - contact_zone_errors[:, 1] / self.cfg.turn_role_contact_zone_norm,
+            min=0.0,
+            max=1.0,
+        )
+
+        agv3_opposite_push_penalty = right_turn_gate * push_utility[:, 2]
+
         # D0A0g-easy：waypoint gate 先关闭，避免从 v4.3f 到强路径约束时任务骤崩。
         # 后续当 path_lat_max 降到 0.25~0.30 后，再把 cfg.enable_waypoint_gate 设为 True。
         if getattr(self.cfg, "enable_waypoint_gate", False):
@@ -910,6 +930,12 @@ class AgvTransportEnv(DirectRLEnv):
                 + contact_reward
                 + self.cfg.approach_reward_scale * approach_reward
                 + self.cfg.contact_zone_approach_reward_scale * contact_zone_approach_reward
+
+                # D0A0i：右转/下拐段招募 AGV2，轻微抑制 AGV3 继续直推。
+                + self.cfg.turn_role_contact_zone_reward_scale * agv2_turn_contact_zone_reward
+                + self.cfg.turn_role_push_reward_scale * agv2_turn_push_reward
+                - self.cfg.turn_opposite_push_penalty_scale * agv3_opposite_push_penalty
+
                 + waypoint_gate_reward
                 + subgoal_reach_reward
                 + self.cfg.contact_persistence_reward_scale * contact_persistence_reward

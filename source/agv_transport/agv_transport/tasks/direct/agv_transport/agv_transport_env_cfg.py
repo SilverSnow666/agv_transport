@@ -14,14 +14,15 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本用于 V4.3-D0A0h-plus-turn-control：
+    当前版本用于 V4.3-D0A0i-turn-role-switch：
     - 延续 D0A0b 的 two-pusher credit，允许任意两台 AGV 有效推动；
     - 不强制 AGV2 必须接触，但要求低贡献 AGV 在已有两车推动时保持低动作、低抖动；
     - 保留任意两台 AGV 有效推动的 two-pusher credit；
     - 不强制第三台 AGV 接触，但进一步抑制低贡献 AGV 抽搐；
     - 将 target 从连续 lookahead 改为当前 active waypoint 子目标；
-    - 通过“当前子目标距离减少”来驱动 payload 依次经过 waypoint，
-      避免开放空间中直接 shortcut 到终点；
+    - 通过 active waypoint 子目标驱动 payload 依次经过 waypoint；
+    - 在右转/下拐段引入 turn-aware role switching，招募 AGV2 参与转向，
+      并轻微抑制 AGV3 在右转段继续过强直推；
     - 保留宽而短的小矩形 payload 与前端几何接触判定。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
@@ -164,20 +165,20 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # D0A0f：路径遵从约束。
     # 当前模型已经能到终点，但存在近似直线 shortcut，因此提高横向误差惩罚，
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
-    path_lateral_error_scale = 0.60
+    path_lateral_error_scale = 0.70
 
     # D0A0g-easy：温和路径遵从。
     # 1) 离路径较远时，正向 progress reward 只被 soft gate 部分衰减；
     # 2) 超出较宽软走廊后按平方轻惩罚；
     # 3) success 需要路径进度合格，但末端横向误差先保持较宽，避免训练骤崩。
-    progress_corridor_width = 0.65
-    path_corridor_half_width = 0.40
-    path_corridor_penalty_scale = 2.0
+    progress_corridor_width = 0.60
+    path_corridor_half_width = 0.35
+    path_corridor_penalty_scale = 2.5
 
     # success 需要 payload 不仅进入目标半径，还要沿路径推进到足够靠近末端。
     # easy 阶段先使用 0.96 和较宽 path lateral 条件，保护已有成功策略。
-    success_progress_ratio = 0.90
-    success_path_lateral_error = 0.45
+    success_progress_ratio = 0.92
+    success_path_lateral_error = 0.40
 
     # D0A0g-easy：暂时关闭强 waypoint gate。
     # 等 soft-path 阶段把 path_lat_max 压到 0.25~0.30 后，再逐步打开。
@@ -193,7 +194,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 当前 target 不再直接指向最终目标或 lookahead target，而是指向当前 active waypoint。
     # payload 到达当前 waypoint 后，active_goal_idx 自动切换到下一个 waypoint。
     enable_subgoal_waypoint = True
-    subgoal_radius = 0.34
+    subgoal_radius = 0.30
     subgoal_final_radius = 0.22
     subgoal_progress_reward_scale = 14.0
     subgoal_backward_penalty_scale = 8.0
@@ -201,7 +202,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # D0A0h-plus：子目标转向稳定项。
     # near_subgoal 越大，越要求 payload 和动作降速，避免接近 waypoint 后继续高速直推。
-    subgoal_slow_radius = 0.55
+    subgoal_slow_radius = 0.60
     subgoal_speed_penalty_scale = 1.20
     subgoal_action_slow_penalty_scale = 0.20
 
@@ -212,7 +213,16 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     subgoal_yaw_alignment_scale = 0.45
 
     # 已有两台 AGV 有效推动时，低贡献且未接触 payload 的 AGV 不应持续向前空跑。
-    idle_forward_no_contact_penalty_scale = 0.80
+    idle_forward_no_contact_penalty_scale = 1.20
+
+    # D0A0i：转弯方向感知的角色切换。
+    # 当 active segment 的 y 方向明显向下/右转时，鼓励 AGV2 靠近并参与有效推动，
+    # 同时轻微抑制 AGV3 在该段继续过强直推，帮助 payload 下拐而不是冲过终点。
+    turn_role_y_threshold = 0.08
+    turn_role_push_reward_scale = 2.0
+    turn_role_contact_zone_reward_scale = 1.2
+    turn_role_contact_zone_norm = 0.80
+    turn_opposite_push_penalty_scale = 0.6
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
     progress_base_reward_scale = 10.0
@@ -243,8 +253,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
     # easy 阶段保持中等强度，避免为了压 AGV2 抽搐而破坏两车推送主策略。
-    idle_action_penalty_scale = 0.28
-    idle_action_rate_penalty_scale = 0.32
+    idle_action_penalty_scale = 0.30
+    idle_action_rate_penalty_scale = 0.35
     idle_standby_penalty_scale = 0.10
     idle_low_utility_threshold = 0.08
     idle_two_pusher_gate_threshold = 0.60
