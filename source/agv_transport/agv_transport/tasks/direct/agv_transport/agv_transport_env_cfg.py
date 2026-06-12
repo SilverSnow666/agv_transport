@@ -36,7 +36,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 45.0
+    episode_length_s = 80.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -147,18 +147,15 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # V4.3-D0A0f：中等偏强曲率路径。
     # 当前阶段不再加大曲率，而是通过 success progress 与 corridor penalty 强化路径遵从。
     waypoints = (
-        (0.45, 0.00),
-        (0.95, 0.28),
-        (1.45, 0.45),
-        (2.05, 0.20),
-        # D0A0h-plus：把原本 (2.05, 0.20) -> (2.65, -0.25) 的急转向段拆细，
-        # 让 payload 在两车推送下先学会连续下拐，而不是到第 4 点后继续直推过头。
-        (2.30, 0.02),
-        (2.55, -0.16),
-        (2.85, -0.16),
-        (3.10, 0.00),
+        (0.80, 0.00),
+        (1.60, 0.00),
+        (2.40, -0.40),  # 缓和入弯
+        (3.00, -0.80),
+        (3.60, -0.80),  # 直线过渡
+        (4.20, -0.40),  # 缓和出弯
+        (4.80, 0.00),
+        (5.60, 0.00),
     )
-
     # V4.1C 连续路径跟踪前视距离
     path_lookahead_dist = 0.32
 
@@ -212,7 +209,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     subgoal_overshoot_penalty_scale = 10.0
 
     # 引导 payload yaw 与当前 active segment 方向大致一致，帮助第 4->第 5 waypoint 下拐。
-    subgoal_yaw_alignment_scale = 0.45
+    subgoal_yaw_alignment_scale = 0.15
 
     # 已有两台 AGV 有效推动时，低贡献且未接触 payload 的 AGV 不应持续向前空跑。
     idle_forward_no_contact_penalty_scale = 1.20
@@ -237,7 +234,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     progress_two_pusher_bonus_scale = 18.0
     backward_progress_penalty_scale = 12.0
     two_pusher_gate_threshold = 0.20
-    single_pusher_progress_penalty_scale = 12.0
+    single_pusher_progress_penalty_scale = 2.0
 
     # 成功奖励按整个 episode 中“两车有效推动进度占比”缩放，避免单车推到终点拿满分。
     success_reward_scale = 150.0
@@ -287,7 +284,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
 
     # 工作空间限制，防止物体飞太远
-    workspace_limit = 3.8
+    workspace_limit = 6.0
 
     # 差速 AGV 动作缩放
     max_agv_linear_speed = 0.5

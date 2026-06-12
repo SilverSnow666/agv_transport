@@ -567,10 +567,20 @@ class AgvTransportEnv(DirectRLEnv):
 
         # 如果只有一台 AGV 在推，second_push 接近 0，two_pusher_gate 接近 0；
         # 第二台 AGV 也有效推时，主要 progress / success reward 才逐步放大。
-        two_pusher_gate = torch.clamp(
+        base_two_pusher_gate = torch.clamp(
             second_push_utility / self.cfg.two_pusher_gate_threshold,
             min=0.0,
             max=1.0,
+        )
+
+        # 提取当前路径段是否处于显著转弯状态
+        is_turning = (torch.abs(active_segment_dir[:, 1]) > self.cfg.turn_role_y_threshold).float()
+
+        # 转弯豁免机制：如果是转弯段，强行提振 two_pusher_gate，允许外侧单车合法发力推进而不被重罚
+        two_pusher_gate = torch.where(
+            is_turning > 0.5,
+            torch.clamp(base_two_pusher_gate + 0.6, max=1.0),
+            base_two_pusher_gate
         )
 
         # D0A0g-easy：soft corridor-gated progress reward。
@@ -658,24 +668,37 @@ class AgvTransportEnv(DirectRLEnv):
             min=0.0,
             max=1.0,
         )
-
-        # D0A0i：转弯方向感知的角色切换。
-        # 当 active segment 的 y 分量明显为负时，说明当前段需要向下/右拐。
-        # 此时鼓励 AGV2 靠近有效接触带并产生有效推动，轻微抑制 AGV3 继续强推，
-        # 以给 payload 提供更合适的转向力矩。
+        # 增加以下双向对称角色切换逻辑：
+        # 1. 右转/下拐判定 (主动招募左侧车 AGV2 发力，压制右侧车 AGV3)
         right_turn_gate = (
-            active_segment_dir[:, 1] < -self.cfg.turn_role_y_threshold
+                active_segment_dir[:, 1] < -self.cfg.turn_role_y_threshold
         ).float()
 
-        agv2_turn_push_reward = right_turn_gate * push_utility[:, 1]
-
-        agv2_turn_contact_zone_reward = right_turn_gate * torch.clamp(
+        agv2_right_turn_push_reward = right_turn_gate * push_utility[:, 1]
+        agv2_right_turn_contact_reward = right_turn_gate * torch.clamp(
             1.0 - contact_zone_errors[:, 1] / self.cfg.turn_role_contact_zone_norm,
             min=0.0,
             max=1.0,
         )
+        agv3_right_turn_penalty = right_turn_gate * push_utility[:, 2]
 
-        agv3_opposite_push_penalty = right_turn_gate * push_utility[:, 2]
+        # 2. 左转/上拐判定 (主动招募右侧车 AGV3 发力，压制左侧车 AGV2)
+        left_turn_gate = (
+                active_segment_dir[:, 1] > self.cfg.turn_role_y_threshold
+        ).float()
+
+        agv3_left_turn_push_reward = left_turn_gate * push_utility[:, 2]
+        agv3_left_turn_contact_reward = left_turn_gate * torch.clamp(
+            1.0 - contact_zone_errors[:, 2] / self.cfg.turn_role_contact_zone_norm,
+            min=0.0,
+            max=1.0,
+        )
+        agv2_left_turn_penalty = left_turn_gate * push_utility[:, 1]
+
+        # 3. 汇总为对称的统一控制项
+        turn_push_reward = agv2_right_turn_push_reward + agv3_left_turn_push_reward
+        turn_contact_reward = agv2_right_turn_contact_reward + agv3_left_turn_contact_reward
+        turn_opposite_penalty = agv3_right_turn_penalty + agv2_left_turn_penalty
 
         # D0A0g-easy：waypoint gate 先关闭，避免从 v4.3f 到强路径约束时任务骤崩。
         # 后续当 path_lat_max 降到 0.25~0.30 后，再把 cfg.enable_waypoint_gate 设为 True。
@@ -914,12 +937,6 @@ class AgvTransportEnv(DirectRLEnv):
             # 单车推可以获得少量基础进度奖励；两台 AGV 有效推时才获得主要进度奖励。
                 progress_reward
 
-                # 目标距离
-                - 0.8 * payload_goal_dist
-
-                # 距离最终终点
-                - 0.6 * final_goal_dist
-
                 - self.cfg.path_lateral_error_scale * path_lateral_error
                 - self.cfg.path_corridor_penalty_scale * path_corridor_violation * path_corridor_violation
 
@@ -941,10 +958,10 @@ class AgvTransportEnv(DirectRLEnv):
                 + self.cfg.approach_reward_scale * approach_reward
                 + self.cfg.contact_zone_approach_reward_scale * contact_zone_approach_reward
 
-                # D0A0i：右转/下拐段招募 AGV2，轻微抑制 AGV3 继续直推。
-                + self.cfg.turn_role_contact_zone_reward_scale * agv2_turn_contact_zone_reward
-                + self.cfg.turn_role_push_reward_scale * agv2_turn_push_reward
-                - self.cfg.turn_opposite_push_penalty_scale * agv3_opposite_push_penalty
+                # 替换为以下对称计算项：
+                + self.cfg.turn_role_contact_zone_reward_scale * turn_contact_reward
+                + self.cfg.turn_role_push_reward_scale * turn_push_reward
+                - self.cfg.turn_opposite_push_penalty_scale * turn_opposite_penalty
 
                 + waypoint_gate_reward
                 + subgoal_reach_reward
