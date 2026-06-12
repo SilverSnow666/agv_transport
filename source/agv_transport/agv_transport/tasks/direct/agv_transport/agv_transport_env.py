@@ -15,7 +15,7 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.3-D0A0i-turn-role-switch：
+    当前版本用于 V4.3-D0A0i-plus-subgoal-tighten：
     - 延续 D0A0c 的 top-2 有效推动 credit；
     - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
     - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到温和动作和动作变化率惩罚，减少抽搐；
@@ -147,6 +147,11 @@ class AgvTransportEnv(DirectRLEnv):
         self.prev_agv_payload_dist[:] = torch.linalg.norm(
             agv_xy - payload_xy,
             dim=1,
+        )
+        self.last_agv_escaped = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
         )
 
         formation_errors = self._compute_formation_errors()
@@ -729,6 +734,11 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        agv_escaped = torch.any(
+            agv_payload_dists > getattr(self.cfg, "agv_escape_dist_threshold", 2.0),
+            dim=1,
+        )
+
         # D0A0c：第三台低贡献 AGV 不必强行参与，但已有两台有效推动时，
         # 低贡献 AGV 应保持低动作、低动作变化率，并处于可重新加入的待命距离。
         low_utility_weight = torch.clamp(
@@ -977,6 +987,8 @@ class AgvTransportEnv(DirectRLEnv):
                 + self.cfg.success_reward_scale * success.float() * success_quality_gate
                 - 30.0 * out_of_bounds.float()
 
+                - getattr(self.cfg, "agv_escape_penalty_scale", 50.0) * agv_escaped.float()
+
         )
 
         return reward
@@ -1017,16 +1029,38 @@ class AgvTransportEnv(DirectRLEnv):
         final_idx = max(len(self.cfg.waypoints) - 1, 0)
         is_final_active_goal = self.active_goal_idx >= final_idx
 
-        success = (
-            is_final_active_goal
-            & position_success
-            & yaw_success
-        )
+        # --- [新增] 修复切角捷径：要求依次通过所有 waypoint 门限 ---
+        if getattr(self.cfg, "enable_waypoint_gate", False):
+            all_gates_passed = self._all_waypoint_gates_passed()
+            success = (
+                    is_final_active_goal
+                    & position_success
+                    & yaw_success
+                    & all_gates_passed
+            )
+        else:
+            success = (
+                    is_final_active_goal
+                    & position_success
+                    & yaw_success
+            )
 
         out_of_bounds = self._compute_out_of_bounds()
 
         _, bad_rear_push = self._compute_bad_rear_push(payload_xy)
         self.last_bad_rear_push[:] = bad_rear_push.detach()
+
+        # --- [新增] 修复角色逃逸：计算 AGV 到 payload 的距离并判定是否逃逸 ---
+        agv1_dist = torch.linalg.norm(self.agv1.data.root_pos_w[:, :2] - payload_xy, dim=1)
+        agv2_dist = torch.linalg.norm(self.agv2.data.root_pos_w[:, :2] - payload_xy, dim=1)
+        agv3_dist = torch.linalg.norm(self.agv3.data.root_pos_w[:, :2] - payload_xy, dim=1)
+
+        agv_payload_dists = torch.stack((agv1_dist, agv2_dist, agv3_dist), dim=1)
+
+        agv_escaped = torch.any(
+            agv_payload_dists > getattr(self.cfg, "agv_escape_dist_threshold", 2.0),
+            dim=1,
+        )
 
         # 保存 terminal 判断时刻的真实状态，供评估脚本读取
         self.last_success[:] = success.detach()
@@ -1035,11 +1069,17 @@ class AgvTransportEnv(DirectRLEnv):
         self.last_out_of_bounds[:] = out_of_bounds.detach()
         self.last_payload_goal_dist[:] = final_goal_dist.detach()
         self.last_payload_yaw_abs[:] = torch.abs(payload_yaw).detach()
+        self.last_agv_escaped[:] = agv_escaped.detach()
 
-        if self.cfg.terminate_on_bad_rear_push:
+        # 基础终止判定
+        if getattr(self.cfg, "terminate_on_bad_rear_push", False):
             terminated = success | out_of_bounds | bad_rear_push
         else:
             terminated = success | out_of_bounds
+
+        # --- [新增] 挂载逃逸截断：如果某台车跑得太远，直接终止当前 episode ---
+        if getattr(self.cfg, "terminate_on_agv_escape", False):
+            terminated = terminated | agv_escaped
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
