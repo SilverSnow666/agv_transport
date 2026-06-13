@@ -700,6 +700,12 @@ class AgvTransportEnv(DirectRLEnv):
         turn_contact_reward = agv2_right_turn_contact_reward + agv3_left_turn_contact_reward
         turn_opposite_penalty = agv3_right_turn_penalty + agv2_left_turn_penalty
 
+        # ======== 【新增段落：AGV1 转弯让权判定】 ========
+        is_turning_gate = torch.clamp(right_turn_gate + left_turn_gate, max=1.0)
+        # 如果处于转弯段，AGV1 若继续强行输出正向推力，将受到计算
+        agv1_turn_penalty = is_turning_gate * push_utility[:, 0]
+        # ===================================================
+
         # D0A0g-easy：waypoint gate 先关闭，避免从 v4.3f 到强路径约束时任务骤崩。
         # 后续当 path_lat_max 降到 0.25~0.30 后，再把 cfg.enable_waypoint_gate 设为 True。
         if getattr(self.cfg, "enable_waypoint_gate", False):
@@ -962,6 +968,8 @@ class AgvTransportEnv(DirectRLEnv):
                 + self.cfg.turn_role_contact_zone_reward_scale * turn_contact_reward
                 + self.cfg.turn_role_push_reward_scale * turn_push_reward
                 - self.cfg.turn_opposite_push_penalty_scale * turn_opposite_penalty
+
+                - getattr(self.cfg, "turn_center_push_penalty_scale", 2.0) * agv1_turn_penalty
 
                 + waypoint_gate_reward
                 + subgoal_reach_reward

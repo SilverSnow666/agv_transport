@@ -115,8 +115,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # AGV-AGV 安全距离约束。
     # D0A1 阶段只使用温和软分离，避免过强避让破坏角色分配。
-    agv_safe_distance = 0.50
-    agv_collision_distance = 0.43
+    agv_safe_distance = 0.46
+    agv_collision_distance = 0.41
 
     agv_overlap_penalty_scale = 5.0
     agv_collision_penalty_scale = 15.0
@@ -224,6 +224,9 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     turn_role_contact_zone_norm = 0.80
     turn_opposite_push_penalty_scale = 0.7
 
+    # [新增] 转弯时压制中间车（AGV1），迫使其交出主导权
+    turn_center_push_penalty_scale = 2.0
+
     # ========== 3. 新增脱队截断机制 (Truncation) ==========
     terminate_on_agv_escape = True
     agv_escape_dist_threshold = 2.0  # 距离 Payload 超过 2.0m 视为逃逸
@@ -262,7 +265,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     idle_action_rate_penalty_scale = 0.35
     idle_standby_penalty_scale = 1.50
     idle_low_utility_threshold = 0.08
-    idle_two_pusher_gate_threshold = 0.60
+    idle_two_pusher_gate_threshold = 0.50
     idle_standby_min_dist = 0.80
     idle_standby_max_dist = 1.20
 
