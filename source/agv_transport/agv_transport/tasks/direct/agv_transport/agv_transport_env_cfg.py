@@ -14,16 +14,18 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本用于 V4.3-D0A0i-plus-subgoal-tighten：
-    - 延续 D0A0b 的 two-pusher credit，允许任意两台 AGV 有效推动；
-    - 不强制 AGV2 必须接触，但要求低贡献 AGV 在已有两车推动时保持低动作、低抖动；
-    - 保留任意两台 AGV 有效推动的 two-pusher credit；
-    - 不强制第三台 AGV 接触，但进一步抑制低贡献 AGV 抽搐；
-    - 将 target 从连续 lookahead 改为当前 active waypoint 子目标；
-    - 通过 active waypoint 子目标驱动 payload 依次经过 waypoint；
-    - 在右转/下拐段引入 turn-aware role switching，招募 AGV2 参与转向，
-      并轻微抑制 AGV3 在右转段继续过强直推；
-    - 保留宽而短的小矩形 payload 与前端几何接触判定。
+    当前版本：V5.0.3-parallel-contact-flags。
+
+    当前阶段目标：在空旷场地验证对称双向转弯招募逻辑。
+    最终课题目标：三台差速 AGV 协同推动异形件沿带物理边界的不规则路径到达终点。
+
+    本版核心变化：
+    - 有效推动奖励和 contact flag 均使用 AGV 与 payload 车身朝向平行度，
+      消除侧车向 payload 质心偏头形成的 V 型挤压梯度。
+    - 保留 two-pusher credit，不强制三车全程同时接触。
+    - 右转/下拐段招募 AGV2，左转/上拐段招募 AGV3。
+    - 恢复适度队形约束，防止侧车在平行推送后横向漂移。
+    - 闲置动作惩罚采用中等偏松设置，允许恢复追赶，但避免侧车过早抢占主推角色。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -259,19 +261,22 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     progress_drop_penalty_scale = 4.0
     progress_drop_tolerance = 0.03
 
-    # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
-    # easy 阶段保持中等强度，避免为了压 AGV2 抽搐而破坏两车推送主策略。
-    idle_action_penalty_scale = 0.30
-    idle_action_rate_penalty_scale = 0.35
-    idle_standby_penalty_scale = 1.50
+    # 低贡献车辆约束。
+    # V5.0.3 采用中等偏松设置：允许闲置车在转弯后恢复、追赶和让位，
+    # 但不完全取消动作代价，避免 AGV2/AGV3 过早抢占中心主推角色。
+    idle_action_penalty_scale = 0.10
+    idle_action_rate_penalty_scale = 0.15
+    idle_standby_penalty_scale = 1.20
     idle_low_utility_threshold = 0.08
     idle_two_pusher_gate_threshold = 0.50
     idle_standby_min_dist = 0.80
-    idle_standby_max_dist = 1.20
+    idle_standby_max_dist = 1.45
 
-    # 固定队形只做弱约束，避免强行要求三台 AGV 始终同时接触。
-    formation_error_mean_scale = 0.10
-    formation_error_max_scale = 0.03
+    # 适度队形约束。
+    # 平行推送与平行 contact flag 已消除侧车内扣梯度；这里保留车道纪律，
+    # 防止 AGV2/AGV3 横向漂移或过早夹占中心车空间。
+    formation_error_mean_scale = 0.06
+    formation_error_max_scale = 0.02
     heading_alignment_mean_scale = 0.15
     heading_alignment_min_scale = 0.05
 

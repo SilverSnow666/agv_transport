@@ -15,16 +15,19 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本用于 V4.3-D0A0i-plus-subgoal-tighten：
-    - 延续 D0A0c 的 top-2 有效推动 credit；
-    - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
-    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到温和动作和动作变化率惩罚，减少抽搐；
-    - 使用 active waypoint 子目标驱动 payload 依次经过路径点；
-    - 当前 target、队形方向与距离奖励都围绕 active waypoint 更新；
-    - 增加接近子目标减速、active segment overshoot 惩罚和 payload yaw 引导；
-    - 在右转/下拐段使用 turn-aware role switching，招募 AGV2 靠近并参与推动，
-      轻微抑制 AGV3 继续过强直推。
-    - 重点解决第 4 个 waypoint 后 payload 不下拐、继续被直推过头的问题。
+    当前版本：V5.0.3-parallel-contact-flags。
+
+    目标：在空旷场地验证对称双向转弯招募逻辑，为后续带物理边界
+    的不规则路径搬运和异形件搬运打基础。
+
+    核心设计：
+    - 集中式单智能体控制三台差速 AGV，动作为 [v1, w1, v2, w2, v3, w3]。
+    - 使用 active waypoint 子目标驱动 payload 按顺序经过路径点。
+    - 允许任意两台 AGV 形成有效推动，不强制三车全程同时接触。
+    - 在右转/下拐段招募 AGV2，在左转/上拐段招募 AGV3。
+    - 有效推动奖励与 contact flag 均使用 AGV 与 payload 车身朝向平行度，
+      避免侧车为了最大化朝向/接触奖励而转向 payload 质心形成 V 型挤压。
+    - 保留 AGV 指向 payload 质心的几何量，仅用于车尾倒推等异常诊断。
     """
 
     cfg: AgvTransportEnvCfg
@@ -468,18 +471,20 @@ class AgvTransportEnv(DirectRLEnv):
         contact_count = contact_flags_float.sum(dim=1)
 
         (
-            heading_to_payload,
+            heading_to_payload_center,
+            heading_parallel_to_payload,
             front_dists,
             rear_dists,
             v_actions,
         ) = self._compute_contact_geometry(payload_xy)
 
-        # 车头是否合理朝向 payload。
-        # heading_to_payload = 1 表示车头正对 payload；
-        # heading_to_payload = -1 表示车尾正对 payload。
+        # 有效推动朝向不再要求侧车指向 payload 质心。
+        # 对宽矩形 payload，侧车若追求“车头指向质心”，会自然形成 V 型内扣，
+        # 压缩中心车空间。这里改为奖励 AGV 车头与 payload 车身朝向一致，
+        # 使三车以近似平行姿态推送。
         front_facing_score = torch.clamp(
             (
-                heading_to_payload - self.cfg.front_contact_heading_min
+                heading_parallel_to_payload - self.cfg.front_contact_heading_min
             )
             / (1.0 - self.cfg.front_contact_heading_min),
             min=0.0,
@@ -506,12 +511,13 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         ) / 3.0
 
-        # 接触时车头明显没有朝向 payload，也给软惩罚。
+        # 接触时车头若未与 payload 车身方向保持一致，给软惩罚。
+        # 该项与 push_utility 使用同一平行朝向指标，避免重新引入侧车内扣梯度。
         bad_contact_heading_penalty = torch.sum(
             contact_flags_float
             * torch.square(
                 torch.clamp(
-                    self.cfg.front_contact_heading_min - heading_to_payload,
+                    self.cfg.front_contact_heading_min - heading_parallel_to_payload,
                     min=0.0,
                 )
             ),
@@ -1581,6 +1587,13 @@ class AgvTransportEnv(DirectRLEnv):
 
         cos_yaw = torch.cos(payload_yaw)
         sin_yaw = torch.sin(payload_yaw)
+        payload_heading_xy = torch.stack(
+            (
+                cos_yaw,
+                sin_yaw,
+            ),
+            dim=1,
+        )
 
         payload_half_x = 0.5 * self.cfg.payload_size[0]
         payload_half_y = 0.5 * self.cfg.payload_size[1]
@@ -1640,11 +1653,14 @@ class AgvTransportEnv(DirectRLEnv):
                 & (front_y_min < payload_half_y + y_margin)
             )
 
-            to_payload = payload_xy - agv_xy
-            to_payload_dist = torch.linalg.norm(to_payload, dim=1, keepdim=True).clamp_min(1e-6)
-            dir_to_payload = to_payload / to_payload_dist
-            heading_to_payload = torch.sum(agv_heading_xy * dir_to_payload, dim=1)
-            front_facing = heading_to_payload > self.cfg.front_contact_heading_min
+            # Contact flag 的朝向 gate 必须与有效推动奖励保持同一语义：
+            # 前端接触车辆应与 payload 车身朝向平行，而不是朝向 payload 质心。
+            # 否则侧车会重新被诱导向中心偏头，形成 V 型挤压。
+            heading_parallel_to_payload = torch.sum(
+                agv_heading_xy * payload_heading_xy,
+                dim=1,
+            )
+            front_facing = heading_parallel_to_payload > self.cfg.front_contact_heading_min
 
             contact_flags.append(rear_band_ok & lateral_overlap_ok & front_facing)
 
@@ -1720,22 +1736,39 @@ class AgvTransportEnv(DirectRLEnv):
         return torch.stack(errors, dim=1)
 
     def _compute_contact_geometry(self, payload_xy: torch.Tensor | None = None):
-        """计算 AGV 与 payload 的前后接触几何关系。
+        """计算 AGV 与 payload 的接触几何关系。
 
         返回：
-            heading_to_payload: 每台 AGV 车头方向与 AGV->payload 方向的点积，shape [num_envs, 3]
-                > 0 表示车头大致朝向 payload；
-                < 0 表示车尾大致朝向 payload。
-            front_dists: 每台 AGV 前端点到 payload 中心的距离，shape [num_envs, 3]
-            rear_dists: 每台 AGV 后端点到 payload 中心的距离，shape [num_envs, 3]
-            v_actions: 每台 AGV 当前线速度动作，shape [num_envs, 3]
+            heading_to_payload_center:
+                AGV 车头方向与 AGV->payload 质心方向的点积，shape=[num_envs, 3]。
+                仅用于车尾倒推、异常接触等几何诊断。
+            heading_parallel_to_payload:
+                AGV 车头方向与 payload 当前车身朝向的点积，shape=[num_envs, 3]。
+                用于有效前端推动奖励，避免侧车为了最大化奖励而朝 payload
+                质心内扣。
+            front_dists:
+                每台 AGV 前端点到 payload 质心的距离，shape=[num_envs, 3]。
+            rear_dists:
+                每台 AGV 后端点到 payload 质心的距离，shape=[num_envs, 3]。
+            v_actions:
+                每台 AGV 当前线速度动作，shape=[num_envs, 3]。
         """
         if payload_xy is None:
             payload_xy = self.payload.data.root_pos_w[:, :2]
 
         half_length = 0.5 * self.cfg.agv_size[0]
 
-        heading_to_payload_list = []
+        payload_yaw = self._get_payload_yaw()
+        payload_heading_xy = torch.stack(
+            (
+                torch.cos(payload_yaw),
+                torch.sin(payload_yaw),
+            ),
+            dim=1,
+        )
+
+        heading_to_payload_center_list = []
+        heading_parallel_to_payload_list = []
         front_dist_list = []
         rear_dist_list = []
         v_action_list = []
@@ -1757,11 +1790,14 @@ class AgvTransportEnv(DirectRLEnv):
                 dim=1,
                 keepdim=True,
             ).clamp_min(1e-6)
-
             dir_to_payload = to_payload / to_payload_dist
 
-            heading_to_payload = torch.sum(
+            heading_to_payload_center = torch.sum(
                 agv_heading_xy * dir_to_payload,
+                dim=1,
+            )
+            heading_parallel_to_payload = torch.sum(
+                agv_heading_xy * payload_heading_xy,
                 dim=1,
             )
 
@@ -1771,17 +1807,31 @@ class AgvTransportEnv(DirectRLEnv):
             front_dist = torch.linalg.norm(front_xy - payload_xy, dim=1)
             rear_dist = torch.linalg.norm(rear_xy - payload_xy, dim=1)
 
-            heading_to_payload_list.append(heading_to_payload)
+            heading_to_payload_center_list.append(heading_to_payload_center)
+            heading_parallel_to_payload_list.append(heading_parallel_to_payload)
             front_dist_list.append(front_dist)
             rear_dist_list.append(rear_dist)
             v_action_list.append(self.actions[:, 2 * i])
 
-        heading_to_payload = torch.stack(heading_to_payload_list, dim=1)
+        heading_to_payload_center = torch.stack(
+            heading_to_payload_center_list,
+            dim=1,
+        )
+        heading_parallel_to_payload = torch.stack(
+            heading_parallel_to_payload_list,
+            dim=1,
+        )
         front_dists = torch.stack(front_dist_list, dim=1)
         rear_dists = torch.stack(rear_dist_list, dim=1)
         v_actions = torch.stack(v_action_list, dim=1)
 
-        return heading_to_payload, front_dists, rear_dists, v_actions
+        return (
+            heading_to_payload_center,
+            heading_parallel_to_payload,
+            front_dists,
+            rear_dists,
+            v_actions,
+        )
 
     def _compute_bad_rear_push(self, payload_xy: torch.Tensor | None = None):
         """判断是否出现明显车尾倒推 payload。
@@ -1795,7 +1845,8 @@ class AgvTransportEnv(DirectRLEnv):
         contact_flags = self._compute_contact_flags().float()
 
         (
-            heading_to_payload,
+            heading_to_payload_center,
+            _,
             front_dists,
             rear_dists,
             v_actions,
@@ -1806,7 +1857,7 @@ class AgvTransportEnv(DirectRLEnv):
         ).float()
 
         heading_away_from_payload = (
-            heading_to_payload < self.cfg.bad_rear_heading_threshold
+            heading_to_payload_center < self.cfg.bad_rear_heading_threshold
         ).float()
 
         reversing = (
