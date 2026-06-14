@@ -14,18 +14,20 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.0.3-parallel-contact-flags。
+    当前版本：V5.1-A-soft-corridor。
 
-    当前阶段目标：在空旷场地验证对称双向转弯招募逻辑。
+    当前阶段目标：V5.1-A 软走廊课程。
     最终课题目标：三台差速 AGV 协同推动异形件沿带物理边界的不规则路径到达终点。
 
+    本版继承 V5.0.3 的对称双向转弯招募与 parallel contact flag 逻辑。
+    V5.1-A 只收紧路径软走廊约束，不修改 payload 几何、质量、摩擦或 AGV 物理配置。
+
     本版核心变化：
-    - 有效推动奖励和 contact flag 均使用 AGV 与 payload 车身朝向平行度，
-      消除侧车向 payload 质心偏头形成的 V 型挤压梯度。
-    - 保留 two-pusher credit，不强制三车全程同时接触。
-    - 右转/下拐段招募 AGV2，左转/上拐段招募 AGV3。
-    - 恢复适度队形约束，防止侧车在平行推送后横向漂移。
-    - 闲置动作惩罚采用中等偏松设置，允许恢复追赶，但避免侧车过早抢占主推角色。
+    - 保持规则矩形 payload，隔离动力学变量。
+    - 保持 AGV2 / AGV3 双侧转弯招募机制。
+    - 保持 effective push 与 contact flag 的平行朝向判定。
+    - 温和收紧 path corridor，用于测试已有策略对更高循迹精度的适应能力。
+    - 作为 A/B 测试配置：可从 V5.0.3 checkpoint fine-tune，也可从零训练。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -166,21 +168,22 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
     path_lateral_error_scale = 0.75
 
-    # D0A0g-easy：温和路径遵从。
-    # 1) 离路径较远时，正向 progress reward 只被 soft gate 部分衰减；
-    # 2) 超出较宽软走廊后按平方轻惩罚；
-    # 3) success 需要路径进度合格，但末端横向误差先保持较宽，避免训练骤崩。
+    # V5.1-A：软走廊课程第一阶段。
+    # 只温和收紧路径约束，避免同时改变 payload 动力学与边界碰撞。
+    # 目标是检验 V5.0.3 已形成的 AGV2/AGV3 对称转弯招募策略，
+    # 是否能在更高循迹精度要求下保持稳定。
     progress_corridor_width = 0.60
-    path_corridor_half_width = 0.15
-    path_corridor_penalty_scale = 5.0
+    path_corridor_half_width = 0.14
+    path_corridor_penalty_scale = 7.5
 
-    # success 需要 payload 不仅进入目标半径，还要沿路径推进到足够靠近末端。
-    # easy 阶段先使用 0.96 和较宽 path lateral 条件，保护已有成功策略。
+    # success 仍要求 payload 到达终点且路径推进充分。
+    # V5.1-A 将末端横向误差阈值从 0.40 收紧到 0.35，
+    # 但不直接跳到 0.10 m 级别，防止课程难度突变。
     success_progress_ratio = 0.92
-    success_path_lateral_error = 0.40
+    success_path_lateral_error = 0.35
 
-    # D0A0g-easy：暂时关闭强 waypoint gate。
-    # 等 soft-path 阶段把 path_lat_max 压到 0.25~0.30 后，再逐步打开。
+    # V5.1-A：继续启用 waypoint gate，保持 V5.0.3 已验证的按 waypoint 顺序推进机制。
+    # 本阶段只调整 soft corridor 强度，不改变 waypoint gate 逻辑。
     enable_waypoint_gate = True
 
 
