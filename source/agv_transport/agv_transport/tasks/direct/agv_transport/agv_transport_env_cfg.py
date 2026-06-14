@@ -14,20 +14,22 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.1-A-soft-corridor。
+    当前版本：V5.2-A-physical-boundaries-final。
 
-    当前阶段目标：V5.1-A 软走廊课程。
+    当前阶段目标：V5.2-A 宽通道低矮物理边界课程。
     最终课题目标：三台差速 AGV 协同推动异形件沿带物理边界的不规则路径到达终点。
 
-    本版继承 V5.0.3 的对称双向转弯招募与 parallel contact flag 逻辑。
-    V5.1-A 只收紧路径软走廊约束，不修改 payload 几何、质量、摩擦或 AGV 物理配置。
+    本版继承 V5.1C 的 0.10 m 软走廊、对称双向转弯招募与 parallel contact flag 逻辑。
+    V5.2-A 首次加入真实物理边界，但采用宽通道低矮墙，只测试碰撞边界对既有策略的影响。
+    本阶段不修改 payload 几何、质量、摩擦或质心。
 
     本版核心变化：
-    - 保持规则矩形 payload，隔离动力学变量。
+    - 保持规则矩形 payload，继续隔离异形件动力学变量。
     - 保持 AGV2 / AGV3 双侧转弯招募机制。
     - 保持 effective push 与 contact flag 的平行朝向判定。
-    - 温和收紧 path corridor，用于测试已有策略对更高循迹精度的适应能力。
-    - 作为 A/B 测试配置：可从 V5.0.3 checkpoint fine-tune，也可从零训练。
+    - 保留 V5.1C 的软走廊压力。
+    - 沿路径两侧生成宽通道低矮物理墙，作为真实物理边界课程的第一阶段。
+    - 推荐从 V5.1C checkpoint fine-tune，不建议从零训练。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -168,23 +170,36 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
     path_lateral_error_scale = 0.75
 
-    # V5.1-A：软走廊课程第一阶段。
-    # 只温和收紧路径约束，避免同时改变 payload 动力学与边界碰撞。
-    # 目标是检验 V5.0.3 已形成的 AGV2/AGV3 对称转弯招募策略，
-    # 是否能在更高循迹精度要求下保持稳定。
+    # V5.2-A：保留 V5.1C 的软走廊压力。
+    # 注意：path_corridor_half_width 是 reward 中的软惩罚阈值，不等于物理墙位置。
+    # 当前评估中 payload 最大横向误差约 0.18~0.19 m，因此继续保留 0.10 m 软走廊，
+    # 用于提供路径贴合压力；真实墙体则采用宽通道，避免直接阻塞 AGV2/AGV3 的侧向工作空间。
     progress_corridor_width = 0.60
-    path_corridor_half_width = 0.14
-    path_corridor_penalty_scale = 7.5
+    path_corridor_half_width = 0.10
+    path_corridor_penalty_scale = 12.0
 
     # success 仍要求 payload 到达终点且路径推进充分。
-    # V5.1-A 将末端横向误差阈值从 0.40 收紧到 0.35，
-    # 但不直接跳到 0.10 m 级别，防止课程难度突变。
     success_progress_ratio = 0.92
-    success_path_lateral_error = 0.35
+    success_path_lateral_error = 0.25
 
-    # V5.1-A：继续启用 waypoint gate，保持 V5.0.3 已验证的按 waypoint 顺序推进机制。
-    # 本阶段只调整 soft corridor 强度，不改变 waypoint gate 逻辑。
+    # 继续启用 waypoint gate，保持按 waypoint 顺序推进。
     enable_waypoint_gate = True
+
+    # V5.2-A：宽通道低矮物理边界。
+    # 该边界不是最终窄通道，只用于引入真实刚体碰撞反馈。
+    # inner_half_width 表示路径中心线到墙体内侧面的距离。
+    # 取 1.35 m 是为了覆盖 payload 半宽、侧车工作空间和安全余量，
+    # 避免一开始就把 V5.1C 已学到的 AGV2/AGV3 双侧推送策略堵死。
+    enable_physical_path_boundaries = True
+    path_boundary_inner_half_width = 1.35
+    path_boundary_wall_thickness = 0.08
+    path_boundary_wall_height = 0.10
+    # 起点向后延伸，确保 AGV 初始区域也处于通道包络内。
+    path_boundary_start_extension = 1.50
+    path_boundary_segment_overlap = 0.10
+    path_boundary_static_friction = 1.0
+    path_boundary_dynamic_friction = 1.0
+    path_boundary_color = (0.25, 0.25, 0.25)
 
 
     # D0A0g：waypoint gate。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 
 import torch
 
@@ -15,10 +16,10 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.0.3-parallel-contact-flags。
+    当前版本：V5.2-A-physical-boundaries-final。
 
-    目标：在空旷场地验证对称双向转弯招募逻辑，为后续带物理边界
-    的不规则路径搬运和异形件搬运打基础。
+    目标：在 V5.1C 软走廊成功基础上，加入宽通道低矮物理边界，
+    验证既有双侧转弯招募策略在真实碰撞约束下是否仍能稳定工作。
 
     核心设计：
     - 集中式单智能体控制三台差速 AGV，动作为 [v1, w1, v2, w2, v3, w3]。
@@ -28,6 +29,8 @@ class AgvTransportEnv(DirectRLEnv):
     - 有效推动奖励与 contact flag 均使用 AGV 与 payload 车身朝向平行度，
       避免侧车为了最大化朝向/接触奖励而转向 payload 质心形成 V 型挤压。
     - 保留 AGV 指向 payload 质心的几何量，仅用于车尾倒推等异常诊断。
+    - 在路径两侧生成低矮物理边界。V5.2-A 使用宽通道，只引入真实碰撞反馈，
+      不改变 payload 形状、质量、摩擦或质心。
     """
 
     cfg: AgvTransportEnvCfg
@@ -186,6 +189,95 @@ class AgvTransportEnv(DirectRLEnv):
                     if imageable:
                         imageable.MakeInvisible()
 
+    def _spawn_path_boundary_walls(self) -> None:
+        """在 env_0 中沿规划路径生成宽通道低矮物理边界。
+
+        V5.2-A 的边界设计原则：
+        - 边界是课程学习中的第一档物理约束，不是窄通道。
+        - 内侧半宽必须大于 payload 半宽和侧车工作空间，避免一开始就阻塞
+          V5.1C 已学到的 AGV2/AGV3 双侧推送策略。
+        - 只生成路径两侧墙段，不封闭起点和终点。
+        - 起点向后延伸，保证 AGV 初始区域被通道包络。
+        - 墙体先生成在 env_0，随后由 scene.clone_environments() 克隆到其它环境。
+        """
+        if not getattr(self.cfg, "enable_physical_path_boundaries", False):
+            return
+
+        payload_start_xy = tuple(float(v) for v in self.cfg.payload_init_pos[:2])
+        start_extension = float(getattr(self.cfg, "path_boundary_start_extension", 0.0))
+        extended_start_xy = (
+            payload_start_xy[0] - start_extension,
+            payload_start_xy[1],
+        )
+
+        path_points = [
+            extended_start_xy,
+            payload_start_xy,
+            *[tuple(float(v) for v in waypoint) for waypoint in self.cfg.waypoints],
+        ]
+
+        inner_half_width = float(self.cfg.path_boundary_inner_half_width)
+        wall_thickness = float(self.cfg.path_boundary_wall_thickness)
+        wall_height = float(self.cfg.path_boundary_wall_height)
+        segment_overlap = float(self.cfg.path_boundary_segment_overlap)
+        wall_center_offset = inner_half_width + 0.5 * wall_thickness
+
+        wall_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=float(getattr(self.cfg, "path_boundary_static_friction", 1.0)),
+            dynamic_friction=float(getattr(self.cfg, "path_boundary_dynamic_friction", 1.0)),
+            restitution=0.0,
+        )
+
+        visual_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=tuple(getattr(self.cfg, "path_boundary_color", (0.25, 0.25, 0.25))),
+            metallic=0.0,
+        )
+
+        wall_idx = 0
+        for seg_idx, (p0, p1) in enumerate(zip(path_points[:-1], path_points[1:])):
+            x0, y0 = p0
+            x1, y1 = p1
+            dx = x1 - x0
+            dy = y1 - y0
+            seg_len = math.hypot(dx, dy)
+            if seg_len < 1e-6:
+                continue
+
+            dir_x = dx / seg_len
+            dir_y = dy / seg_len
+            normal_x = -dir_y
+            normal_y = dir_x
+            yaw = math.atan2(dy, dx)
+            quat_w = math.cos(0.5 * yaw)
+            quat_z = math.sin(0.5 * yaw)
+            center_x = 0.5 * (x0 + x1)
+            center_y = 0.5 * (y0 + y1)
+            wall_length = seg_len + 2.0 * segment_overlap
+
+            for side_name, side_sign in (("left", 1.0), ("right", -1.0)):
+                wall_cfg = sim_utils.CuboidCfg(
+                    size=(wall_length, wall_thickness, wall_height),
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
+                    collision_props=sim_utils.CollisionPropertiesCfg(),
+                    physics_material=wall_material,
+                    visual_material=visual_material,
+                )
+
+                wall_x = center_x + side_sign * normal_x * wall_center_offset
+                wall_y = center_y + side_sign * normal_y * wall_center_offset
+
+                wall_cfg.func(
+                    f"/World/envs/env_0/PathBoundary_{seg_idx}_{side_name}_{wall_idx}",
+                    wall_cfg,
+                    translation=(wall_x, wall_y, 0.5 * wall_height),
+                    orientation=(quat_w, 0.0, 0.0, quat_z),
+                )
+                wall_idx += 1
+
     def _setup_scene(self):
         # 创建刚体
         self.agv1 = RigidObject(self.cfg.agv1_cfg)
@@ -233,6 +325,9 @@ class AgvTransportEnv(DirectRLEnv):
                 waypoint_marker_cfg,
                 translation=(waypoint[0], waypoint[1], 0.02),
             )
+
+        # V5.2-A：生成路径两侧宽通道低矮物理边界。
+        self._spawn_path_boundary_walls()
 
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
