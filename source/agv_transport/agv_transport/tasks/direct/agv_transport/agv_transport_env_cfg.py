@@ -14,7 +14,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.2-B0-clean-narrow-corridor-clearance。
+    当前版本：V5.2-B0-train-safe-narrow-corridor-clearance。
 
     阶段目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证既有 V5.1C / V5.2-A5 策略是否能安全迁移。
@@ -201,6 +201,11 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     path_boundary_segment_overlap = 0.0
     path_boundary_use_joint_caps = True
     path_boundary_joint_cap_radius = 0.04
+    # Large-scale training safety:
+    # Keep this False for --num_envs 2048.  If True, every wall segment/cap may
+    # spawn its own material and cloned environments can exceed the PhysX 64K
+    # material limit.  Enable only for low-num_envs visual inspection if needed.
+    path_boundary_enable_materials = False
     path_boundary_static_friction = 1.0
     path_boundary_dynamic_friction = 1.0
     path_boundary_color = (0.25, 0.25, 0.25)
@@ -209,8 +214,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 因此从收窄通道阶段开始加入轻量 wall-clearance penalty，
     # 只惩罚贴墙/穿墙风险，不改变 payload 主路径 reward。
     enable_wall_clearance_penalty = True
-    agv_wall_clearance_margin = 0.05
-    agv_wall_clearance_penalty_scale = 3.0
+    agv_wall_clearance_margin = 0.08
+    agv_wall_clearance_penalty_scale = 4.0
     payload_wall_clearance_margin = 0.20
     payload_wall_clearance_penalty_scale = 2.0
 

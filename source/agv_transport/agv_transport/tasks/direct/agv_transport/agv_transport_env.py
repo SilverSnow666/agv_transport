@@ -16,7 +16,7 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.2-B0-clean-narrow-corridor-clearance。
+    当前版本：V5.2-B0-train-safe-narrow-corridor-clearance。
 
     目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证 AGV2/AGV3 侧推策略在更强边界约束下是否仍稳定。
@@ -32,6 +32,7 @@ class AgvTransportEnv(DirectRLEnv):
     - 在路径两侧生成低矮物理边界。V5.2-B0 仍不改变 payload 形状、质量、摩擦或质心。
     - 使用手动左右边界控制点、稠密短墙段和 joint cap 生成连续 U 型通道。
     - 从收窄通道阶段开始加入 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
+    - 默认不为每个墙段/cap 生成独立 PhysX/visual material，避免 2048 并行环境下触发 64K material limit。
     """
 
     cfg: AgvTransportEnvCfg
@@ -217,16 +218,26 @@ class AgvTransportEnv(DirectRLEnv):
         joint_cap_radius = float(getattr(self.cfg, "path_boundary_joint_cap_radius", 0.5 * wall_thickness))
         joint_cap_radius = max(joint_cap_radius, 0.25 * wall_thickness)
 
-        wall_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=float(getattr(self.cfg, "path_boundary_static_friction", 1.0)),
-            dynamic_friction=float(getattr(self.cfg, "path_boundary_dynamic_friction", 1.0)),
-            restitution=0.0,
-        )
-
-        visual_material = sim_utils.PreviewSurfaceCfg(
-            diffuse_color=tuple(getattr(self.cfg, "path_boundary_color", (0.25, 0.25, 0.25))),
-            metallic=0.0,
-        )
+        # IMPORTANT for large-scale training:
+        # Do not create per-wall physics/visual materials by default.  With
+        # num_envs=2048, each spawned segment/cap is cloned many times; if each
+        # prim owns its own material, PhysX can hit the 64K material limit during
+        # scene replication.  The walls use the default material unless
+        # path_boundary_enable_materials=True is explicitly enabled for visual
+        # inspection with small num_envs.
+        enable_boundary_materials = bool(getattr(self.cfg, "path_boundary_enable_materials", False))
+        wall_material = None
+        visual_material = None
+        if enable_boundary_materials:
+            wall_material = sim_utils.RigidBodyMaterialCfg(
+                static_friction=float(getattr(self.cfg, "path_boundary_static_friction", 1.0)),
+                dynamic_friction=float(getattr(self.cfg, "path_boundary_dynamic_friction", 1.0)),
+                restitution=0.0,
+            )
+            visual_material = sim_utils.PreviewSurfaceCfg(
+                diffuse_color=tuple(getattr(self.cfg, "path_boundary_color", (0.25, 0.25, 0.25))),
+                metallic=0.0,
+            )
 
         def _as_point_list(values) -> list[tuple[float, float]]:
             points: list[tuple[float, float]] = []
@@ -366,43 +377,43 @@ class AgvTransportEnv(DirectRLEnv):
                 ),
             }
 
-        segment_cfg = sim_utils.CuboidCfg(
-            size=(sample_step, wall_thickness, wall_height),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+        segment_kwargs = {
+            "size": (sample_step, wall_thickness, wall_height),
+            "rigid_props": sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=True,
                 disable_gravity=True,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=wall_material,
-            visual_material=visual_material,
-        )
+            "mass_props": sim_utils.MassPropertiesCfg(mass=1000.0),
+            "collision_props": sim_utils.CollisionPropertiesCfg(),
+        }
+        if enable_boundary_materials:
+            segment_kwargs["physics_material"] = wall_material
+            segment_kwargs["visual_material"] = visual_material
+        segment_cfg = sim_utils.CuboidCfg(**segment_kwargs)
+
+        cap_common_kwargs = {
+            "rigid_props": sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            "mass_props": sim_utils.MassPropertiesCfg(mass=1000.0),
+            "collision_props": sim_utils.CollisionPropertiesCfg(),
+        }
+        if enable_boundary_materials:
+            cap_common_kwargs["physics_material"] = wall_material
+            cap_common_kwargs["visual_material"] = visual_material
 
         if hasattr(sim_utils, "CylinderCfg"):
             cap_cfg = sim_utils.CylinderCfg(
                 radius=joint_cap_radius,
                 height=wall_height,
                 axis="Z",
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                physics_material=wall_material,
-                visual_material=visual_material,
+                **cap_common_kwargs,
             )
         else:
             cap_cfg = sim_utils.CuboidCfg(
                 size=(2.0 * joint_cap_radius, 2.0 * joint_cap_radius, wall_height),
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                physics_material=wall_material,
-                visual_material=visual_material,
+                **cap_common_kwargs,
             )
 
         def _spawn_wall_segment(
