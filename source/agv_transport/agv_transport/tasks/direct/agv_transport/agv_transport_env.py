@@ -16,10 +16,10 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.2-A4-manual-u-corridor-boundaries。
+    当前版本：V5.2-B0-clean-narrow-corridor-clearance。
 
-    目标：在 V5.1C 软走廊成功基础上，加入宽通道低矮物理边界，
-    验证既有双侧转弯招募策略在连续低矮物理通道下是否仍能稳定工作。
+    目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
+    并加入轻量 wall-clearance penalty，验证 AGV2/AGV3 侧推策略在更强边界约束下是否仍稳定。
 
     核心设计：
     - 集中式单智能体控制三台差速 AGV，动作为 [v1, w1, v2, w2, v3, w3]。
@@ -29,10 +29,9 @@ class AgvTransportEnv(DirectRLEnv):
     - 有效推动奖励与 contact flag 均使用 AGV 与 payload 车身朝向平行度，
       避免侧车为了最大化朝向/接触奖励而转向 payload 质心形成 V 型挤压。
     - 保留 AGV 指向 payload 质心的几何量，仅用于车尾倒推等异常诊断。
-    - 在路径两侧生成低矮物理边界。V5.2-A 使用宽通道，只引入真实碰撞反馈，
-      不改变 payload 形状、质量、摩擦或质心。
-    - V5.2-A4 支持手动定义左右边界控制点，避免自动 offset 在内弯处自交。
-    - 手动边界再经过平滑、稠密采样、短墙段和 joint cap 生成连续 U 型通道。
+    - 在路径两侧生成低矮物理边界。V5.2-B0 仍不改变 payload 形状、质量、摩擦或质心。
+    - 使用手动左右边界控制点、稠密短墙段和 joint cap 生成连续 U 型通道。
+    - 从收窄通道阶段开始加入 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
     """
 
     cfg: AgvTransportEnvCfg
@@ -464,6 +463,112 @@ class AgvTransportEnv(DirectRLEnv):
                         f"/World/envs/env_0/PathBoundary/{side_name}/cap_{cap_idx}",
                         point,
                     )
+
+    def _get_manual_boundary_world_points(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return manual physical boundary centerlines in world frame.
+
+        The points are wall centerlines defined in local env coordinates.
+        They are used only for soft wall-clearance diagnostics/reward.  The
+        actual collision geometry is spawned separately in env_0 and cloned.
+        """
+        if not bool(getattr(self.cfg, "enable_physical_path_boundaries", False)):
+            return None, None
+        if not bool(getattr(self.cfg, "path_boundary_use_manual_edges", True)):
+            return None, None
+
+        left_points = getattr(self.cfg, "path_boundary_left_points", None)
+        right_points = getattr(self.cfg, "path_boundary_right_points", None)
+        if left_points is None or right_points is None:
+            return None, None
+        if len(left_points) < 2 or len(right_points) < 2:
+            return None, None
+
+        left_local = torch.tensor(left_points, dtype=torch.float32, device=self.device)
+        right_local = torch.tensor(right_points, dtype=torch.float32, device=self.device)
+        origins = self.scene.env_origins[:, None, :2]
+        return origins + left_local[None, :, :], origins + right_local[None, :, :]
+
+    @staticmethod
+    def _point_to_polyline_distance(points: torch.Tensor, polyline: torch.Tensor) -> torch.Tensor:
+        """Compute minimum 2D distance from each point to a batched polyline.
+
+        Args:
+            points: Tensor with shape [num_envs, 2].
+            polyline: Tensor with shape [num_envs, num_points, 2].
+
+        Returns:
+            Tensor with shape [num_envs].
+        """
+        if polyline is None or polyline.shape[1] < 2:
+            return torch.full((points.shape[0],), float("nan"), device=points.device)
+
+        p0 = polyline[:, :-1, :]
+        p1 = polyline[:, 1:, :]
+        segment = p1 - p0
+        segment_len_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
+        rel = points[:, None, :] - p0
+        t = torch.sum(rel * segment, dim=2) / segment_len_sq
+        t = torch.clamp(t, 0.0, 1.0)
+        projection = p0 + t[:, :, None] * segment
+        return torch.linalg.norm(points[:, None, :] - projection, dim=2).min(dim=1).values
+
+    def _compute_wall_clearance_penalties(
+        self,
+        payload_xy: torch.Tensor,
+        agv_payload_dists: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute lightweight wall-clearance penalties for payload and AGVs.
+
+        V5.2-B0 narrows the physical corridor.  Since the AGVs are
+        kinematic bodies whose poses are written directly, physical walls are
+        not a complete safety constraint for AGV-wall interaction.  This term
+        adds a small dense penalty when AGVs or payload approach the manual
+        wall centerlines closer than a configurable clearance margin.
+        """
+        del agv_payload_dists  # reserved for future role-conditioned variants
+
+        zeros = torch.zeros(self.num_envs, device=self.device)
+        if not bool(getattr(self.cfg, "enable_wall_clearance_penalty", False)):
+            return zeros, zeros
+
+        left_world, right_world = self._get_manual_boundary_world_points()
+        if left_world is None or right_world is None:
+            return zeros, zeros
+
+        wall_half_thickness = 0.5 * float(getattr(self.cfg, "path_boundary_wall_thickness", 0.08))
+        payload_half_width = 0.5 * float(getattr(self.cfg, "payload_size", (0.90, 1.20, 0.30))[1])
+        agv_half_width = 0.5 * float(getattr(self.cfg, "agv_size", (0.70, 0.45, 0.06))[1])
+
+        payload_dist_to_wall = torch.minimum(
+            self._point_to_polyline_distance(payload_xy, left_world),
+            self._point_to_polyline_distance(payload_xy, right_world),
+        )
+        payload_clearance = payload_dist_to_wall - wall_half_thickness - payload_half_width
+        payload_margin = float(getattr(self.cfg, "payload_wall_clearance_margin", 0.20))
+        payload_violation = torch.clamp(payload_margin - payload_clearance, min=0.0)
+        payload_penalty = payload_violation * payload_violation
+
+        agv_xy = torch.stack(
+            (
+                self.agv1.data.root_pos_w[:, :2],
+                self.agv2.data.root_pos_w[:, :2],
+                self.agv3.data.root_pos_w[:, :2],
+            ),
+            dim=1,
+        )
+        agv_penalties = []
+        agv_margin = float(getattr(self.cfg, "agv_wall_clearance_margin", 0.05))
+        for agv_idx in range(3):
+            agv_dist_to_wall = torch.minimum(
+                self._point_to_polyline_distance(agv_xy[:, agv_idx, :], left_world),
+                self._point_to_polyline_distance(agv_xy[:, agv_idx, :], right_world),
+            )
+            agv_clearance = agv_dist_to_wall - wall_half_thickness - agv_half_width
+            agv_violation = torch.clamp(agv_margin - agv_clearance, min=0.0)
+            agv_penalties.append(agv_violation * agv_violation)
+
+        agv_penalty = torch.stack(agv_penalties, dim=1).sum(dim=1)
+        return payload_penalty, agv_penalty
 
     def _setup_scene(self):
         # 创建刚体
@@ -1056,6 +1161,10 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         )
 
+        payload_wall_clearance_penalty, agv_wall_clearance_penalty = (
+            self._compute_wall_clearance_penalties(payload_xy)
+        )
+
         # D0A0c：第三台低贡献 AGV 不必强行参与，但已有两台有效推动时，
         # 低贡献 AGV 应保持低动作、低动作变化率，并处于可重新加入的待命距离。
         low_utility_weight = torch.clamp(
@@ -1301,6 +1410,10 @@ class AgvTransportEnv(DirectRLEnv):
                 - 30.0 * out_of_bounds.float()
 
                 - getattr(self.cfg, "agv_escape_penalty_scale", 50.0) * agv_escaped.float()
+
+                # V5.2-B0：物理通道收窄后，轻量约束 AGV/payload 与墙体的安全间隙。
+                - getattr(self.cfg, "payload_wall_clearance_penalty_scale", 0.0) * payload_wall_clearance_penalty
+                - getattr(self.cfg, "agv_wall_clearance_penalty_scale", 0.0) * agv_wall_clearance_penalty
 
         )
 

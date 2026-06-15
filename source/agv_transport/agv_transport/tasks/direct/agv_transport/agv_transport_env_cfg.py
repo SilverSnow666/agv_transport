@@ -14,23 +14,18 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.2-A3-joint-capped-physical-boundaries。
+    当前版本：V5.2-B0-clean-narrow-corridor-clearance。
 
-    当前阶段目标：V5.2-A 宽通道低矮物理边界课程。
-    最终课题目标：三台差速 AGV 协同推动异形件沿带物理边界的不规则路径到达终点。
+    阶段目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
+    并加入轻量 wall-clearance penalty，验证既有 V5.1C / V5.2-A5 策略是否能安全迁移。
 
-    本版继承 V5.1C 的 0.10 m 软走廊、对称双向转弯招募与 parallel contact flag 逻辑。
-    V5.2-A 首次加入真实物理边界，但采用宽通道低矮墙，只测试碰撞边界对既有策略的影响。
-    本阶段不修改 payload 几何、质量、摩擦或质心。
-
-    本版核心变化：
-    - 保持规则矩形 payload，继续隔离异形件动力学变量。
-    - 保持 AGV2 / AGV3 双侧转弯招募机制。
-    - 保持 effective push 与 contact flag 的平行朝向判定。
-    - 保留 V5.1C 的软走廊压力。
-    - 沿路径两侧生成宽通道低矮物理墙，作为真实物理边界课程的第一阶段。
-    - V5.2-A3 使用稠密短墙段和 joint cap，修复拐角拼接、尖角和局部缝隙问题。
-    - 推荐从 V5.1C checkpoint fine-tune，不建议从零训练。
+    设计原则：
+    - 保持规则矩形 payload，不引入异形件、不引入质心偏移。
+    - 保持 V5.1C 软走廊 reward，不放松路径约束，不鼓励撞墙探索。
+    - 基于手动 U 型左右边界控制点生成低矮物理墙。
+    - 相比 V5.2-A5，左右墙各向内收窄约 0.03 m。
+    - 从收窄通道阶段开始加入轻量 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
+    - 推荐先用 V5.1.0c.pt zero-shot 评估；若失败，再 fine-tune。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -171,7 +166,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
     path_lateral_error_scale = 0.75
 
-    # V5.2-A：保留 V5.1C 的软走廊压力。
+    # V5.2-B0：保留 V5.1C 的软走廊压力。
     # 注意：path_corridor_half_width 是 reward 中的软惩罚阈值，不等于物理墙位置。
     # 当前评估中 payload 最大横向误差约 0.18~0.19 m，因此继续保留 0.10 m 软走廊，
     # 用于提供路径贴合压力；真实墙体则采用宽通道，避免直接阻塞 AGV2/AGV3 的侧向工作空间。
@@ -186,18 +181,17 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 继续启用 waypoint gate，保持按 waypoint 顺序推进。
     enable_waypoint_gate = True
 
-    # V5.2-A：宽通道低矮物理边界。
+    # V5.2-B0：在 V5.2-A5 zero-shot 通过基础上，小幅收窄物理通道。
     # 该边界不是最终窄通道，只用于引入真实刚体碰撞反馈。
     # inner_half_width 表示路径中心线到墙体内侧面的距离。
-    # 取 1.35 m 是为了覆盖 payload 半宽、侧车工作空间和安全余量，
-    # 避免一开始就把 V5.1C 已学到的 AGV2/AGV3 双侧推送策略堵死。
+    # 手动边界已从 V5.2-A5 向内收窄约 0.03 m，用于验证更强物理边界约束。
     enable_physical_path_boundaries = True
     path_boundary_inner_half_width = 1.35
     path_boundary_wall_thickness = 0.08
     path_boundary_wall_height = 0.10
     # 起点向后延伸，确保 AGV 初始区域也处于通道包络内。
     path_boundary_start_extension = 1.50
-    # V5.2-A4：显式左右边界控制点 + 稠密短墙段 + joint cap。
+    # V5.2-B0：显式左右边界控制点 + 稠密短墙段 + joint cap。
     # 不再默认使用中心线自动 offset，避免大 offset 在内弯处产生自交。
     path_boundary_use_manual_edges = True
     path_boundary_smoothing_iterations = 3
@@ -211,32 +205,40 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     path_boundary_dynamic_friction = 1.0
     path_boundary_color = (0.25, 0.25, 0.25)
 
+    # V5.2-B0：AGV 是 kinematic 写位姿，物理墙不能完全依靠 PhysX 推回。
+    # 因此从收窄通道阶段开始加入轻量 wall-clearance penalty，
+    # 只惩罚贴墙/穿墙风险，不改变 payload 主路径 reward。
+    enable_wall_clearance_penalty = True
+    agv_wall_clearance_margin = 0.05
+    agv_wall_clearance_penalty_scale = 3.0
+    payload_wall_clearance_margin = 0.20
+    payload_wall_clearance_penalty_scale = 2.0
+
     # 手动 U 型物理通道边界控制点，局部坐标。
     # 这些点表示墙体中心线，不是 payload 轨迹，也不是墙体内侧边。
     # 设计目标：左右墙各自独立成连续 U 型，避免由中心线 offset 导致内侧墙自交。
-    # 若视觉检查发现边界过宽/过窄，只微调这些控制点，不改 reward。
+    # 若视觉检查发现边界过宽/过窄，只微调这些控制点，不改 payload 或主路径 reward。
     path_boundary_left_points = (
-        (-1.50, 1.45),
-        (0.40, 1.45),
-        (1.60, 1.45),
-        (2.40, 1.05),
-        (3.00, 0.65),
-        (3.60, 0.65),
-        (4.20, 1.05),
-        (4.80, 1.45),
-        (7.10, 1.45),
+        (-1.50, 1.42),
+        (0.40, 1.42),
+        (1.60, 1.42),
+        (2.40, 1.02),
+        (3.00, 0.62),
+        (3.60, 0.62),
+        (4.20, 1.02),
+        (4.80, 1.42),
+        (7.10, 1.42),
     )
-
     path_boundary_right_points = (
-        (-1.50, -1.45),
-        (0.40, -1.45),
-        (1.60, -1.45),
-        (2.40, -1.85),
-        (3.00, -2.25),
-        (3.60, -2.25),
-        (4.20, -1.85),
-        (4.80, -1.45),
-        (7.10, -1.45),
+        (-1.50, -1.42),
+        (0.40, -1.42),
+        (1.60, -1.42),
+        (2.40, -1.82),
+        (3.00, -2.22),
+        (3.60, -2.22),
+        (4.20, -1.82),
+        (4.80, -1.42),
+        (7.10, -1.42),
     )
 
 
