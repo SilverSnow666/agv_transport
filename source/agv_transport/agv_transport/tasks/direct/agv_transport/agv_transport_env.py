@@ -16,10 +16,10 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.2-A-physical-boundaries-final。
+    当前版本：V5.2-A4-manual-u-corridor-boundaries。
 
     目标：在 V5.1C 软走廊成功基础上，加入宽通道低矮物理边界，
-    验证既有双侧转弯招募策略在真实碰撞约束下是否仍能稳定工作。
+    验证既有双侧转弯招募策略在连续低矮物理通道下是否仍能稳定工作。
 
     核心设计：
     - 集中式单智能体控制三台差速 AGV，动作为 [v1, w1, v2, w2, v3, w3]。
@@ -31,6 +31,8 @@ class AgvTransportEnv(DirectRLEnv):
     - 保留 AGV 指向 payload 质心的几何量，仅用于车尾倒推等异常诊断。
     - 在路径两侧生成低矮物理边界。V5.2-A 使用宽通道，只引入真实碰撞反馈，
       不改变 payload 形状、质量、摩擦或质心。
+    - V5.2-A4 支持手动定义左右边界控制点，避免自动 offset 在内弯处自交。
+    - 手动边界再经过平滑、稠密采样、短墙段和 joint cap 生成连续 U 型通道。
     """
 
     cfg: AgvTransportEnvCfg
@@ -190,37 +192,31 @@ class AgvTransportEnv(DirectRLEnv):
                         imageable.MakeInvisible()
 
     def _spawn_path_boundary_walls(self) -> None:
-        """在 env_0 中沿规划路径生成宽通道低矮物理边界。
+        """在 env_0 中生成连续、低矮、宽通道物理边界墙。
 
-        V5.2-A 的边界设计原则：
-        - 边界是课程学习中的第一档物理约束，不是窄通道。
-        - 内侧半宽必须大于 payload 半宽和侧车工作空间，避免一开始就阻塞
-          V5.1C 已学到的 AGV2/AGV3 双侧推送策略。
-        - 只生成路径两侧墙段，不封闭起点和终点。
-        - 起点向后延伸，保证 AGV 初始区域被通道包络。
-        - 墙体先生成在 env_0，随后由 scene.clone_environments() 克隆到其它环境。
+        V5.2-A4：优先使用手动左右边界控制点生成 U 型通道。
+
+        之前的中心线 offset 方法在大 offset 距离和内弯组合下会产生
+        offset 曲线自交，表现为某一侧墙体出现 X 型交叉或局部折返。
+        joint cap 只能遮盖连接点，不能消除这种拓扑自交。
+
+        本版默认采用显式 left/right boundary control points：
+        - 左右墙分别独立定义，不再由中心线自动外扩；
+        - 分别做 Chaikin 平滑和稠密采样；
+        - 用短墙段 + joint cap 生成连续低矮物理边界；
+        - 保留中心线 offset fallback，便于后续快速测试其它路径。
         """
         if not getattr(self.cfg, "enable_physical_path_boundaries", False):
             return
 
-        payload_start_xy = tuple(float(v) for v in self.cfg.payload_init_pos[:2])
-        start_extension = float(getattr(self.cfg, "path_boundary_start_extension", 0.0))
-        extended_start_xy = (
-            payload_start_xy[0] - start_extension,
-            payload_start_xy[1],
-        )
-
-        path_points = [
-            extended_start_xy,
-            payload_start_xy,
-            *[tuple(float(v) for v in waypoint) for waypoint in self.cfg.waypoints],
-        ]
-
-        inner_half_width = float(self.cfg.path_boundary_inner_half_width)
         wall_thickness = float(self.cfg.path_boundary_wall_thickness)
         wall_height = float(self.cfg.path_boundary_wall_height)
-        segment_overlap = float(self.cfg.path_boundary_segment_overlap)
-        wall_center_offset = inner_half_width + 0.5 * wall_thickness
+        smoothing_iterations = int(getattr(self.cfg, "path_boundary_smoothing_iterations", 3))
+        sample_step = max(float(getattr(self.cfg, "path_boundary_sample_step", 0.20)), 0.05)
+        segment_overlap = max(float(getattr(self.cfg, "path_boundary_segment_overlap", 0.0)), 0.0)
+        use_joint_caps = bool(getattr(self.cfg, "path_boundary_use_joint_caps", True))
+        joint_cap_radius = float(getattr(self.cfg, "path_boundary_joint_cap_radius", 0.5 * wall_thickness))
+        joint_cap_radius = max(joint_cap_radius, 0.25 * wall_thickness)
 
         wall_material = sim_utils.RigidBodyMaterialCfg(
             static_friction=float(getattr(self.cfg, "path_boundary_static_friction", 1.0)),
@@ -233,50 +229,241 @@ class AgvTransportEnv(DirectRLEnv):
             metallic=0.0,
         )
 
-        wall_idx = 0
-        for seg_idx, (p0, p1) in enumerate(zip(path_points[:-1], path_points[1:])):
-            x0, y0 = p0
-            x1, y1 = p1
-            dx = x1 - x0
-            dy = y1 - y0
-            seg_len = math.hypot(dx, dy)
-            if seg_len < 1e-6:
-                continue
+        def _as_point_list(values) -> list[tuple[float, float]]:
+            points: list[tuple[float, float]] = []
+            for item in values:
+                if len(item) < 2:
+                    continue
+                point = (float(item[0]), float(item[1]))
+                if points and math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) <= 1e-6:
+                    continue
+                points.append(point)
+            return points
 
-            dir_x = dx / seg_len
-            dir_y = dy / seg_len
-            normal_x = -dir_y
-            normal_y = dir_x
+        def _lerp(
+            a: tuple[float, float],
+            b: tuple[float, float],
+            t: float,
+        ) -> tuple[float, float]:
+            return (a[0] * (1.0 - t) + b[0] * t, a[1] * (1.0 - t) + b[1] * t)
+
+        def _chaikin_smooth(
+            points: list[tuple[float, float]],
+            iterations: int,
+        ) -> list[tuple[float, float]]:
+            """Chaikin corner-cutting，保留首尾点，生成更连续的墙体中心线。"""
+            smoothed = points
+            for _ in range(max(iterations, 0)):
+                if len(smoothed) < 3:
+                    break
+                new_points: list[tuple[float, float]] = [smoothed[0]]
+                for p0, p1 in zip(smoothed[:-1], smoothed[1:]):
+                    new_points.append(_lerp(p0, p1, 0.25))
+                    new_points.append(_lerp(p0, p1, 0.75))
+                new_points.append(smoothed[-1])
+                smoothed = new_points
+            return smoothed
+
+        def _dense_sample_polyline(
+            points: list[tuple[float, float]],
+            step: float,
+        ) -> list[tuple[float, float]]:
+            """按近似等距重采样，使墙体由均匀短段组成。"""
+            if len(points) < 2:
+                return points
+
+            sampled: list[tuple[float, float]] = [points[0]]
+            for p0, p1 in zip(points[:-1], points[1:]):
+                dx = p1[0] - p0[0]
+                dy = p1[1] - p0[1]
+                length = math.hypot(dx, dy)
+                if length < 1e-9:
+                    continue
+                num_segments = max(1, int(math.ceil(length / step)))
+                for k in range(1, num_segments + 1):
+                    sampled.append((p0[0] + dx * k / num_segments, p0[1] + dy * k / num_segments))
+            return sampled
+
+        def _normalize(vec: tuple[float, float]) -> tuple[float, float]:
+            length = math.hypot(vec[0], vec[1])
+            if length < 1e-9:
+                return (0.0, 0.0)
+            return (vec[0] / length, vec[1] / length)
+
+        def _build_auto_offset_edges() -> dict[str, list[tuple[float, float]]]:
+            """自动 offset fallback。复杂弯道可能自交，默认不作为 V5.2-A4 主方案。"""
+            payload_start_xy = tuple(float(v) for v in self.cfg.payload_init_pos[:2])
+            start_extension = float(getattr(self.cfg, "path_boundary_start_extension", 0.0))
+            extended_start_xy = (
+                payload_start_xy[0] - start_extension,
+                payload_start_xy[1],
+            )
+
+            raw_path_points = [
+                extended_start_xy,
+                payload_start_xy,
+                *[tuple(float(v) for v in waypoint) for waypoint in self.cfg.waypoints],
+            ]
+            center_points = _as_point_list(raw_path_points)
+            if len(center_points) < 2:
+                return {"left": [], "right": []}
+
+            smooth_centerline = _chaikin_smooth(center_points, smoothing_iterations)
+            dense_centerline = _dense_sample_polyline(smooth_centerline, sample_step)
+            if len(dense_centerline) < 2:
+                return {"left": [], "right": []}
+
+            segment_normals: list[tuple[float, float]] = []
+            for p0, p1 in zip(dense_centerline[:-1], dense_centerline[1:]):
+                direction = _normalize((p1[0] - p0[0], p1[1] - p0[1]))
+                segment_normals.append((-direction[1], direction[0]))
+
+            vertex_normals: list[tuple[float, float]] = []
+            for idx in range(len(dense_centerline)):
+                if idx == 0:
+                    normal = segment_normals[0]
+                elif idx == len(dense_centerline) - 1:
+                    normal = segment_normals[-1]
+                else:
+                    normal = _normalize((
+                        segment_normals[idx - 1][0] + segment_normals[idx][0],
+                        segment_normals[idx - 1][1] + segment_normals[idx][1],
+                    ))
+                    if math.hypot(normal[0], normal[1]) < 1e-9:
+                        normal = segment_normals[idx]
+                vertex_normals.append(normal)
+
+            inner_half_width = float(self.cfg.path_boundary_inner_half_width)
+            wall_center_offset = inner_half_width + 0.5 * wall_thickness
+
+            return {
+                "left": [
+                    (p[0] + n[0] * wall_center_offset, p[1] + n[1] * wall_center_offset)
+                    for p, n in zip(dense_centerline, vertex_normals)
+                ],
+                "right": [
+                    (p[0] - n[0] * wall_center_offset, p[1] - n[1] * wall_center_offset)
+                    for p, n in zip(dense_centerline, vertex_normals)
+                ],
+            }
+
+        def _build_manual_edges() -> dict[str, list[tuple[float, float]]]:
+            left_points = _as_point_list(getattr(self.cfg, "path_boundary_left_points", ()))
+            right_points = _as_point_list(getattr(self.cfg, "path_boundary_right_points", ()))
+            if len(left_points) < 2 or len(right_points) < 2:
+                return _build_auto_offset_edges()
+
+            manual_smoothing_iterations = int(
+                getattr(self.cfg, "path_boundary_manual_smoothing_iterations", smoothing_iterations)
+            )
+            return {
+                "left": _dense_sample_polyline(
+                    _chaikin_smooth(left_points, manual_smoothing_iterations),
+                    sample_step,
+                ),
+                "right": _dense_sample_polyline(
+                    _chaikin_smooth(right_points, manual_smoothing_iterations),
+                    sample_step,
+                ),
+            }
+
+        segment_cfg = sim_utils.CuboidCfg(
+            size=(sample_step, wall_thickness, wall_height),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=wall_material,
+            visual_material=visual_material,
+        )
+
+        if hasattr(sim_utils, "CylinderCfg"):
+            cap_cfg = sim_utils.CylinderCfg(
+                radius=joint_cap_radius,
+                height=wall_height,
+                axis="Z",
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                physics_material=wall_material,
+                visual_material=visual_material,
+            )
+        else:
+            cap_cfg = sim_utils.CuboidCfg(
+                size=(2.0 * joint_cap_radius, 2.0 * joint_cap_radius, wall_height),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                physics_material=wall_material,
+                visual_material=visual_material,
+            )
+
+        def _spawn_wall_segment(
+            prim_name: str,
+            p0: tuple[float, float],
+            p1: tuple[float, float],
+        ) -> None:
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            length = math.hypot(dx, dy)
+            if length < 1e-6:
+                return
+
             yaw = math.atan2(dy, dx)
             quat_w = math.cos(0.5 * yaw)
             quat_z = math.sin(0.5 * yaw)
-            center_x = 0.5 * (x0 + x1)
-            center_y = 0.5 * (y0 + y1)
-            wall_length = seg_len + 2.0 * segment_overlap
+            center_x = 0.5 * (p0[0] + p1[0])
+            center_y = 0.5 * (p0[1] + p1[1])
 
-            for side_name, side_sign in (("left", 1.0), ("right", -1.0)):
-                wall_cfg = sim_utils.CuboidCfg(
-                    size=(wall_length, wall_thickness, wall_height),
-                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                        kinematic_enabled=True,
-                        disable_gravity=True,
-                    ),
-                    mass_props=sim_utils.MassPropertiesCfg(mass=1000.0),
-                    collision_props=sim_utils.CollisionPropertiesCfg(),
-                    physics_material=wall_material,
-                    visual_material=visual_material,
+            segment_cfg.size = (length + 2.0 * segment_overlap, wall_thickness, wall_height)
+            segment_cfg.func(
+                prim_name,
+                segment_cfg,
+                translation=(center_x, center_y, 0.5 * wall_height),
+                orientation=(quat_w, 0.0, 0.0, quat_z),
+            )
+
+        def _spawn_joint_cap(
+            prim_name: str,
+            point: tuple[float, float],
+        ) -> None:
+            cap_cfg.func(
+                prim_name,
+                cap_cfg,
+                translation=(point[0], point[1], 0.5 * wall_height),
+            )
+
+        if bool(getattr(self.cfg, "path_boundary_use_manual_edges", True)):
+            wall_edges = _build_manual_edges()
+        else:
+            wall_edges = _build_auto_offset_edges()
+
+        for side_name in ("left", "right"):
+            wall_points = wall_edges.get(side_name, [])
+            if len(wall_points) < 2:
+                continue
+
+            for seg_idx, (p0, p1) in enumerate(zip(wall_points[:-1], wall_points[1:])):
+                _spawn_wall_segment(
+                    f"/World/envs/env_0/PathBoundary/{side_name}/segment_{seg_idx}",
+                    p0,
+                    p1,
                 )
 
-                wall_x = center_x + side_sign * normal_x * wall_center_offset
-                wall_y = center_y + side_sign * normal_y * wall_center_offset
-
-                wall_cfg.func(
-                    f"/World/envs/env_0/PathBoundary_{seg_idx}_{side_name}_{wall_idx}",
-                    wall_cfg,
-                    translation=(wall_x, wall_y, 0.5 * wall_height),
-                    orientation=(quat_w, 0.0, 0.0, quat_z),
-                )
-                wall_idx += 1
+            if use_joint_caps:
+                for cap_idx, point in enumerate(wall_points):
+                    _spawn_joint_cap(
+                        f"/World/envs/env_0/PathBoundary/{side_name}/cap_{cap_idx}",
+                        point,
+                    )
 
     def _setup_scene(self):
         # 创建刚体

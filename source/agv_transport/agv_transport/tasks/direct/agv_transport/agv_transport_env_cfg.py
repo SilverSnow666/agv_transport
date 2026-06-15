@@ -14,7 +14,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.2-A-physical-boundaries-final。
+    当前版本：V5.2-A3-joint-capped-physical-boundaries。
 
     当前阶段目标：V5.2-A 宽通道低矮物理边界课程。
     最终课题目标：三台差速 AGV 协同推动异形件沿带物理边界的不规则路径到达终点。
@@ -29,6 +29,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     - 保持 effective push 与 contact flag 的平行朝向判定。
     - 保留 V5.1C 的软走廊压力。
     - 沿路径两侧生成宽通道低矮物理墙，作为真实物理边界课程的第一阶段。
+    - V5.2-A3 使用稠密短墙段和 joint cap，修复拐角拼接、尖角和局部缝隙问题。
     - 推荐从 V5.1C checkpoint fine-tune，不建议从零训练。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
@@ -196,10 +197,46 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     path_boundary_wall_height = 0.10
     # 起点向后延伸，确保 AGV 初始区域也处于通道包络内。
     path_boundary_start_extension = 1.50
-    path_boundary_segment_overlap = 0.10
+    # V5.2-A4：显式左右边界控制点 + 稠密短墙段 + joint cap。
+    # 不再默认使用中心线自动 offset，避免大 offset 在内弯处产生自交。
+    path_boundary_use_manual_edges = True
+    path_boundary_smoothing_iterations = 3
+    path_boundary_manual_smoothing_iterations = 2
+    path_boundary_sample_step = 0.20
+    # 使用 joint cap 处理连接点，不再通过墙段重叠掩盖缝隙，避免局部穿插。
+    path_boundary_segment_overlap = 0.0
+    path_boundary_use_joint_caps = True
+    path_boundary_joint_cap_radius = 0.04
     path_boundary_static_friction = 1.0
     path_boundary_dynamic_friction = 1.0
     path_boundary_color = (0.25, 0.25, 0.25)
+
+    # 手动 U 型物理通道边界控制点，局部坐标。
+    # 这些点表示墙体中心线，不是 payload 轨迹，也不是墙体内侧边。
+    # 设计目标：左右墙各自独立成连续 U 型，避免由中心线 offset 导致内侧墙自交。
+    # 若视觉检查发现边界过宽/过窄，只微调这些控制点，不改 reward。
+    path_boundary_left_points = (
+        (-1.50, 1.35),
+        (0.40, 1.35),
+        (1.60, 1.35),
+        (2.40, 0.95),
+        (3.00, 0.55),
+        (3.60, 0.55),
+        (4.20, 0.95),
+        (4.80, 1.35),
+        (7.10, 1.35),
+    )
+    path_boundary_right_points = (
+        (-1.50, -1.35),
+        (0.40, -1.35),
+        (1.60, -1.35),
+        (2.40, -1.75),
+        (3.00, -2.15),
+        (3.60, -2.15),
+        (4.20, -1.75),
+        (4.80, -1.35),
+        (7.10, -1.35),
+    )
 
 
     # D0A0g：waypoint gate。
