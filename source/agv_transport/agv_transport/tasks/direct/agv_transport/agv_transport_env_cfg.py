@@ -14,7 +14,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.2-B0-train-safe-narrow-corridor-clearance。
+    当前版本：V5.3-A1-light-irregular-soft-escape。
 
     阶段目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证既有 V5.1C / V5.2-A5 策略是否能安全迁移。
@@ -317,10 +317,19 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # [新增] 转弯时压制中间车（AGV1），迫使其交出主导权
     turn_center_push_penalty_scale = 2.0
 
-    # ========== 3. 新增脱队截断机制 (Truncation) ==========
+    # ========== 3. 脱队截断机制 (Truncation) ==========
     terminate_on_agv_escape = True
     agv_escape_dist_threshold = 2.0  # 距离 Payload 超过 2.0m 视为逃逸
     agv_escape_penalty_scale = 50.0  # 触发逃逸终止时的巨额惩罚
+
+    # V5.3-A1：soft escape prevention。
+    # 轻度异形件引入后，少数 episode 的主要失败源是 AGV 与 payload 距离逐步拉大，
+    # 最终触发 hard escape 截断。hard termination 对 PPO 过于稀疏，因此在接近
+    # escape 阈值之前加入连续惩罚，提前约束 standby AGV 不要被甩出可介入范围。
+    enable_soft_escape_penalty = True
+    soft_escape_dist = 1.65
+    soft_escape_penalty_scale = 4.0
+    soft_escape_use_max_agv = True
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
     progress_base_reward_scale = 10.0

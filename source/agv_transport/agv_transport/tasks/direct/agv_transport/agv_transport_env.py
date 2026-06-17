@@ -16,7 +16,7 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.2-B0-train-safe-narrow-corridor-clearance。
+    当前版本：V5.3-A1-light-irregular-soft-escape。
 
     目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证 AGV2/AGV3 侧推策略在更强边界约束下是否仍稳定。
@@ -665,6 +665,47 @@ class AgvTransportEnv(DirectRLEnv):
 
         return payload_penalty, agv_penalty
 
+    def _compute_soft_escape_penalty(self, payload_xy: torch.Tensor) -> torch.Tensor:
+        """Compute dense pre-escape penalty for AGV-payload separation.
+
+        V5.3-A1 targets the dominant failure mode observed after introducing a
+        light irregular payload: one AGV, often the low-contact standby vehicle,
+        gradually drifts away from the payload and eventually triggers the hard
+        ``terminate_on_agv_escape`` truncation.  The hard event is too sparse for
+        PPO, so this term starts penalizing distances before the hard threshold.
+        """
+        zeros = torch.zeros(self.num_envs, device=self.device)
+        if not bool(getattr(self.cfg, "enable_soft_escape_penalty", False)):
+            return zeros
+
+        agv_payload_dists = torch.stack(
+            (
+                torch.linalg.norm(self.agv1.data.root_pos_w[:, :2] - payload_xy, dim=1),
+                torch.linalg.norm(self.agv2.data.root_pos_w[:, :2] - payload_xy, dim=1),
+                torch.linalg.norm(self.agv3.data.root_pos_w[:, :2] - payload_xy, dim=1),
+            ),
+            dim=1,
+        )
+
+        soft_dist = float(getattr(self.cfg, "soft_escape_dist", 1.65))
+        hard_dist = float(getattr(self.cfg, "agv_escape_dist_threshold", 2.0))
+        denom = max(hard_dist - soft_dist, 1e-6)
+
+        # Normalized deficit: 0 below soft_dist and 1 at or above hard_dist.
+        violation = torch.clamp(
+            (agv_payload_dists - soft_dist) / denom,
+            min=0.0,
+            max=1.0,
+        )
+        penalty_each = torch.square(violation)
+
+        # Use the worst AGV by default.  Mean penalty would hide a single
+        # standby AGV drifting away because the two active pushers remain close.
+        if bool(getattr(self.cfg, "soft_escape_use_max_agv", True)):
+            return torch.max(penalty_each, dim=1).values
+
+        return torch.mean(penalty_each, dim=1)
+
     def _setup_scene(self):
         # 创建刚体
         self.agv1 = RigidObject(self.cfg.agv1_cfg)
@@ -1263,6 +1304,7 @@ class AgvTransportEnv(DirectRLEnv):
         payload_wall_clearance_penalty, agv_wall_clearance_penalty = (
             self._compute_wall_clearance_penalties(payload_xy)
         )
+        soft_escape_penalty = self._compute_soft_escape_penalty(payload_xy)
 
         # D0A0c：第三台低贡献 AGV 不必强行参与，但已有两台有效推动时，
         # 低贡献 AGV 应保持低动作、低动作变化率，并处于可重新加入的待命距离。
@@ -1509,6 +1551,9 @@ class AgvTransportEnv(DirectRLEnv):
                 - 30.0 * out_of_bounds.float()
 
                 - getattr(self.cfg, "agv_escape_penalty_scale", 50.0) * agv_escaped.float()
+
+                # V5.3-A1：hard escape 之前的连续预警惩罚，防止 standby AGV 被逐步甩远。
+                - getattr(self.cfg, "soft_escape_penalty_scale", 0.0) * soft_escape_penalty
 
                 # V5.2-B0：物理通道收窄后，轻量约束 AGV/payload 与墙体的安全间隙。
                 - getattr(self.cfg, "payload_wall_clearance_penalty_scale", 0.0) * payload_wall_clearance_penalty
