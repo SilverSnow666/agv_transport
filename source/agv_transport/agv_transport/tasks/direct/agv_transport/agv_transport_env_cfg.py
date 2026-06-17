@@ -142,6 +142,31 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     payload_mass = 24.0
     payload_init_pos = (0.0, 0.0, 0.15)
 
+    # V5.3-A0：保守轻度异形件预验证。
+    # 不改变主 payload 的质量、质心与基础矩形尺寸，只在 payload 刚体下添加一个更小的轻度侧向凸起碰撞体，
+    # 让接触边界变成非矩形。该附加块作为 Payload 的子 collider 参与同一刚体碰撞，
+    # 目标是在不引入 CoM 偏移的前提下，验证既有双侧转弯招募策略对轻度几何非对称的迁移能力。
+    enable_irregular_payload = True
+    irregular_payload_mode = "side_lobe"
+    # 每个元素为 (local_pos_xyz, size_xyz)。local_pos 以 Payload 根坐标为局部坐标。
+    # 当前只在 +Y 侧添加一个小凸起：与主矩形略微重叠，避免碰撞缝隙。
+    irregular_payload_lobes = (
+        ((0.12, 0.66, 0.0), (0.24, 0.12, 0.30)),
+    )
+    irregular_payload_color = (1.0, 0.32, 0.08)
+    irregular_payload_static_friction = 0.9
+    irregular_payload_dynamic_friction = 0.8
+    # 训练时可关闭独立材质，避免大规模并行时产生过多 material；
+    # 单环境 play 检查时可设为 True 以区分凸起颜色。
+    irregular_payload_enable_materials = False
+
+    # V5.3-A0：解析奖励/接触判定使用的有效横向包络。
+    # 主矩形 payload 半宽为 0.60m，轻度侧凸起外扩到约 0.72m。
+    # 为避免物理接触几何与 reward/contact 解析假设割裂，
+    # 用 0.70m 作为保守有效半宽；后续增强异形件时再逐步调整。
+    payload_contact_half_width_y = 0.70
+    payload_clearance_half_width_y = 0.70
+
     # 目标点，基于每个 env 原点的局部坐标
     #用于兼容旧模型
     target_pos = (3.10, 0.0, 0.0)
@@ -166,7 +191,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
     path_lateral_error_scale = 0.75
 
-    # V5.2-B0：保留 V5.1C 的软走廊压力。
+    # V5.3-A：保留 V5.1C 的软走廊压力。
     # 注意：path_corridor_half_width 是 reward 中的软惩罚阈值，不等于物理墙位置。
     # 当前评估中 payload 最大横向误差约 0.18~0.19 m，因此继续保留 0.10 m 软走廊，
     # 用于提供路径贴合压力；真实墙体则采用宽通道，避免直接阻塞 AGV2/AGV3 的侧向工作空间。
@@ -181,7 +206,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 继续启用 waypoint gate，保持按 waypoint 顺序推进。
     enable_waypoint_gate = True
 
-    # V5.2-B0：在 V5.2-A5 zero-shot 通过基础上，小幅收窄物理通道。
+    # V5.3-A：在 V5.2-B0 边界稳定基础上，引入轻度异形 payload。
     # 该边界不是最终窄通道，只用于引入真实刚体碰撞反馈。
     # inner_half_width 表示路径中心线到墙体内侧面的距离。
     # 手动边界已从 V5.2-A5 向内收窄约 0.03 m，用于验证更强物理边界约束。
@@ -210,14 +235,14 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     path_boundary_dynamic_friction = 1.0
     path_boundary_color = (0.25, 0.25, 0.25)
 
-    # V5.2-B0：AGV 是 kinematic 写位姿，物理墙不能完全依靠 PhysX 推回。
-    # 因此从收窄通道阶段开始加入轻量 wall-clearance penalty，
-    # 只惩罚贴墙/穿墙风险，不改变 payload 主路径 reward。
-    enable_wall_clearance_penalty = True
+    # V5.3-A：停止把 AGV2 clearance 作为主优化目标。
+    # 物理墙仍然存在，clearance 继续由评估脚本记录；本阶段只隔离 payload 形状变量。
+    # 若后续窄通道阶段再次出现负 clearance，可重新启用该 penalty。
+    enable_wall_clearance_penalty = False
     agv_wall_clearance_margin = 0.08
-    agv_wall_clearance_penalty_scale = 4.0
+    agv_wall_clearance_penalty_scale = 1.5
     payload_wall_clearance_margin = 0.20
-    payload_wall_clearance_penalty_scale = 2.0
+    payload_wall_clearance_penalty_scale = 0.8
 
     # 手动 U 型物理通道边界控制点，局部坐标。
     # 这些点表示墙体中心线，不是 payload 轨迹，也不是墙体内侧边。

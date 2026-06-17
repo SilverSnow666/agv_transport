@@ -475,6 +475,71 @@ class AgvTransportEnv(DirectRLEnv):
                         point,
                     )
 
+
+    def _spawn_irregular_payload_lobes(self) -> None:
+        """Spawn light irregular payload lobes as child colliders of Payload.
+
+        V5.3-A0 keeps the main payload rigid body, mass and CoM unchanged.  The
+        added lobes are child collision shapes under the payload prim, so they
+        act as a mild compound-contact irregularity without introducing a new
+        dynamic object or a welded joint.  This is intentionally conservative:
+        the goal is to test whether the V5.2 boundary-capable policy transfers
+        to a non-rectangular contact outline before introducing strong CoM
+        shifts or a full custom USD asset.
+        """
+        if not bool(getattr(self.cfg, "enable_irregular_payload", False)):
+            return
+
+        lobes = getattr(self.cfg, "irregular_payload_lobes", ())
+        if not lobes:
+            return
+
+        use_materials = bool(getattr(self.cfg, "irregular_payload_enable_materials", True))
+        visual_material = None
+        physics_material = None
+        if use_materials:
+            visual_material = sim_utils.PreviewSurfaceCfg(
+                diffuse_color=tuple(getattr(self.cfg, "irregular_payload_color", (1.0, 0.32, 0.08))),
+                metallic=0.0,
+            )
+            physics_material = sim_utils.RigidBodyMaterialCfg(
+                static_friction=float(getattr(self.cfg, "irregular_payload_static_friction", 0.9)),
+                dynamic_friction=float(getattr(self.cfg, "irregular_payload_dynamic_friction", 0.8)),
+                restitution=0.0,
+            )
+
+        for lobe_idx, lobe in enumerate(lobes):
+            if len(lobe) != 2:
+                raise ValueError(
+                    "Each irregular_payload_lobes entry must be "
+                    "(local_pos_xyz, size_xyz)."
+                )
+            local_pos, size = lobe
+            local_pos = tuple(float(v) for v in local_pos)
+            size = tuple(float(v) for v in size)
+            if len(local_pos) != 3 or len(size) != 3:
+                raise ValueError(
+                    "irregular payload local_pos and size must both have length 3."
+                )
+            if any(v <= 0.0 for v in size):
+                raise ValueError(f"Invalid irregular payload lobe size: {size}")
+
+            lobe_cfg_kwargs = {
+                "size": size,
+                "collision_props": sim_utils.CollisionPropertiesCfg(),
+            }
+            if use_materials:
+                lobe_cfg_kwargs["physics_material"] = physics_material
+                lobe_cfg_kwargs["visual_material"] = visual_material
+
+            lobe_cfg = sim_utils.CuboidCfg(**lobe_cfg_kwargs)
+            lobe_cfg.func(
+                f"/World/envs/env_0/Payload/IrregularLobe_{lobe_idx}",
+                lobe_cfg,
+                translation=local_pos,
+                orientation=(1.0, 0.0, 0.0, 0.0),
+            )
+
     def _get_manual_boundary_world_points(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return manual physical boundary centerlines in world frame.
 
@@ -528,13 +593,16 @@ class AgvTransportEnv(DirectRLEnv):
         payload_xy: torch.Tensor,
         agv_payload_dists: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute lightweight wall-clearance penalties for payload and AGVs.
+        """Compute normalized wall-clearance penalties for payload and AGVs.
 
-        V5.2-B0 narrows the physical corridor.  Since the AGVs are
-        kinematic bodies whose poses are written directly, physical walls are
-        not a complete safety constraint for AGV-wall interaction.  This term
-        adds a small dense penalty when AGVs or payload approach the manual
-        wall centerlines closer than a configurable clearance margin.
+        V5.2.3 changes the B0 clearance penalty from raw meter-squared
+        violations to normalized margin deficits.  This makes small but
+        important AGV-wall clearance violations visible to PPO.
+
+        The AGV term uses the worst AGV in each environment instead of the
+        mean/sum over all three AGVs.  In the current policy AGV2 is the
+        wall-critical robot, while AGV1 and AGV3 usually remain far from the
+        wall; averaging would dilute AGV2's safety signal.
         """
         del agv_payload_dists  # reserved for future role-conditioned variants
 
@@ -555,9 +623,14 @@ class AgvTransportEnv(DirectRLEnv):
             self._point_to_polyline_distance(payload_xy, right_world),
         )
         payload_clearance = payload_dist_to_wall - wall_half_thickness - payload_half_width
-        payload_margin = float(getattr(self.cfg, "payload_wall_clearance_margin", 0.20))
-        payload_violation = torch.clamp(payload_margin - payload_clearance, min=0.0)
-        payload_penalty = payload_violation * payload_violation
+
+        payload_margin = max(float(getattr(self.cfg, "payload_wall_clearance_margin", 0.20)), 1e-6)
+        payload_deficit = torch.clamp(
+            (payload_margin - payload_clearance) / payload_margin,
+            min=0.0,
+            max=1.0,
+        )
+        payload_penalty = torch.square(payload_deficit)
 
         agv_xy = torch.stack(
             (
@@ -567,18 +640,29 @@ class AgvTransportEnv(DirectRLEnv):
             ),
             dim=1,
         )
-        agv_penalties = []
-        agv_margin = float(getattr(self.cfg, "agv_wall_clearance_margin", 0.05))
+
+        agv_margin = max(float(getattr(self.cfg, "agv_wall_clearance_margin", 0.08)), 1e-6)
+        agv_deficits = []
         for agv_idx in range(3):
             agv_dist_to_wall = torch.minimum(
                 self._point_to_polyline_distance(agv_xy[:, agv_idx, :], left_world),
                 self._point_to_polyline_distance(agv_xy[:, agv_idx, :], right_world),
             )
             agv_clearance = agv_dist_to_wall - wall_half_thickness - agv_half_width
-            agv_violation = torch.clamp(agv_margin - agv_clearance, min=0.0)
-            agv_penalties.append(agv_violation * agv_violation)
+            agv_deficit = torch.clamp(
+                (agv_margin - agv_clearance) / agv_margin,
+                min=0.0,
+                max=1.0,
+            )
+            agv_deficits.append(agv_deficit)
 
-        agv_penalty = torch.stack(agv_penalties, dim=1).sum(dim=1)
+        agv_deficit = torch.stack(agv_deficits, dim=1)
+
+        # Use the worst AGV rather than an average.  This prevents AGV2's
+        # near-wall behavior from being masked by AGV1/AGV3, which usually
+        # have large positive clearances.
+        agv_penalty = torch.max(torch.square(agv_deficit), dim=1).values
+
         return payload_penalty, agv_penalty
 
     def _setup_scene(self):
@@ -631,6 +715,10 @@ class AgvTransportEnv(DirectRLEnv):
 
         # V5.2-A：生成路径两侧宽通道低矮物理边界。
         self._spawn_path_boundary_walls()
+
+        # V5.3-A0：在 Payload 根 prim 下添加轻度异形凸起子碰撞体。
+        # 该凸起会随 env_0 一同 clone 到全部并行环境。
+        self._spawn_irregular_payload_lobes()
 
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
@@ -2002,7 +2090,13 @@ class AgvTransportEnv(DirectRLEnv):
         )
 
         payload_half_x = 0.5 * self.cfg.payload_size[0]
-        payload_half_y = 0.5 * self.cfg.payload_size[1]
+        payload_half_y = float(
+            getattr(
+                self.cfg,
+                "payload_contact_half_width_y",
+                0.5 * self.cfg.payload_size[1],
+            )
+        )
         agv_half_length = 0.5 * self.cfg.agv_size[0]
         agv_half_width = 0.5 * self.cfg.agv_size[1]
 
@@ -2086,7 +2180,13 @@ class AgvTransportEnv(DirectRLEnv):
         sin_yaw = torch.sin(payload_yaw)
 
         payload_half_x = 0.5 * self.cfg.payload_size[0]
-        payload_half_y = 0.5 * self.cfg.payload_size[1]
+        payload_half_y = float(
+            getattr(
+                self.cfg,
+                "payload_contact_half_width_y",
+                0.5 * self.cfg.payload_size[1],
+            )
+        )
         agv_half_length = 0.5 * self.cfg.agv_size[0]
         agv_half_width = 0.5 * self.cfg.agv_size[1]
 
