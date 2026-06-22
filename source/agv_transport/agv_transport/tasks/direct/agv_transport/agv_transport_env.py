@@ -33,7 +33,7 @@ class AgvTransportEnv(DirectRLEnv):
     - 使用手动左右边界控制点、稠密短墙段和 joint cap 生成连续 U 型通道。
     - 从收窄通道阶段开始加入 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
     - 默认不为每个墙段/cap 生成独立 PhysX/visual material，避免 2048 并行环境下触发 64K material limit。
-    "
+    """
 
     cfg: AgvTransportEnvCfg
 
