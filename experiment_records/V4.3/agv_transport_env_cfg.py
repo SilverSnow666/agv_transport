@@ -14,18 +14,16 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.3-B1-wall-stuck-prevention。
-
-    阶段目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
-    并加入轻量 wall-clearance penalty，验证既有 V5.1C / V5.2-A5 策略是否能安全迁移。
-
-    设计原则：
-    - 保持规则矩形 payload，不引入异形件、不引入质心偏移。
-    - 保持 V5.1C 软走廊 reward，不放松路径约束，不鼓励撞墙探索。
-    - 基于手动 U 型左右边界控制点生成低矮物理墙。
-    - 相比 V5.2-A5，左右墙各向内收窄约 0.03 m。
-    - 从收窄通道阶段开始加入轻量 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
-    - 推荐先用 V5.1.0c.pt zero-shot 评估；若失败，再 fine-tune。
+    当前版本用于 V4.3-D0A0i-plus-subgoal-tighten：
+    - 延续 D0A0b 的 two-pusher credit，允许任意两台 AGV 有效推动；
+    - 不强制 AGV2 必须接触，但要求低贡献 AGV 在已有两车推动时保持低动作、低抖动；
+    - 保留任意两台 AGV 有效推动的 two-pusher credit；
+    - 不强制第三台 AGV 接触，但进一步抑制低贡献 AGV 抽搐；
+    - 将 target 从连续 lookahead 改为当前 active waypoint 子目标；
+    - 通过 active waypoint 子目标驱动 payload 依次经过 waypoint；
+    - 在右转/下拐段引入 turn-aware role switching，招募 AGV2 参与转向，
+      并轻微抑制 AGV3 在右转段继续过强直推；
+    - 保留宽而短的小矩形 payload 与前端几何接触判定。
     """
     # Isaac Sim 自带 AGV / AMR 视觉模型
     # 优先使用 Idealworks iwhub static，比较像工业 AGV
@@ -38,7 +36,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # 环境设置
     decimation = 2
-    episode_length_s = 80.0
+    episode_length_s = 45.0
 
     # 动作：差速 AGV 控制 [v, w]
     # v: 线速度
@@ -117,8 +115,8 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
     # AGV-AGV 安全距离约束。
     # D0A1 阶段只使用温和软分离，避免过强避让破坏角色分配。
-    agv_safe_distance = 0.46
-    agv_collision_distance = 0.41
+    agv_safe_distance = 0.50
+    agv_collision_distance = 0.43
 
     agv_overlap_penalty_scale = 5.0
     agv_collision_penalty_scale = 15.0
@@ -142,31 +140,6 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     payload_mass = 24.0
     payload_init_pos = (0.0, 0.0, 0.15)
 
-    # V5.3-B1：增强轻度几何异形件 + wall-stuck prevention。
-    # 不改变主 payload 的质量、质心与基础矩形尺寸，只在 payload 刚体下添加一个更小的轻度侧向凸起碰撞体，
-    # 让接触边界变成非矩形。该附加块作为 Payload 的子 collider 参与同一刚体碰撞，
-    # 目标是在不引入 CoM 偏移的前提下，验证既有双侧转弯招募策略对轻度几何非对称的迁移能力。
-    enable_irregular_payload = True
-    irregular_payload_mode = "side_lobe"
-    # 每个元素为 (local_pos_xyz, size_xyz)。local_pos 以 Payload 根坐标为局部坐标。
-    # 当前只在 +Y 侧添加一个小凸起：与主矩形略微重叠，避免碰撞缝隙。
-    irregular_payload_lobes = (
-        ((0.14, 0.68, 0.0), (0.28, 0.16, 0.30)),
-    )
-    irregular_payload_color = (1.0, 0.32, 0.08)
-    irregular_payload_static_friction = 0.9
-    irregular_payload_dynamic_friction = 0.8
-    # 训练时可关闭独立材质，避免大规模并行时产生过多 material；
-    # 单环境 play 检查时可设为 True 以区分凸起颜色。
-    irregular_payload_enable_materials = False
-
-    # V5.3-A0：解析奖励/接触判定使用的有效横向包络。
-    # 主矩形 payload 半宽为 0.60m，轻度侧凸起外扩到约 0.72m。
-    # 为避免物理接触几何与 reward/contact 解析假设割裂，
-    # 用 0.70m 作为保守有效半宽；后续增强异形件时再逐步调整。
-    payload_contact_half_width_y = 0.72
-    payload_clearance_half_width_y = 0.72
-
     # 目标点，基于每个 env 原点的局部坐标
     #用于兼容旧模型
     target_pos = (3.10, 0.0, 0.0)
@@ -174,15 +147,18 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # V4.3-D0A0f：中等偏强曲率路径。
     # 当前阶段不再加大曲率，而是通过 success progress 与 corridor penalty 强化路径遵从。
     waypoints = (
-        (0.80, 0.00),
-        (1.60, 0.00),
-        (2.40, -0.40),  # 缓和入弯
-        (3.00, -0.80),
-        (3.60, -0.80),  # 直线过渡
-        (4.20, -0.40),  # 缓和出弯
-        (4.80, 0.00),
-        (5.60, 0.00),
+        (0.45, 0.00),
+        (0.95, 0.28),
+        (1.45, 0.45),
+        (2.05, 0.20),
+        # D0A0h-plus：把原本 (2.05, 0.20) -> (2.65, -0.25) 的急转向段拆细，
+        # 让 payload 在两车推送下先学会连续下拐，而不是到第 4 点后继续直推过头。
+        (2.30, 0.02),
+        (2.55, -0.16),
+        (2.85, -0.16),
+        (3.10, 0.00),
     )
+
     # V4.1C 连续路径跟踪前视距离
     path_lookahead_dist = 0.32
 
@@ -191,85 +167,22 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     # 并加入软路径走廊；不直接使用墙壁硬终止，先保持训练稳定。
     path_lateral_error_scale = 0.75
 
-    # V5.3-A：保留 V5.1C 的软走廊压力。
-    # 注意：path_corridor_half_width 是 reward 中的软惩罚阈值，不等于物理墙位置。
-    # 当前评估中 payload 最大横向误差约 0.18~0.19 m，因此继续保留 0.10 m 软走廊，
-    # 用于提供路径贴合压力；真实墙体则采用宽通道，避免直接阻塞 AGV2/AGV3 的侧向工作空间。
+    # D0A0g-easy：温和路径遵从。
+    # 1) 离路径较远时，正向 progress reward 只被 soft gate 部分衰减；
+    # 2) 超出较宽软走廊后按平方轻惩罚；
+    # 3) success 需要路径进度合格，但末端横向误差先保持较宽，避免训练骤崩。
     progress_corridor_width = 0.60
-    path_corridor_half_width = 0.10
-    path_corridor_penalty_scale = 12.0
+    path_corridor_half_width = 0.15
+    path_corridor_penalty_scale = 5.0
 
-    # success 仍要求 payload 到达终点且路径推进充分。
+    # success 需要 payload 不仅进入目标半径，还要沿路径推进到足够靠近末端。
+    # easy 阶段先使用 0.96 和较宽 path lateral 条件，保护已有成功策略。
     success_progress_ratio = 0.92
-    success_path_lateral_error = 0.25
+    success_path_lateral_error = 0.40
 
-    # 继续启用 waypoint gate，保持按 waypoint 顺序推进。
+    # D0A0g-easy：暂时关闭强 waypoint gate。
+    # 等 soft-path 阶段把 path_lat_max 压到 0.25~0.30 后，再逐步打开。
     enable_waypoint_gate = True
-
-    # V5.3-A：在 V5.2-B0 边界稳定基础上，引入轻度异形 payload。
-    # 该边界不是最终窄通道，只用于引入真实刚体碰撞反馈。
-    # inner_half_width 表示路径中心线到墙体内侧面的距离。
-    # 手动边界已从 V5.2-A5 向内收窄约 0.03 m，用于验证更强物理边界约束。
-    enable_physical_path_boundaries = True
-    path_boundary_inner_half_width = 1.35
-    path_boundary_wall_thickness = 0.08
-    path_boundary_wall_height = 0.10
-    # 起点向后延伸，确保 AGV 初始区域也处于通道包络内。
-    path_boundary_start_extension = 1.50
-    # V5.2-B0：显式左右边界控制点 + 稠密短墙段 + joint cap。
-    # 不再默认使用中心线自动 offset，避免大 offset 在内弯处产生自交。
-    path_boundary_use_manual_edges = True
-    path_boundary_smoothing_iterations = 3
-    path_boundary_manual_smoothing_iterations = 2
-    path_boundary_sample_step = 0.20
-    # 使用 joint cap 处理连接点，不再通过墙段重叠掩盖缝隙，避免局部穿插。
-    path_boundary_segment_overlap = 0.0
-    path_boundary_use_joint_caps = True
-    path_boundary_joint_cap_radius = 0.04
-    # Large-scale training safety:
-    # Keep this False for --num_envs 2048.  If True, every wall segment/cap may
-    # spawn its own material and cloned environments can exceed the PhysX 64K
-    # material limit.  Enable only for low-num_envs visual inspection if needed.
-    path_boundary_enable_materials = False
-    path_boundary_static_friction = 1.0
-    path_boundary_dynamic_friction = 1.0
-    path_boundary_color = (0.25, 0.25, 0.25)
-
-    # V5.3-A：停止把 AGV2 clearance 作为主优化目标。
-    # 物理墙仍然存在，clearance 继续由评估脚本记录；本阶段只隔离 payload 形状变量。
-    # 若后续窄通道阶段再次出现负 clearance，可重新启用该 penalty。
-    enable_wall_clearance_penalty = False
-    agv_wall_clearance_margin = 0.08
-    agv_wall_clearance_penalty_scale = 1.5
-    payload_wall_clearance_margin = 0.20
-    payload_wall_clearance_penalty_scale = 0.8
-
-    # 手动 U 型物理通道边界控制点，局部坐标。
-    # 这些点表示墙体中心线，不是 payload 轨迹，也不是墙体内侧边。
-    # 设计目标：左右墙各自独立成连续 U 型，避免由中心线 offset 导致内侧墙自交。
-    # 若视觉检查发现边界过宽/过窄，只微调这些控制点，不改 payload 或主路径 reward。
-    path_boundary_left_points = (
-        (-1.50, 1.42),
-        (0.40, 1.42),
-        (1.60, 1.42),
-        (2.40, 1.02),
-        (3.00, 0.62),
-        (3.60, 0.62),
-        (4.20, 1.02),
-        (4.80, 1.42),
-        (7.10, 1.42),
-    )
-    path_boundary_right_points = (
-        (-1.50, -1.42),
-        (0.40, -1.42),
-        (1.60, -1.42),
-        (2.40, -1.82),
-        (3.00, -2.22),
-        (3.60, -2.22),
-        (4.20, -1.82),
-        (4.80, -1.42),
-        (7.10, -1.42),
-    )
 
 
     # D0A0g：waypoint gate。
@@ -299,7 +212,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     subgoal_overshoot_penalty_scale = 10.0
 
     # 引导 payload yaw 与当前 active segment 方向大致一致，帮助第 4->第 5 waypoint 下拐。
-    subgoal_yaw_alignment_scale = 0.15
+    subgoal_yaw_alignment_scale = 0.45
 
     # 已有两台 AGV 有效推动时，低贡献且未接触 payload 的 AGV 不应持续向前空跑。
     idle_forward_no_contact_penalty_scale = 1.20
@@ -314,38 +227,17 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     turn_role_contact_zone_norm = 0.80
     turn_opposite_push_penalty_scale = 0.7
 
-    # [新增] 转弯时压制中间车（AGV1），迫使其交出主导权
-    turn_center_push_penalty_scale = 2.0
-
-    # ========== 3. 脱队截断机制 (Truncation) ==========
+    # ========== 3. 新增脱队截断机制 (Truncation) ==========
     terminate_on_agv_escape = True
     agv_escape_dist_threshold = 2.0  # 距离 Payload 超过 2.0m 视为逃逸
     agv_escape_penalty_scale = 50.0  # 触发逃逸终止时的巨额惩罚
-
-    # V5.3-A1：soft escape prevention。
-    # 轻度异形件引入后，少数 episode 的主要失败源是 AGV 与 payload 距离逐步拉大，
-    # 最终触发 hard escape 截断。hard termination 对 PPO 过于稀疏，因此在接近
-    # escape 阈值之前加入连续惩罚，提前约束 standby AGV 不要被甩出可介入范围。
-    enable_soft_escape_penalty = True
-    soft_escape_dist = 1.65
-    soft_escape_penalty_scale = 4.0
-    soft_escape_use_max_agv = True
-
-    # V5.3-B1：wall-stuck prevention。
-    # V5.3-B0 的 100 episode 评估出现低概率贴墙卡死：payload/AGV 与墙体负 clearance，
-    # two-pusher gate 长时间接近 0，但未触发 escape/rear/oob。该项只在“靠墙 + 双推失效”
-    # 同时出现时给连续惩罚，避免把正常的近墙转弯也错误惩罚。
-    enable_wall_stuck_penalty = True
-    wall_stuck_payload_clearance_margin = 0.12
-    wall_stuck_two_gate_threshold = 0.30
-    wall_stuck_penalty_scale = 3.0
 
     # 两车有效推动 credit：progress 的主奖励由第二台有效推动车辆 gate。
     progress_base_reward_scale = 10.0
     progress_two_pusher_bonus_scale = 18.0
     backward_progress_penalty_scale = 12.0
     two_pusher_gate_threshold = 0.20
-    single_pusher_progress_penalty_scale = 2.0
+    single_pusher_progress_penalty_scale = 12.0
 
     # 成功奖励按整个 episode 中“两车有效推动进度占比”缩放，避免单车推到终点拿满分。
     success_reward_scale = 150.0
@@ -367,22 +259,19 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     progress_drop_penalty_scale = 4.0
     progress_drop_tolerance = 0.03
 
-    # 低贡献车辆约束。
-    # V5.0.3 采用中等偏松设置：允许闲置车在转弯后恢复、追赶和让位，
-    # 但不完全取消动作代价，避免 AGV2/AGV3 过早抢占中心主推角色。
-    idle_action_penalty_scale = 0.10
-    idle_action_rate_penalty_scale = 0.15
-    idle_standby_penalty_scale = 1.20
+    # 只有在已有两台有效推动时，才惩罚低贡献 AGV 的无意义动作和抽搐。
+    # easy 阶段保持中等强度，避免为了压 AGV2 抽搐而破坏两车推送主策略。
+    idle_action_penalty_scale = 0.30
+    idle_action_rate_penalty_scale = 0.35
+    idle_standby_penalty_scale = 1.50
     idle_low_utility_threshold = 0.08
-    idle_two_pusher_gate_threshold = 0.50
+    idle_two_pusher_gate_threshold = 0.60
     idle_standby_min_dist = 0.80
-    idle_standby_max_dist = 1.45
+    idle_standby_max_dist = 1.20
 
-    # 适度队形约束。
-    # 平行推送与平行 contact flag 已消除侧车内扣梯度；这里保留车道纪律，
-    # 防止 AGV2/AGV3 横向漂移或过早夹占中心车空间。
-    formation_error_mean_scale = 0.06
-    formation_error_max_scale = 0.02
+    # 固定队形只做弱约束，避免强行要求三台 AGV 始终同时接触。
+    formation_error_mean_scale = 0.10
+    formation_error_max_scale = 0.03
     heading_alignment_mean_scale = 0.15
     heading_alignment_min_scale = 0.05
 
@@ -398,7 +287,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
 
 
     # 工作空间限制，防止物体飞太远
-    workspace_limit = 6.0
+    workspace_limit = 3.8
 
     # 差速 AGV 动作缩放
     max_agv_linear_speed = 0.5

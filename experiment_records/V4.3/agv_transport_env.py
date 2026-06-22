@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import math
 
 import torch
 
@@ -16,24 +15,17 @@ from pxr import Usd, UsdGeom
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.3-B1-wall-stuck-prevention。
-
-    目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
-    并加入轻量 wall-clearance penalty，验证 AGV2/AGV3 侧推策略在更强边界约束下是否仍稳定。
-
-    核心设计：
-    - 集中式单智能体控制三台差速 AGV，动作为 [v1, w1, v2, w2, v3, w3]。
-    - 使用 active waypoint 子目标驱动 payload 按顺序经过路径点。
-    - 允许任意两台 AGV 形成有效推动，不强制三车全程同时接触。
-    - 在右转/下拐段招募 AGV2，在左转/上拐段招募 AGV3。
-    - 有效推动奖励与 contact flag 均使用 AGV 与 payload 车身朝向平行度，
-      避免侧车为了最大化朝向/接触奖励而转向 payload 质心形成 V 型挤压。
-    - 保留 AGV 指向 payload 质心的几何量，仅用于车尾倒推等异常诊断。
-    - 在路径两侧生成低矮物理边界。V5.2-B0 仍不改变 payload 形状、质量、摩擦或质心。
-    - 使用手动左右边界控制点、稠密短墙段和 joint cap 生成连续 U 型通道。
-    - 从收窄通道阶段开始加入 wall-clearance penalty，约束 kinematic AGV 贴墙/穿墙风险。
-    - 默认不为每个墙段/cap 生成独立 PhysX/visual material，避免 2048 并行环境下触发 64K material limit。
-    "
+    当前版本用于 V4.3-D0A0i-plus-subgoal-tighten：
+    - 延续 D0A0c 的 top-2 有效推动 credit；
+    - 允许任意两台 AGV 推动 payload 到终点，不强制三车同时接触；
+    - 当已有两台 AGV 有效推动时，低贡献 AGV 会受到温和动作和动作变化率惩罚，减少抽搐；
+    - 使用 active waypoint 子目标驱动 payload 依次经过路径点；
+    - 当前 target、队形方向与距离奖励都围绕 active waypoint 更新；
+    - 增加接近子目标减速、active segment overshoot 惩罚和 payload yaw 引导；
+    - 在右转/下拐段使用 turn-aware role switching，招募 AGV2 靠近并参与推动，
+      轻微抑制 AGV3 继续过强直推。
+    - 重点解决第 4 个 waypoint 后 payload 不下拐、继续被直推过头的问题。
+    """
 
     cfg: AgvTransportEnvCfg
 
@@ -191,585 +183,6 @@ class AgvTransportEnv(DirectRLEnv):
                     if imageable:
                         imageable.MakeInvisible()
 
-    def _spawn_path_boundary_walls(self) -> None:
-        """在 env_0 中生成连续、低矮、宽通道物理边界墙。
-
-        V5.2-A4：优先使用手动左右边界控制点生成 U 型通道。
-
-        之前的中心线 offset 方法在大 offset 距离和内弯组合下会产生
-        offset 曲线自交，表现为某一侧墙体出现 X 型交叉或局部折返。
-        joint cap 只能遮盖连接点，不能消除这种拓扑自交。
-
-        本版默认采用显式 left/right boundary control points：
-        - 左右墙分别独立定义，不再由中心线自动外扩；
-        - 分别做 Chaikin 平滑和稠密采样；
-        - 用短墙段 + joint cap 生成连续低矮物理边界；
-        - 保留中心线 offset fallback，便于后续快速测试其它路径。
-        """
-        if not getattr(self.cfg, "enable_physical_path_boundaries", False):
-            return
-
-        wall_thickness = float(self.cfg.path_boundary_wall_thickness)
-        wall_height = float(self.cfg.path_boundary_wall_height)
-        smoothing_iterations = int(getattr(self.cfg, "path_boundary_smoothing_iterations", 3))
-        sample_step = max(float(getattr(self.cfg, "path_boundary_sample_step", 0.20)), 0.05)
-        segment_overlap = max(float(getattr(self.cfg, "path_boundary_segment_overlap", 0.0)), 0.0)
-        use_joint_caps = bool(getattr(self.cfg, "path_boundary_use_joint_caps", True))
-        joint_cap_radius = float(getattr(self.cfg, "path_boundary_joint_cap_radius", 0.5 * wall_thickness))
-        joint_cap_radius = max(joint_cap_radius, 0.25 * wall_thickness)
-
-        # IMPORTANT for large-scale training:
-        # Do not create per-wall physics/visual materials by default.  With
-        # num_envs=2048, each spawned segment/cap is cloned many times; if each
-        # prim owns its own material, PhysX can hit the 64K material limit during
-        # scene replication.  The walls use the default material unless
-        # path_boundary_enable_materials=True is explicitly enabled for visual
-        # inspection with small num_envs.
-        enable_boundary_materials = bool(getattr(self.cfg, "path_boundary_enable_materials", False))
-        wall_material = None
-        visual_material = None
-        if enable_boundary_materials:
-            wall_material = sim_utils.RigidBodyMaterialCfg(
-                static_friction=float(getattr(self.cfg, "path_boundary_static_friction", 1.0)),
-                dynamic_friction=float(getattr(self.cfg, "path_boundary_dynamic_friction", 1.0)),
-                restitution=0.0,
-            )
-            visual_material = sim_utils.PreviewSurfaceCfg(
-                diffuse_color=tuple(getattr(self.cfg, "path_boundary_color", (0.25, 0.25, 0.25))),
-                metallic=0.0,
-            )
-
-        def _as_point_list(values) -> list[tuple[float, float]]:
-            points: list[tuple[float, float]] = []
-            for item in values:
-                if len(item) < 2:
-                    continue
-                point = (float(item[0]), float(item[1]))
-                if points and math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) <= 1e-6:
-                    continue
-                points.append(point)
-            return points
-
-        def _lerp(
-            a: tuple[float, float],
-            b: tuple[float, float],
-            t: float,
-        ) -> tuple[float, float]:
-            return (a[0] * (1.0 - t) + b[0] * t, a[1] * (1.0 - t) + b[1] * t)
-
-        def _chaikin_smooth(
-            points: list[tuple[float, float]],
-            iterations: int,
-        ) -> list[tuple[float, float]]:
-            """Chaikin corner-cutting，保留首尾点，生成更连续的墙体中心线。"""
-            smoothed = points
-            for _ in range(max(iterations, 0)):
-                if len(smoothed) < 3:
-                    break
-                new_points: list[tuple[float, float]] = [smoothed[0]]
-                for p0, p1 in zip(smoothed[:-1], smoothed[1:]):
-                    new_points.append(_lerp(p0, p1, 0.25))
-                    new_points.append(_lerp(p0, p1, 0.75))
-                new_points.append(smoothed[-1])
-                smoothed = new_points
-            return smoothed
-
-        def _dense_sample_polyline(
-            points: list[tuple[float, float]],
-            step: float,
-        ) -> list[tuple[float, float]]:
-            """按近似等距重采样，使墙体由均匀短段组成。"""
-            if len(points) < 2:
-                return points
-
-            sampled: list[tuple[float, float]] = [points[0]]
-            for p0, p1 in zip(points[:-1], points[1:]):
-                dx = p1[0] - p0[0]
-                dy = p1[1] - p0[1]
-                length = math.hypot(dx, dy)
-                if length < 1e-9:
-                    continue
-                num_segments = max(1, int(math.ceil(length / step)))
-                for k in range(1, num_segments + 1):
-                    sampled.append((p0[0] + dx * k / num_segments, p0[1] + dy * k / num_segments))
-            return sampled
-
-        def _normalize(vec: tuple[float, float]) -> tuple[float, float]:
-            length = math.hypot(vec[0], vec[1])
-            if length < 1e-9:
-                return (0.0, 0.0)
-            return (vec[0] / length, vec[1] / length)
-
-        def _build_auto_offset_edges() -> dict[str, list[tuple[float, float]]]:
-            """自动 offset fallback。复杂弯道可能自交，默认不作为 V5.2-A4 主方案。"""
-            payload_start_xy = tuple(float(v) for v in self.cfg.payload_init_pos[:2])
-            start_extension = float(getattr(self.cfg, "path_boundary_start_extension", 0.0))
-            extended_start_xy = (
-                payload_start_xy[0] - start_extension,
-                payload_start_xy[1],
-            )
-
-            raw_path_points = [
-                extended_start_xy,
-                payload_start_xy,
-                *[tuple(float(v) for v in waypoint) for waypoint in self.cfg.waypoints],
-            ]
-            center_points = _as_point_list(raw_path_points)
-            if len(center_points) < 2:
-                return {"left": [], "right": []}
-
-            smooth_centerline = _chaikin_smooth(center_points, smoothing_iterations)
-            dense_centerline = _dense_sample_polyline(smooth_centerline, sample_step)
-            if len(dense_centerline) < 2:
-                return {"left": [], "right": []}
-
-            segment_normals: list[tuple[float, float]] = []
-            for p0, p1 in zip(dense_centerline[:-1], dense_centerline[1:]):
-                direction = _normalize((p1[0] - p0[0], p1[1] - p0[1]))
-                segment_normals.append((-direction[1], direction[0]))
-
-            vertex_normals: list[tuple[float, float]] = []
-            for idx in range(len(dense_centerline)):
-                if idx == 0:
-                    normal = segment_normals[0]
-                elif idx == len(dense_centerline) - 1:
-                    normal = segment_normals[-1]
-                else:
-                    normal = _normalize((
-                        segment_normals[idx - 1][0] + segment_normals[idx][0],
-                        segment_normals[idx - 1][1] + segment_normals[idx][1],
-                    ))
-                    if math.hypot(normal[0], normal[1]) < 1e-9:
-                        normal = segment_normals[idx]
-                vertex_normals.append(normal)
-
-            inner_half_width = float(self.cfg.path_boundary_inner_half_width)
-            wall_center_offset = inner_half_width + 0.5 * wall_thickness
-
-            return {
-                "left": [
-                    (p[0] + n[0] * wall_center_offset, p[1] + n[1] * wall_center_offset)
-                    for p, n in zip(dense_centerline, vertex_normals)
-                ],
-                "right": [
-                    (p[0] - n[0] * wall_center_offset, p[1] - n[1] * wall_center_offset)
-                    for p, n in zip(dense_centerline, vertex_normals)
-                ],
-            }
-
-        def _build_manual_edges() -> dict[str, list[tuple[float, float]]]:
-            left_points = _as_point_list(getattr(self.cfg, "path_boundary_left_points", ()))
-            right_points = _as_point_list(getattr(self.cfg, "path_boundary_right_points", ()))
-            if len(left_points) < 2 or len(right_points) < 2:
-                return _build_auto_offset_edges()
-
-            manual_smoothing_iterations = int(
-                getattr(self.cfg, "path_boundary_manual_smoothing_iterations", smoothing_iterations)
-            )
-            return {
-                "left": _dense_sample_polyline(
-                    _chaikin_smooth(left_points, manual_smoothing_iterations),
-                    sample_step,
-                ),
-                "right": _dense_sample_polyline(
-                    _chaikin_smooth(right_points, manual_smoothing_iterations),
-                    sample_step,
-                ),
-            }
-
-        segment_kwargs = {
-            "size": (sample_step, wall_thickness, wall_height),
-            "rigid_props": sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
-            ),
-            "mass_props": sim_utils.MassPropertiesCfg(mass=1000.0),
-            "collision_props": sim_utils.CollisionPropertiesCfg(),
-        }
-        if enable_boundary_materials:
-            segment_kwargs["physics_material"] = wall_material
-            segment_kwargs["visual_material"] = visual_material
-        segment_cfg = sim_utils.CuboidCfg(**segment_kwargs)
-
-        cap_common_kwargs = {
-            "rigid_props": sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                disable_gravity=True,
-            ),
-            "mass_props": sim_utils.MassPropertiesCfg(mass=1000.0),
-            "collision_props": sim_utils.CollisionPropertiesCfg(),
-        }
-        if enable_boundary_materials:
-            cap_common_kwargs["physics_material"] = wall_material
-            cap_common_kwargs["visual_material"] = visual_material
-
-        if hasattr(sim_utils, "CylinderCfg"):
-            cap_cfg = sim_utils.CylinderCfg(
-                radius=joint_cap_radius,
-                height=wall_height,
-                axis="Z",
-                **cap_common_kwargs,
-            )
-        else:
-            cap_cfg = sim_utils.CuboidCfg(
-                size=(2.0 * joint_cap_radius, 2.0 * joint_cap_radius, wall_height),
-                **cap_common_kwargs,
-            )
-
-        def _spawn_wall_segment(
-            prim_name: str,
-            p0: tuple[float, float],
-            p1: tuple[float, float],
-        ) -> None:
-            dx = p1[0] - p0[0]
-            dy = p1[1] - p0[1]
-            length = math.hypot(dx, dy)
-            if length < 1e-6:
-                return
-
-            yaw = math.atan2(dy, dx)
-            quat_w = math.cos(0.5 * yaw)
-            quat_z = math.sin(0.5 * yaw)
-            center_x = 0.5 * (p0[0] + p1[0])
-            center_y = 0.5 * (p0[1] + p1[1])
-
-            segment_cfg.size = (length + 2.0 * segment_overlap, wall_thickness, wall_height)
-            segment_cfg.func(
-                prim_name,
-                segment_cfg,
-                translation=(center_x, center_y, 0.5 * wall_height),
-                orientation=(quat_w, 0.0, 0.0, quat_z),
-            )
-
-        def _spawn_joint_cap(
-            prim_name: str,
-            point: tuple[float, float],
-        ) -> None:
-            cap_cfg.func(
-                prim_name,
-                cap_cfg,
-                translation=(point[0], point[1], 0.5 * wall_height),
-            )
-
-        if bool(getattr(self.cfg, "path_boundary_use_manual_edges", True)):
-            wall_edges = _build_manual_edges()
-        else:
-            wall_edges = _build_auto_offset_edges()
-
-        for side_name in ("left", "right"):
-            wall_points = wall_edges.get(side_name, [])
-            if len(wall_points) < 2:
-                continue
-
-            for seg_idx, (p0, p1) in enumerate(zip(wall_points[:-1], wall_points[1:])):
-                _spawn_wall_segment(
-                    f"/World/envs/env_0/PathBoundary/{side_name}/segment_{seg_idx}",
-                    p0,
-                    p1,
-                )
-
-            if use_joint_caps:
-                for cap_idx, point in enumerate(wall_points):
-                    _spawn_joint_cap(
-                        f"/World/envs/env_0/PathBoundary/{side_name}/cap_{cap_idx}",
-                        point,
-                    )
-
-
-    def _spawn_irregular_payload_lobes(self) -> None:
-        """Spawn light irregular payload lobes as child colliders of Payload.
-
-        V5.3-A0 keeps the main payload rigid body, mass and CoM unchanged.  The
-        added lobes are child collision shapes under the payload prim, so they
-        act as a mild compound-contact irregularity without introducing a new
-        dynamic object or a welded joint.  This is intentionally conservative:
-        the goal is to test whether the V5.2 boundary-capable policy transfers
-        to a non-rectangular contact outline before introducing strong CoM
-        shifts or a full custom USD asset.
-        """
-        if not bool(getattr(self.cfg, "enable_irregular_payload", False)):
-            return
-
-        lobes = getattr(self.cfg, "irregular_payload_lobes", ())
-        if not lobes:
-            return
-
-        use_materials = bool(getattr(self.cfg, "irregular_payload_enable_materials", True))
-        visual_material = None
-        physics_material = None
-        if use_materials:
-            visual_material = sim_utils.PreviewSurfaceCfg(
-                diffuse_color=tuple(getattr(self.cfg, "irregular_payload_color", (1.0, 0.32, 0.08))),
-                metallic=0.0,
-            )
-            physics_material = sim_utils.RigidBodyMaterialCfg(
-                static_friction=float(getattr(self.cfg, "irregular_payload_static_friction", 0.9)),
-                dynamic_friction=float(getattr(self.cfg, "irregular_payload_dynamic_friction", 0.8)),
-                restitution=0.0,
-            )
-
-        for lobe_idx, lobe in enumerate(lobes):
-            if len(lobe) != 2:
-                raise ValueError(
-                    "Each irregular_payload_lobes entry must be "
-                    "(local_pos_xyz, size_xyz)."
-                )
-            local_pos, size = lobe
-            local_pos = tuple(float(v) for v in local_pos)
-            size = tuple(float(v) for v in size)
-            if len(local_pos) != 3 or len(size) != 3:
-                raise ValueError(
-                    "irregular payload local_pos and size must both have length 3."
-                )
-            if any(v <= 0.0 for v in size):
-                raise ValueError(f"Invalid irregular payload lobe size: {size}")
-
-            lobe_cfg_kwargs = {
-                "size": size,
-                "collision_props": sim_utils.CollisionPropertiesCfg(),
-            }
-            if use_materials:
-                lobe_cfg_kwargs["physics_material"] = physics_material
-                lobe_cfg_kwargs["visual_material"] = visual_material
-
-            lobe_cfg = sim_utils.CuboidCfg(**lobe_cfg_kwargs)
-            lobe_cfg.func(
-                f"/World/envs/env_0/Payload/IrregularLobe_{lobe_idx}",
-                lobe_cfg,
-                translation=local_pos,
-                orientation=(1.0, 0.0, 0.0, 0.0),
-            )
-
-    def _get_manual_boundary_world_points(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Return manual physical boundary centerlines in world frame.
-
-        The points are wall centerlines defined in local env coordinates.
-        They are used only for soft wall-clearance diagnostics/reward.  The
-        actual collision geometry is spawned separately in env_0 and cloned.
-        """
-        if not bool(getattr(self.cfg, "enable_physical_path_boundaries", False)):
-            return None, None
-        if not bool(getattr(self.cfg, "path_boundary_use_manual_edges", True)):
-            return None, None
-
-        left_points = getattr(self.cfg, "path_boundary_left_points", None)
-        right_points = getattr(self.cfg, "path_boundary_right_points", None)
-        if left_points is None or right_points is None:
-            return None, None
-        if len(left_points) < 2 or len(right_points) < 2:
-            return None, None
-
-        left_local = torch.tensor(left_points, dtype=torch.float32, device=self.device)
-        right_local = torch.tensor(right_points, dtype=torch.float32, device=self.device)
-        origins = self.scene.env_origins[:, None, :2]
-        return origins + left_local[None, :, :], origins + right_local[None, :, :]
-
-    @staticmethod
-    def _point_to_polyline_distance(points: torch.Tensor, polyline: torch.Tensor) -> torch.Tensor:
-        """Compute minimum 2D distance from each point to a batched polyline.
-
-        Args:
-            points: Tensor with shape [num_envs, 2].
-            polyline: Tensor with shape [num_envs, num_points, 2].
-
-        Returns:
-            Tensor with shape [num_envs].
-        """
-        if polyline is None or polyline.shape[1] < 2:
-            return torch.full((points.shape[0],), float("nan"), device=points.device)
-
-        p0 = polyline[:, :-1, :]
-        p1 = polyline[:, 1:, :]
-        segment = p1 - p0
-        segment_len_sq = torch.sum(segment * segment, dim=2).clamp_min(1e-12)
-        rel = points[:, None, :] - p0
-        t = torch.sum(rel * segment, dim=2) / segment_len_sq
-        t = torch.clamp(t, 0.0, 1.0)
-        projection = p0 + t[:, :, None] * segment
-        return torch.linalg.norm(points[:, None, :] - projection, dim=2).min(dim=1).values
-
-    def _compute_wall_clearance_penalties(
-        self,
-        payload_xy: torch.Tensor,
-        agv_payload_dists: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute normalized wall-clearance penalties for payload and AGVs.
-
-        V5.2.3 changes the B0 clearance penalty from raw meter-squared
-        violations to normalized margin deficits.  This makes small but
-        important AGV-wall clearance violations visible to PPO.
-
-        The AGV term uses the worst AGV in each environment instead of the
-        mean/sum over all three AGVs.  In the current policy AGV2 is the
-        wall-critical robot, while AGV1 and AGV3 usually remain far from the
-        wall; averaging would dilute AGV2's safety signal.
-        """
-        del agv_payload_dists  # reserved for future role-conditioned variants
-
-        zeros = torch.zeros(self.num_envs, device=self.device)
-        if not bool(getattr(self.cfg, "enable_wall_clearance_penalty", False)):
-            return zeros, zeros
-
-        left_world, right_world = self._get_manual_boundary_world_points()
-        if left_world is None or right_world is None:
-            return zeros, zeros
-
-        wall_half_thickness = 0.5 * float(getattr(self.cfg, "path_boundary_wall_thickness", 0.08))
-        payload_half_width = 0.5 * float(getattr(self.cfg, "payload_size", (0.90, 1.20, 0.30))[1])
-        agv_half_width = 0.5 * float(getattr(self.cfg, "agv_size", (0.70, 0.45, 0.06))[1])
-
-        payload_dist_to_wall = torch.minimum(
-            self._point_to_polyline_distance(payload_xy, left_world),
-            self._point_to_polyline_distance(payload_xy, right_world),
-        )
-        payload_clearance = payload_dist_to_wall - wall_half_thickness - payload_half_width
-
-        payload_margin = max(float(getattr(self.cfg, "payload_wall_clearance_margin", 0.20)), 1e-6)
-        payload_deficit = torch.clamp(
-            (payload_margin - payload_clearance) / payload_margin,
-            min=0.0,
-            max=1.0,
-        )
-        payload_penalty = torch.square(payload_deficit)
-
-        agv_xy = torch.stack(
-            (
-                self.agv1.data.root_pos_w[:, :2],
-                self.agv2.data.root_pos_w[:, :2],
-                self.agv3.data.root_pos_w[:, :2],
-            ),
-            dim=1,
-        )
-
-        agv_margin = max(float(getattr(self.cfg, "agv_wall_clearance_margin", 0.08)), 1e-6)
-        agv_deficits = []
-        for agv_idx in range(3):
-            agv_dist_to_wall = torch.minimum(
-                self._point_to_polyline_distance(agv_xy[:, agv_idx, :], left_world),
-                self._point_to_polyline_distance(agv_xy[:, agv_idx, :], right_world),
-            )
-            agv_clearance = agv_dist_to_wall - wall_half_thickness - agv_half_width
-            agv_deficit = torch.clamp(
-                (agv_margin - agv_clearance) / agv_margin,
-                min=0.0,
-                max=1.0,
-            )
-            agv_deficits.append(agv_deficit)
-
-        agv_deficit = torch.stack(agv_deficits, dim=1)
-
-        # Use the worst AGV rather than an average.  This prevents AGV2's
-        # near-wall behavior from being masked by AGV1/AGV3, which usually
-        # have large positive clearances.
-        agv_penalty = torch.max(torch.square(agv_deficit), dim=1).values
-
-        return payload_penalty, agv_penalty
-
-    def _compute_soft_escape_penalty(self, payload_xy: torch.Tensor) -> torch.Tensor:
-        """Compute dense pre-escape penalty for AGV-payload separation.
-
-        V5.3-A1 targets the dominant failure mode observed after introducing a
-        light irregular payload: one AGV, often the low-contact standby vehicle,
-        gradually drifts away from the payload and eventually triggers the hard
-        ``terminate_on_agv_escape`` truncation.  The hard event is too sparse for
-        PPO, so this term starts penalizing distances before the hard threshold.
-        """
-        zeros = torch.zeros(self.num_envs, device=self.device)
-        if not bool(getattr(self.cfg, "enable_soft_escape_penalty", False)):
-            return zeros
-
-        agv_payload_dists = torch.stack(
-            (
-                torch.linalg.norm(self.agv1.data.root_pos_w[:, :2] - payload_xy, dim=1),
-                torch.linalg.norm(self.agv2.data.root_pos_w[:, :2] - payload_xy, dim=1),
-                torch.linalg.norm(self.agv3.data.root_pos_w[:, :2] - payload_xy, dim=1),
-            ),
-            dim=1,
-        )
-
-        soft_dist = float(getattr(self.cfg, "soft_escape_dist", 1.65))
-        hard_dist = float(getattr(self.cfg, "agv_escape_dist_threshold", 2.0))
-        denom = max(hard_dist - soft_dist, 1e-6)
-
-        # Normalized deficit: 0 below soft_dist and 1 at or above hard_dist.
-        violation = torch.clamp(
-            (agv_payload_dists - soft_dist) / denom,
-            min=0.0,
-            max=1.0,
-        )
-        penalty_each = torch.square(violation)
-
-        # Use the worst AGV by default.  Mean penalty would hide a single
-        # standby AGV drifting away because the two active pushers remain close.
-        if bool(getattr(self.cfg, "soft_escape_use_max_agv", True)):
-            return torch.max(penalty_each, dim=1).values
-
-        return torch.mean(penalty_each, dim=1)
-
-
-    def _compute_wall_stuck_penalty(
-        self,
-        payload_xy: torch.Tensor,
-        two_pusher_gate: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute dense penalty for near-wall contact-collapse states.
-
-        V5.3-B0 100-episode evaluation exposed a rare but important failure
-        mode: the irregular payload can drift into the physical boundary,
-        lose two-pusher contact, and then remain stuck for thousands of steps
-        without triggering escape/rear/oob termination.  This penalty targets
-        that coupled state only:
-
-        - payload wall clearance is below a small margin, and
-        - two-pusher gate has collapsed.
-
-        It does not penalize normal successful episodes where the payload is
-        merely close to the wall but AGV2/AGV3 still maintain effective pushing.
-        """
-        zeros = torch.zeros(self.num_envs, device=self.device)
-        if not bool(getattr(self.cfg, "enable_wall_stuck_penalty", False)):
-            return zeros
-
-        left_world, right_world = self._get_manual_boundary_world_points()
-        if left_world is None or right_world is None:
-            return zeros
-
-        wall_half_thickness = 0.5 * float(getattr(self.cfg, "path_boundary_wall_thickness", 0.08))
-        payload_half_width_y = float(
-            getattr(
-                self.cfg,
-                "payload_clearance_half_width_y",
-                0.5 * float(getattr(self.cfg, "payload_size", (0.90, 1.20, 0.30))[1]),
-            )
-        )
-
-        payload_dist_to_wall = torch.minimum(
-            self._point_to_polyline_distance(payload_xy, left_world),
-            self._point_to_polyline_distance(payload_xy, right_world),
-        )
-        payload_clearance = payload_dist_to_wall - wall_half_thickness - payload_half_width_y
-
-        clearance_margin = max(float(getattr(self.cfg, "wall_stuck_payload_clearance_margin", 0.12)), 1e-6)
-        gate_threshold = max(float(getattr(self.cfg, "wall_stuck_two_gate_threshold", 0.30)), 1e-6)
-
-        # 0 when clearance is safe; 1 when payload reaches/penetrates wall line.
-        clearance_deficit = torch.clamp(
-            (clearance_margin - payload_clearance) / clearance_margin,
-            min=0.0,
-            max=1.0,
-        )
-
-        # 0 when two-pusher gate is healthy; 1 when effective two-pusher
-        # contact collapses.  The product focuses the penalty on wall-stuck
-        # contact-collapse, not on ordinary low-contact phases away from walls.
-        low_two_pusher = torch.clamp(
-            (gate_threshold - two_pusher_gate) / gate_threshold,
-            min=0.0,
-            max=1.0,
-        )
-
-        return torch.square(clearance_deficit) * low_two_pusher
-
     def _setup_scene(self):
         # 创建刚体
         self.agv1 = RigidObject(self.cfg.agv1_cfg)
@@ -817,13 +230,6 @@ class AgvTransportEnv(DirectRLEnv):
                 waypoint_marker_cfg,
                 translation=(waypoint[0], waypoint[1], 0.02),
             )
-
-        # V5.2-A：生成路径两侧宽通道低矮物理边界。
-        self._spawn_path_boundary_walls()
-
-        # V5.3-A0：在 Payload 根 prim 下添加轻度异形凸起子碰撞体。
-        # 该凸起会随 env_0 一同 clone 到全部并行环境。
-        self._spawn_irregular_payload_lobes()
 
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
@@ -1062,20 +468,18 @@ class AgvTransportEnv(DirectRLEnv):
         contact_count = contact_flags_float.sum(dim=1)
 
         (
-            heading_to_payload_center,
-            heading_parallel_to_payload,
+            heading_to_payload,
             front_dists,
             rear_dists,
             v_actions,
         ) = self._compute_contact_geometry(payload_xy)
 
-        # 有效推动朝向不再要求侧车指向 payload 质心。
-        # 对宽矩形 payload，侧车若追求“车头指向质心”，会自然形成 V 型内扣，
-        # 压缩中心车空间。这里改为奖励 AGV 车头与 payload 车身朝向一致，
-        # 使三车以近似平行姿态推送。
+        # 车头是否合理朝向 payload。
+        # heading_to_payload = 1 表示车头正对 payload；
+        # heading_to_payload = -1 表示车尾正对 payload。
         front_facing_score = torch.clamp(
             (
-                heading_parallel_to_payload - self.cfg.front_contact_heading_min
+                heading_to_payload - self.cfg.front_contact_heading_min
             )
             / (1.0 - self.cfg.front_contact_heading_min),
             min=0.0,
@@ -1102,13 +506,12 @@ class AgvTransportEnv(DirectRLEnv):
             dim=1,
         ) / 3.0
 
-        # 接触时车头若未与 payload 车身方向保持一致，给软惩罚。
-        # 该项与 push_utility 使用同一平行朝向指标，避免重新引入侧车内扣梯度。
+        # 接触时车头明显没有朝向 payload，也给软惩罚。
         bad_contact_heading_penalty = torch.sum(
             contact_flags_float
             * torch.square(
                 torch.clamp(
-                    self.cfg.front_contact_heading_min - heading_parallel_to_payload,
+                    self.cfg.front_contact_heading_min - heading_to_payload,
                     min=0.0,
                 )
             ),
@@ -1164,20 +567,10 @@ class AgvTransportEnv(DirectRLEnv):
 
         # 如果只有一台 AGV 在推，second_push 接近 0，two_pusher_gate 接近 0；
         # 第二台 AGV 也有效推时，主要 progress / success reward 才逐步放大。
-        base_two_pusher_gate = torch.clamp(
+        two_pusher_gate = torch.clamp(
             second_push_utility / self.cfg.two_pusher_gate_threshold,
             min=0.0,
             max=1.0,
-        )
-
-        # 提取当前路径段是否处于显著转弯状态
-        is_turning = (torch.abs(active_segment_dir[:, 1]) > self.cfg.turn_role_y_threshold).float()
-
-        # 转弯豁免机制：如果是转弯段，强行提振 two_pusher_gate，允许外侧单车合法发力推进而不被重罚
-        two_pusher_gate = torch.where(
-            is_turning > 0.5,
-            torch.clamp(base_two_pusher_gate + 0.6, max=1.0),
-            base_two_pusher_gate
         )
 
         # D0A0g-easy：soft corridor-gated progress reward。
@@ -1265,43 +658,24 @@ class AgvTransportEnv(DirectRLEnv):
             min=0.0,
             max=1.0,
         )
-        # 增加以下双向对称角色切换逻辑：
-        # 1. 右转/下拐判定 (主动招募左侧车 AGV2 发力，压制右侧车 AGV3)
+
+        # D0A0i：转弯方向感知的角色切换。
+        # 当 active segment 的 y 分量明显为负时，说明当前段需要向下/右拐。
+        # 此时鼓励 AGV2 靠近有效接触带并产生有效推动，轻微抑制 AGV3 继续强推，
+        # 以给 payload 提供更合适的转向力矩。
         right_turn_gate = (
-                active_segment_dir[:, 1] < -self.cfg.turn_role_y_threshold
+            active_segment_dir[:, 1] < -self.cfg.turn_role_y_threshold
         ).float()
 
-        agv2_right_turn_push_reward = right_turn_gate * push_utility[:, 1]
-        agv2_right_turn_contact_reward = right_turn_gate * torch.clamp(
+        agv2_turn_push_reward = right_turn_gate * push_utility[:, 1]
+
+        agv2_turn_contact_zone_reward = right_turn_gate * torch.clamp(
             1.0 - contact_zone_errors[:, 1] / self.cfg.turn_role_contact_zone_norm,
             min=0.0,
             max=1.0,
         )
-        agv3_right_turn_penalty = right_turn_gate * push_utility[:, 2]
 
-        # 2. 左转/上拐判定 (主动招募右侧车 AGV3 发力，压制左侧车 AGV2)
-        left_turn_gate = (
-                active_segment_dir[:, 1] > self.cfg.turn_role_y_threshold
-        ).float()
-
-        agv3_left_turn_push_reward = left_turn_gate * push_utility[:, 2]
-        agv3_left_turn_contact_reward = left_turn_gate * torch.clamp(
-            1.0 - contact_zone_errors[:, 2] / self.cfg.turn_role_contact_zone_norm,
-            min=0.0,
-            max=1.0,
-        )
-        agv2_left_turn_penalty = left_turn_gate * push_utility[:, 1]
-
-        # 3. 汇总为对称的统一控制项
-        turn_push_reward = agv2_right_turn_push_reward + agv3_left_turn_push_reward
-        turn_contact_reward = agv2_right_turn_contact_reward + agv3_left_turn_contact_reward
-        turn_opposite_penalty = agv3_right_turn_penalty + agv2_left_turn_penalty
-
-        # ======== 【新增段落：AGV1 转弯让权判定】 ========
-        is_turning_gate = torch.clamp(right_turn_gate + left_turn_gate, max=1.0)
-        # 如果处于转弯段，AGV1 若继续强行输出正向推力，将受到计算
-        agv1_turn_penalty = is_turning_gate * push_utility[:, 0]
-        # ===================================================
+        agv3_opposite_push_penalty = right_turn_gate * push_utility[:, 2]
 
         # D0A0g-easy：waypoint gate 先关闭，避免从 v4.3f 到强路径约束时任务骤崩。
         # 后续当 path_lat_max 降到 0.25~0.30 后，再把 cfg.enable_waypoint_gate 设为 True。
@@ -1364,12 +738,6 @@ class AgvTransportEnv(DirectRLEnv):
             agv_payload_dists > getattr(self.cfg, "agv_escape_dist_threshold", 2.0),
             dim=1,
         )
-
-        payload_wall_clearance_penalty, agv_wall_clearance_penalty = (
-            self._compute_wall_clearance_penalties(payload_xy)
-        )
-        soft_escape_penalty = self._compute_soft_escape_penalty(payload_xy)
-        wall_stuck_penalty = self._compute_wall_stuck_penalty(payload_xy, two_pusher_gate)
 
         # D0A0c：第三台低贡献 AGV 不必强行参与，但已有两台有效推动时，
         # 低贡献 AGV 应保持低动作、低动作变化率，并处于可重新加入的待命距离。
@@ -1546,6 +914,12 @@ class AgvTransportEnv(DirectRLEnv):
             # 单车推可以获得少量基础进度奖励；两台 AGV 有效推时才获得主要进度奖励。
                 progress_reward
 
+                # 目标距离
+                - 0.8 * payload_goal_dist
+
+                # 距离最终终点
+                - 0.6 * final_goal_dist
+
                 - self.cfg.path_lateral_error_scale * path_lateral_error
                 - self.cfg.path_corridor_penalty_scale * path_corridor_violation * path_corridor_violation
 
@@ -1567,12 +941,10 @@ class AgvTransportEnv(DirectRLEnv):
                 + self.cfg.approach_reward_scale * approach_reward
                 + self.cfg.contact_zone_approach_reward_scale * contact_zone_approach_reward
 
-                # 替换为以下对称计算项：
-                + self.cfg.turn_role_contact_zone_reward_scale * turn_contact_reward
-                + self.cfg.turn_role_push_reward_scale * turn_push_reward
-                - self.cfg.turn_opposite_push_penalty_scale * turn_opposite_penalty
-
-                - getattr(self.cfg, "turn_center_push_penalty_scale", 2.0) * agv1_turn_penalty
+                # D0A0i：右转/下拐段招募 AGV2，轻微抑制 AGV3 继续直推。
+                + self.cfg.turn_role_contact_zone_reward_scale * agv2_turn_contact_zone_reward
+                + self.cfg.turn_role_push_reward_scale * agv2_turn_push_reward
+                - self.cfg.turn_opposite_push_penalty_scale * agv3_opposite_push_penalty
 
                 + waypoint_gate_reward
                 + subgoal_reach_reward
@@ -1616,16 +988,6 @@ class AgvTransportEnv(DirectRLEnv):
                 - 30.0 * out_of_bounds.float()
 
                 - getattr(self.cfg, "agv_escape_penalty_scale", 50.0) * agv_escaped.float()
-
-                # V5.3-A1：hard escape 之前的连续预警惩罚，防止 standby AGV 被逐步甩远。
-                - getattr(self.cfg, "soft_escape_penalty_scale", 0.0) * soft_escape_penalty
-
-                # V5.3-B1：靠墙且 two-pusher gate 崩塌时提前惩罚，避免长时间贴墙卡死。
-                - getattr(self.cfg, "wall_stuck_penalty_scale", 0.0) * wall_stuck_penalty
-
-                # V5.2-B0：物理通道收窄后，轻量约束 AGV/payload 与墙体的安全间隙。
-                - getattr(self.cfg, "payload_wall_clearance_penalty_scale", 0.0) * payload_wall_clearance_penalty
-                - getattr(self.cfg, "agv_wall_clearance_penalty_scale", 0.0) * agv_wall_clearance_penalty
 
         )
 
@@ -2194,22 +1556,9 @@ class AgvTransportEnv(DirectRLEnv):
 
         cos_yaw = torch.cos(payload_yaw)
         sin_yaw = torch.sin(payload_yaw)
-        payload_heading_xy = torch.stack(
-            (
-                cos_yaw,
-                sin_yaw,
-            ),
-            dim=1,
-        )
 
         payload_half_x = 0.5 * self.cfg.payload_size[0]
-        payload_half_y = float(
-            getattr(
-                self.cfg,
-                "payload_contact_half_width_y",
-                0.5 * self.cfg.payload_size[1],
-            )
-        )
+        payload_half_y = 0.5 * self.cfg.payload_size[1]
         agv_half_length = 0.5 * self.cfg.agv_size[0]
         agv_half_width = 0.5 * self.cfg.agv_size[1]
 
@@ -2266,14 +1615,11 @@ class AgvTransportEnv(DirectRLEnv):
                 & (front_y_min < payload_half_y + y_margin)
             )
 
-            # Contact flag 的朝向 gate 必须与有效推动奖励保持同一语义：
-            # 前端接触车辆应与 payload 车身朝向平行，而不是朝向 payload 质心。
-            # 否则侧车会重新被诱导向中心偏头，形成 V 型挤压。
-            heading_parallel_to_payload = torch.sum(
-                agv_heading_xy * payload_heading_xy,
-                dim=1,
-            )
-            front_facing = heading_parallel_to_payload > self.cfg.front_contact_heading_min
+            to_payload = payload_xy - agv_xy
+            to_payload_dist = torch.linalg.norm(to_payload, dim=1, keepdim=True).clamp_min(1e-6)
+            dir_to_payload = to_payload / to_payload_dist
+            heading_to_payload = torch.sum(agv_heading_xy * dir_to_payload, dim=1)
+            front_facing = heading_to_payload > self.cfg.front_contact_heading_min
 
             contact_flags.append(rear_band_ok & lateral_overlap_ok & front_facing)
 
@@ -2293,13 +1639,7 @@ class AgvTransportEnv(DirectRLEnv):
         sin_yaw = torch.sin(payload_yaw)
 
         payload_half_x = 0.5 * self.cfg.payload_size[0]
-        payload_half_y = float(
-            getattr(
-                self.cfg,
-                "payload_contact_half_width_y",
-                0.5 * self.cfg.payload_size[1],
-            )
-        )
+        payload_half_y = 0.5 * self.cfg.payload_size[1]
         agv_half_length = 0.5 * self.cfg.agv_size[0]
         agv_half_width = 0.5 * self.cfg.agv_size[1]
 
@@ -2355,39 +1695,22 @@ class AgvTransportEnv(DirectRLEnv):
         return torch.stack(errors, dim=1)
 
     def _compute_contact_geometry(self, payload_xy: torch.Tensor | None = None):
-        """计算 AGV 与 payload 的接触几何关系。
+        """计算 AGV 与 payload 的前后接触几何关系。
 
         返回：
-            heading_to_payload_center:
-                AGV 车头方向与 AGV->payload 质心方向的点积，shape=[num_envs, 3]。
-                仅用于车尾倒推、异常接触等几何诊断。
-            heading_parallel_to_payload:
-                AGV 车头方向与 payload 当前车身朝向的点积，shape=[num_envs, 3]。
-                用于有效前端推动奖励，避免侧车为了最大化奖励而朝 payload
-                质心内扣。
-            front_dists:
-                每台 AGV 前端点到 payload 质心的距离，shape=[num_envs, 3]。
-            rear_dists:
-                每台 AGV 后端点到 payload 质心的距离，shape=[num_envs, 3]。
-            v_actions:
-                每台 AGV 当前线速度动作，shape=[num_envs, 3]。
+            heading_to_payload: 每台 AGV 车头方向与 AGV->payload 方向的点积，shape [num_envs, 3]
+                > 0 表示车头大致朝向 payload；
+                < 0 表示车尾大致朝向 payload。
+            front_dists: 每台 AGV 前端点到 payload 中心的距离，shape [num_envs, 3]
+            rear_dists: 每台 AGV 后端点到 payload 中心的距离，shape [num_envs, 3]
+            v_actions: 每台 AGV 当前线速度动作，shape [num_envs, 3]
         """
         if payload_xy is None:
             payload_xy = self.payload.data.root_pos_w[:, :2]
 
         half_length = 0.5 * self.cfg.agv_size[0]
 
-        payload_yaw = self._get_payload_yaw()
-        payload_heading_xy = torch.stack(
-            (
-                torch.cos(payload_yaw),
-                torch.sin(payload_yaw),
-            ),
-            dim=1,
-        )
-
-        heading_to_payload_center_list = []
-        heading_parallel_to_payload_list = []
+        heading_to_payload_list = []
         front_dist_list = []
         rear_dist_list = []
         v_action_list = []
@@ -2409,14 +1732,11 @@ class AgvTransportEnv(DirectRLEnv):
                 dim=1,
                 keepdim=True,
             ).clamp_min(1e-6)
+
             dir_to_payload = to_payload / to_payload_dist
 
-            heading_to_payload_center = torch.sum(
+            heading_to_payload = torch.sum(
                 agv_heading_xy * dir_to_payload,
-                dim=1,
-            )
-            heading_parallel_to_payload = torch.sum(
-                agv_heading_xy * payload_heading_xy,
                 dim=1,
             )
 
@@ -2426,31 +1746,17 @@ class AgvTransportEnv(DirectRLEnv):
             front_dist = torch.linalg.norm(front_xy - payload_xy, dim=1)
             rear_dist = torch.linalg.norm(rear_xy - payload_xy, dim=1)
 
-            heading_to_payload_center_list.append(heading_to_payload_center)
-            heading_parallel_to_payload_list.append(heading_parallel_to_payload)
+            heading_to_payload_list.append(heading_to_payload)
             front_dist_list.append(front_dist)
             rear_dist_list.append(rear_dist)
             v_action_list.append(self.actions[:, 2 * i])
 
-        heading_to_payload_center = torch.stack(
-            heading_to_payload_center_list,
-            dim=1,
-        )
-        heading_parallel_to_payload = torch.stack(
-            heading_parallel_to_payload_list,
-            dim=1,
-        )
+        heading_to_payload = torch.stack(heading_to_payload_list, dim=1)
         front_dists = torch.stack(front_dist_list, dim=1)
         rear_dists = torch.stack(rear_dist_list, dim=1)
         v_actions = torch.stack(v_action_list, dim=1)
 
-        return (
-            heading_to_payload_center,
-            heading_parallel_to_payload,
-            front_dists,
-            rear_dists,
-            v_actions,
-        )
+        return heading_to_payload, front_dists, rear_dists, v_actions
 
     def _compute_bad_rear_push(self, payload_xy: torch.Tensor | None = None):
         """判断是否出现明显车尾倒推 payload。
@@ -2464,8 +1770,7 @@ class AgvTransportEnv(DirectRLEnv):
         contact_flags = self._compute_contact_flags().float()
 
         (
-            heading_to_payload_center,
-            _,
+            heading_to_payload,
             front_dists,
             rear_dists,
             v_actions,
@@ -2476,7 +1781,7 @@ class AgvTransportEnv(DirectRLEnv):
         ).float()
 
         heading_away_from_payload = (
-            heading_to_payload_center < self.cfg.bad_rear_heading_threshold
+            heading_to_payload < self.cfg.bad_rear_heading_threshold
         ).float()
 
         reversing = (
