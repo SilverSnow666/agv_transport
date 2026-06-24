@@ -14,7 +14,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 class AgvTransportEnvCfg(DirectRLEnvCfg):
     """三 AGV 无连接协同推送任务配置。
 
-    当前版本：V5.3-B1-wall-stuck-prevention。
+    当前版本：V5.3-C0-com-offset。
 
     阶段目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证既有 V5.1C / V5.2-A5 策略是否能安全迁移。
@@ -143,6 +143,7 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     payload_init_pos = (0.0, 0.0, 0.15)
 
     # V5.3-B1：增强轻度几何异形件 + wall-stuck prevention。
+    # V5.3-C0：在 B1 稳定基线基础上加入轻度 payload CoM 偏移。
     # 不改变主 payload 的质量、质心与基础矩形尺寸，只在 payload 刚体下添加一个更小的轻度侧向凸起碰撞体，
     # 让接触边界变成非矩形。该附加块作为 Payload 的子 collider 参与同一刚体碰撞，
     # 目标是在不引入 CoM 偏移的前提下，验证既有双侧转弯招募策略对轻度几何非对称的迁移能力。
@@ -167,7 +168,21 @@ class AgvTransportEnvCfg(DirectRLEnvCfg):
     payload_contact_half_width_y = 0.72
     payload_clearance_half_width_y = 0.72
 
-    # 目标点，基于每个 env 原点的局部坐标
+
+    # V5.3-C0：轻度质心偏移 / 质量分布不对称。
+    # 只改变 Payload 根刚体的 center of mass，不改变外部接触轮廓、墙体、
+    # contact envelope、soft escape 或 wall-stuck prevention。
+    # 第一阶段必须保守：3~5 cm 级别即可，用于验证 B1 策略对偏置力矩的迁移性。
+    enable_payload_com_offset = True
+    payload_com_offset = (0.15, 0.15, 0.0)
+
+    
+
+    # V5.3-COM-VERIFY: print USD MassAPI values for CoM validation.
+    # This does not change reward, contact, wall, or payload geometry.
+    enable_payload_com_debug_print = True
+    payload_com_debug_print_once = True
+# 目标点，基于每个 env 原点的局部坐标
     #用于兼容旧模型
     target_pos = (3.10, 0.0, 0.0)
 

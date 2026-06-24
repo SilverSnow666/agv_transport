@@ -11,12 +11,12 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from .agv_transport_env_cfg import AgvTransportEnvCfg
-from pxr import Usd, UsdGeom
+from pxr import Usd, UsdGeom, UsdPhysics, Gf
 
 class AgvTransportEnv(DirectRLEnv):
     """三 AGV 无连接协同推送 payload 的 DirectRLEnv 环境。
 
-    当前版本：V5.3-B1-wall-stuck-prevention。
+    当前版本：V5.3-C0-com-offset。
 
     目标：在 V5.2-A5 物理边界 zero-shot 成功基础上，小幅收窄物理通道，
     并加入轻量 wall-clearance penalty，验证 AGV2/AGV3 侧推策略在更强边界约束下是否仍稳定。
@@ -540,6 +540,92 @@ class AgvTransportEnv(DirectRLEnv):
                 orientation=(1.0, 0.0, 0.0, 0.0),
             )
 
+
+    def _apply_payload_com_offset(self) -> None:
+        """Apply and debug-print Payload root CoM offset.
+
+        This method is intentionally limited to USD Physics MassAPI attributes
+        on /World/envs/env_0/Payload.  It does not change payload collision
+        geometry, contact envelope, wall geometry, reward terms, soft escape,
+        or wall-stuck prevention.
+
+        The debug print proves that USD attributes are written/read back.  It
+        does not by itself prove that PhysX dynamics uses the offset; that must
+        be checked by comparing zero-shot rollouts under different offsets.
+        """
+        if not bool(getattr(self.cfg, "enable_payload_com_offset", False)):
+            if bool(getattr(self.cfg, "enable_payload_com_debug_print", False)):
+                print("[V5.3-COM] enable_payload_com_offset=False; no CoM offset applied.")
+            return
+
+        stage = sim_utils.get_current_stage()
+        payload_path = "/World/envs/env_0/Payload"
+        payload_prim = stage.GetPrimAtPath(payload_path)
+        if not payload_prim.IsValid():
+            raise RuntimeError(f"Cannot apply payload CoM offset: {payload_path} does not exist.")
+
+        if payload_prim.HasAPI(UsdPhysics.MassAPI):
+            mass_api = UsdPhysics.MassAPI(payload_prim)
+        else:
+            mass_api = UsdPhysics.MassAPI.Apply(payload_prim)
+
+        com = tuple(float(v) for v in getattr(self.cfg, "payload_com_offset", (0.0, 0.0, 0.0)))
+        if len(com) != 3:
+            raise ValueError("payload_com_offset must be a 3D tuple: (x, y, z).")
+
+        mass = float(getattr(self.cfg, "payload_mass", 24.0))
+
+        mass_attr = mass_api.GetMassAttr()
+        if not mass_attr:
+            mass_attr = mass_api.CreateMassAttr()
+        mass_attr.Set(mass)
+
+        com_attr = mass_api.GetCenterOfMassAttr()
+        if not com_attr:
+            com_attr = mass_api.CreateCenterOfMassAttr()
+        com_attr.Set(Gf.Vec3f(com[0], com[1], com[2]))
+
+        if bool(getattr(self.cfg, "enable_payload_com_debug_print", False)):
+            print(
+                "[V5.3-COM] before_clone path="
+                f"{payload_path}, requested_com={com}, "
+                f"usd_mass={mass_attr.Get()}, usd_centerOfMass={com_attr.Get()}"
+            )
+
+    def _debug_print_payload_mass_api(self, label: str = "after_clone") -> None:
+        """Print Payload MassAPI values from env_0 and, if available, env_1.
+
+        This is a diagnostic only.  It verifies authored USD attributes on the
+        cloned prims; rollout comparison is still required to verify effective
+        PhysX dynamics.
+        """
+        if not bool(getattr(self.cfg, "enable_payload_com_debug_print", False)):
+            return
+        if bool(getattr(self.cfg, "payload_com_debug_print_once", True)) and getattr(
+            self, "_payload_com_debug_printed", False
+        ):
+            return
+
+        stage = sim_utils.get_current_stage()
+        max_envs = min(int(getattr(self, "num_envs", 1)), 2)
+        for env_id in range(max_envs):
+            payload_path = f"/World/envs/env_{env_id}/Payload"
+            prim = stage.GetPrimAtPath(payload_path)
+            if not prim.IsValid():
+                print(f"[V5.3-COM] {label} path={payload_path}: prim not found")
+                continue
+            if not prim.HasAPI(UsdPhysics.MassAPI):
+                print(f"[V5.3-COM] {label} path={payload_path}: no MassAPI")
+                continue
+            mass_api = UsdPhysics.MassAPI(prim)
+            mass_attr = mass_api.GetMassAttr()
+            com_attr = mass_api.GetCenterOfMassAttr()
+            mass = mass_attr.Get() if mass_attr else None
+            com = com_attr.Get() if com_attr else None
+            print(f"[V5.3-COM] {label} path={payload_path}, usd_mass={mass}, usd_centerOfMass={com}")
+
+        self._payload_com_debug_printed = True
+
     def _get_manual_boundary_world_points(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return manual physical boundary centerlines in world frame.
 
@@ -821,9 +907,13 @@ class AgvTransportEnv(DirectRLEnv):
         # V5.2-A：生成路径两侧宽通道低矮物理边界。
         self._spawn_path_boundary_walls()
 
-        # V5.3-A0：在 Payload 根 prim 下添加轻度异形凸起子碰撞体。
+        # V5.3-A0/B1：在 Payload 根 prim 下添加轻度异形凸起子碰撞体。
         # 该凸起会随 env_0 一同 clone 到全部并行环境。
         self._spawn_irregular_payload_lobes()
+
+        # V5.3-C0：只引入轻度质心偏移，不改变外部接触轮廓。
+        # 必须在 clone_environments 前应用，使所有并行环境继承相同质量属性。
+        self._apply_payload_com_offset()
 
         # 添加 Isaac Sim 自带小车 / AGV 视觉模型
         # 注意：它只是视觉模型，真正的碰撞和推动仍由 /AGV 这个简化刚体负责
@@ -837,6 +927,9 @@ class AgvTransportEnv(DirectRLEnv):
 
         # 克隆多环境
         self.scene.clone_environments(copy_from_source=False)
+
+        # V5.3-COM-VERIFY: print cloned Payload MassAPI values.
+        self._debug_print_payload_mass_api("after_clone")
 
         # 隐藏简化碰撞方块的视觉显示，只保留小车外观
         self._hide_agv_collision_visual()
