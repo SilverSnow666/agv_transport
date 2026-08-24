@@ -28,13 +28,17 @@ class AgvLevelCarryEnv(DirectRLEnv):
 
     cfg: AgvLevelCarryEnvCfg
 
-    def __init__(self, cfg: AgvCarryEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: AgvLevelCarryEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.prev_actions = torch.zeros_like(self.actions)
         self.agv_yaw = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_planar_vel = torch.zeros((self.num_envs, 3, 2), device=self.device)
+        self.lift_height = torch.full(
+            (self.num_envs, 3), float(self.cfg.lift_neutral_height), device=self.device
+        )
+        self.lift_velocity = torch.zeros((self.num_envs, 3), device=self.device)
 
         target_xy = self._get_target_xy()
         payload_xy = self.payload.data.root_pos_w[:, :2]
@@ -64,12 +68,19 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.agv1 = RigidObject(self.cfg.agv1_cfg)
         self.agv2 = RigidObject(self.cfg.agv2_cfg)
         self.agv3 = RigidObject(self.cfg.agv3_cfg)
+        self.lift1 = RigidObject(self.cfg.lift1_cfg)
+        self.lift2 = RigidObject(self.cfg.lift2_cfg)
+        self.lift3 = RigidObject(self.cfg.lift3_cfg)
         self.payload = RigidObject(self.cfg.payload_cfg)
         self.agvs = [self.agv1, self.agv2, self.agv3]
+        self.lifts = [self.lift1, self.lift2, self.lift3]
 
         self.scene.rigid_objects["agv1"] = self.agv1
         self.scene.rigid_objects["agv2"] = self.agv2
         self.scene.rigid_objects["agv3"] = self.agv3
+        self.scene.rigid_objects["lift1"] = self.lift1
+        self.scene.rigid_objects["lift2"] = self.lift2
+        self.scene.rigid_objects["lift3"] = self.lift3
         self.scene.rigid_objects["payload"] = self.payload
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -282,8 +293,37 @@ class AgvLevelCarryEnv(DirectRLEnv):
             agv.write_root_pose_to_sim(agv_state[:, :7])
             agv.write_root_velocity_to_sim(agv_state[:, 7:])
 
+        # V7.0-A keeps all three plates at their neutral extension.  They are
+        # independent kinematic rigid bodies and have no joints to the board.
+        self.lift_velocity.zero_()
+        self._update_lift_poses()
+
         if bool(getattr(self.cfg, "enable_virtual_friction_carry", False)):
             self._apply_virtual_friction_carry(dt)
+
+    def _update_lift_poses(self, env_ids: torch.Tensor | None = None) -> None:
+        """Place each Lift Plate above its AGV while preserving independent lift state."""
+        if env_ids is None:
+            env_ids = self.payload._ALL_INDICES
+
+        for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
+            agv_state = agv.data.root_state_w[env_ids]
+            lift_pose = torch.zeros((len(env_ids), 7), device=self.device)
+            lift_pose[:, 0:2] = agv_state[:, 0:2]
+            lift_pose[:, 2] = (
+                agv_state[:, 2]
+                + 0.5 * float(self.cfg.agv_size[2])
+                + self.lift_height[env_ids, i]
+                + 0.5 * float(self.cfg.lift_plate_size[2])
+            )
+            lift_pose[:, 3:7] = self._yaw_to_quat(self.agv_yaw[env_ids, i])
+
+            lift_velocity = torch.zeros((len(env_ids), 6), device=self.device)
+            lift_velocity[:, 0:2] = agv_state[:, 7:9]
+            lift_velocity[:, 2] = self.lift_velocity[env_ids, i]
+            lift_velocity[:, 5] = agv_state[:, 12]
+            lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
+            lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
 
     def _apply_virtual_friction_carry(self, dt: float) -> None:
         """用虚拟摩擦耦合修正 kinematic 支撑台无法可靠带动 payload 的问题。
@@ -964,6 +1004,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.prev_actions[env_ids] = 0.0
         self.agv_yaw[env_ids] = 0.0
         self.agv_planar_vel[env_ids] = 0.0
+        self.lift_height[env_ids] = float(self.cfg.lift_neutral_height)
+        self.lift_velocity[env_ids] = 0.0
 
         # Payload 初始状态。
         payload_init_pos = torch.tensor(self.cfg.payload_init_pos, device=self.device, dtype=torch.float32)
@@ -996,6 +1038,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
             vel = torch.zeros((num_reset, 6), device=self.device)
             agv.write_root_pose_to_sim(pose, env_ids=env_ids)
             agv.write_root_velocity_to_sim(vel, env_ids=env_ids)
+
+        self._update_lift_poses(env_ids)
 
         self.prev_goal_dist[env_ids] = torch.linalg.norm(target_xy - payload_xy, dim=1)
 
@@ -1063,12 +1107,12 @@ class AgvLevelCarryEnv(DirectRLEnv):
         return torch.linalg.norm(agv_xy - support_targets, dim=2)
 
     def _compute_support_z_gaps(self) -> torch.Tensor:
-        """payload 底面与三台 AGV 顶面的绝对 z gap。"""
+        """payload 底面与三块 Lift Plate 顶面的绝对 z gap。"""
         payload_bottom_z = self.payload.data.root_pos_w[:, 2] - 0.5 * self.cfg.payload_size[2]
         gaps = []
-        for agv in self.agvs:
-            agv_top_z = agv.data.root_pos_w[:, 2] + 0.5 * self.cfg.agv_size[2]
-            gaps.append(torch.abs(payload_bottom_z - agv_top_z))
+        for lift in self.lifts:
+            lift_top_z = lift.data.root_pos_w[:, 2] + 0.5 * self.cfg.lift_plate_size[2]
+            gaps.append(torch.abs(payload_bottom_z - lift_top_z))
         return torch.stack(gaps, dim=1)
 
     def _compute_support_contact_flags(self, support_targets: torch.Tensor) -> torch.Tensor:

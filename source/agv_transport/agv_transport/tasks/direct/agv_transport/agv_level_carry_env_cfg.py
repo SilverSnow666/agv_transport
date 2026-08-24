@@ -47,6 +47,24 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
         scale=(0.45, 0.45, 0.45),
     )
 
+    # ------------------------- V7.0 顶升机构 -------------------------
+
+    # 第一阶段使用理想 kinematic 顶升平台。
+    # lift_height 表示 AGV 顶面到 Lift Plate 底面的垂向伸出量。
+    lift_plate_size = (0.28, 0.28, 0.04)
+    lift_plate_mass = 5.0
+
+    # 顶升行程。
+    lift_min_height = 0.00
+    lift_max_height = 0.12
+
+    # 中位高度，允许后续向上和向下各补偿约 60 mm。
+    lift_neutral_height = 0.06
+
+    # 后续动态调平时使用，目前 V7.0-A 暂时不控制。
+    max_lift_speed = 0.04  # m/s
+    lift_position_kp = 5.0
+
     # ------------------------- 纯视觉高度补偿 -------------------------
     # 物理代理尺寸、根节点高度和 payload 物理高度全部恢复 V6.2.1。
     # 这里只改变无碰撞外观子节点的局部变换，避免再次改变 checkpoint 的状态分布。
@@ -56,9 +74,9 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
 
     # V6.2.1 的 payload 物理中心比 V6.2.3 高 0.064 m
     # （代理顶面差 0.055 m + clearance 差 0.009 m）。黄色外观单独向下补偿。
-    payload_visual_translation = (0.0, 0.0, -0.064)
+    payload_visual_translation = (0.0, 0.0, 0.0)
     payload_visual_cfg = sim_utils.CuboidCfg(
-        size=(1.20, 0.95, 0.18),
+        size=(1.60, 1.20, 0.08),
         visual_material=sim_utils.PreviewSurfaceCfg(
             diffuse_color=(1.0, 0.55, 0.0), metallic=0.0
         ),
@@ -74,19 +92,30 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     agv_center_z = 0.08
     agv_top_z = agv_center_z + 0.5 * agv_size[2]
 
-    # payload 是被三车共同承载的动态刚体。
-    payload_size = (1.20, 0.95, 0.18)
-    payload_mass = 22.0
+    # V7.0 carrier board.
+    # 暂时沿用 payload 变量名，后续加入独立 Cargo 后再正式重命名。
+    payload_size = (1.60, 1.20, 0.08)
+    payload_mass = 12.0
+
     # 保持 V6.2.1 的物理支撑间隙与初始高度，确保旧 checkpoint 兼容。
-    payload_init_z = agv_top_z + 0.5 * payload_size[2] + 0.012
+    board_support_clearance = 0.003
+
+    payload_init_z = (
+            agv_top_z
+            + lift_neutral_height
+            + lift_plate_size[2]
+            + 0.5 * payload_size[2]
+            + board_support_clearance
+    )
+
     payload_init_pos = (0.0, 0.0, payload_init_z)
 
     # 支撑三角形：local_x 为运输方向，local_y 为横向。
     # AGV1 在前中，AGV2 在后左，AGV3 在后右。三点都位于 payload 投影内。
     support_offsets_xy = (
-        (0.38, 0.00),
-        (-0.34, 0.42),
-        (-0.34, -0.42),
+        (0.50, 0.00),
+        (-0.40, 0.45),
+        (-0.40, -0.45),
     )
 
     agv_init_positions = (
@@ -148,7 +177,7 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 因此这里加入一个可关闭的虚拟摩擦/无滑移耦合项：只在至少两台 AGV 仍处于支撑
     # 区域时，把 payload 平面速度软耦合到支撑平台平均速度，并用滑移误差做小幅修正。
     # 后续若升级为真实轮式 articulation 或可产生真实切向摩擦的动态支撑平台，可关闭此项。
-    enable_virtual_friction_carry = True
+    enable_virtual_friction_carry = False
     # 软约束版：训练早期允许至少两车有效支撑时产生有限虚拟摩擦，
     # 但 reward 会通过 contact/formation/slip quality 鼓励最终三车稳定支撑。
     virtual_friction_min_contacts = 2.0
@@ -169,7 +198,7 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 可选：模拟支撑面高度扰动。V6.0 默认关闭；V6.1 再打开。
     # 这不是完整轮-地坑洼模型，只是让 kinematic 支撑台 z 方向随位置变化，
     # 用于验证 payload 颠簸/姿态稳定 reward 是否有效。
-    enable_bumpy_support = True
+    enable_bumpy_support = False
     # V6.2：仍保持轻度起伏，但加入相位，避免 y=0 中心线完全平坦，便于视觉观察。
     # 如果训练明显变差，先把 bump_amplitude 降回 0.020。
     bump_amplitude = 0.030
@@ -316,6 +345,11 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
         dynamic_friction=0.95,
         restitution=0.0,
     )
+    _lift_material = sim_utils.RigidBodyMaterialCfg(
+        static_friction=1.30,
+        dynamic_friction=1.10,
+        restitution=0.0,
+    )
 
     agv1_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/AGV1",
@@ -363,6 +397,65 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.05, 0.05, 0.05), metallic=0.0),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=agv_init_positions[2], rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    lift_init_z = agv_top_z + lift_neutral_height + 0.5 * lift_plate_size[2]
+
+    lift1_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift1",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=_lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.45, 0.85), metallic=0.15),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(support_offsets_xy[0][0], support_offsets_xy[0][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    lift2_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift2",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=_lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.45, 0.85), metallic=0.15),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(support_offsets_xy[1][0], support_offsets_xy[1][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    lift3_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift3",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=_lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.45, 0.85), metallic=0.15),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(support_offsets_xy[2][0], support_offsets_xy[2][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
     )
 
     payload_cfg: RigidObjectCfg = RigidObjectCfg(
