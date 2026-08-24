@@ -26,3 +26,16 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_carry_cfg.yaml",
     },
 )
+
+# V7.0 active-leveling carrying task:
+# three AGVs support a common carrier board and will later
+# regulate independent lift heights for active leveling.
+gym.register(
+    id="Template-Agv-Level-Carry-Direct-v0",
+    entry_point=f"{__name__}.agv_level_carry_env:AgvLevelCarryEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.agv_level_carry_env_cfg:AgvLevelCarryEnvCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_carry_cfg.yaml",
+    },
+)
