@@ -35,6 +35,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.prev_actions = torch.zeros_like(self.actions)
         self.agv_yaw = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_planar_vel = torch.zeros((self.num_envs, 3, 2), device=self.device)
+        self.base_z_disturbance = torch.zeros((self.num_envs, 3), device=self.device)
+        self.lift_target_height = torch.full(
+            (self.num_envs, 3), float(self.cfg.lift_neutral_height), device=self.device
+        )
         self.lift_height = torch.full(
             (self.num_envs, 3), float(self.cfg.lift_neutral_height), device=self.device
         )
@@ -275,7 +279,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
             rel_xy = torch.clamp(new_xy - env_xy, -self.cfg.workspace_limit, self.cfg.workspace_limit)
             new_xy = env_xy + rel_xy
             local_xy = new_xy - env_xy
-            z = self.cfg.agv_center_z + self._terrain_height(local_xy)
+            z = self.cfg.agv_center_z + self._terrain_height(local_xy) + self.base_z_disturbance[:, i]
 
             quat = self._yaw_to_quat(self.agv_yaw[:, i])
             agv_state[:, 0:2] = new_xy
@@ -293,9 +297,29 @@ class AgvLevelCarryEnv(DirectRLEnv):
             agv.write_root_pose_to_sim(agv_state[:, :7])
             agv.write_root_velocity_to_sim(agv_state[:, 7:])
 
-        # V7.0-A keeps all three plates at their neutral extension.  They are
-        # independent kinematic rigid bodies and have no joints to the board.
-        self.lift_velocity.zero_()
+        # V7.0-B: independent ideal lift actuators track bounded targets at a
+        # finite speed.  This update runs once per environment step, so ``dt``
+        # includes simulation decimation.
+        lift_target = torch.clamp(
+            self.lift_target_height,
+            min=float(self.cfg.lift_min_height),
+            max=float(self.cfg.lift_max_height),
+        )
+        lift_error = lift_target - self.lift_height
+        self.lift_velocity[:] = torch.clamp(
+            float(self.cfg.lift_position_kp) * lift_error,
+            min=-float(self.cfg.max_lift_speed),
+            max=float(self.cfg.max_lift_speed),
+        )
+        next_lift_height = self.lift_height + self.lift_velocity * dt
+        reached_target = (lift_error * (lift_target - next_lift_height)) <= 0.0
+        self.lift_height[:] = torch.where(reached_target, lift_target, next_lift_height)
+        self.lift_height.clamp_(
+            min=float(self.cfg.lift_min_height), max=float(self.cfg.lift_max_height)
+        )
+        self.lift_velocity[:] = torch.where(
+            reached_target, torch.zeros_like(self.lift_velocity), self.lift_velocity
+        )
         self._update_lift_poses()
 
         if bool(getattr(self.cfg, "enable_virtual_friction_carry", False)):
@@ -1004,6 +1028,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.prev_actions[env_ids] = 0.0
         self.agv_yaw[env_ids] = 0.0
         self.agv_planar_vel[env_ids] = 0.0
+        self.base_z_disturbance[env_ids] = 0.0
+        self.lift_target_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_velocity[env_ids] = 0.0
 
@@ -1033,7 +1059,11 @@ class AgvLevelCarryEnv(DirectRLEnv):
             pose = torch.zeros((num_reset, 7), device=self.device)
             support_xy = payload_xy + offsets[i, 0] * move_dir + offsets[i, 1] * lateral_dir
             pose[:, 0:2] = support_xy
-            pose[:, 2] = self.cfg.agv_center_z + self._terrain_height(support_xy - env_origins[:, :2])
+            pose[:, 2] = (
+                self.cfg.agv_center_z
+                + self._terrain_height(support_xy - env_origins[:, :2])
+                + self.base_z_disturbance[env_ids, i]
+            )
             pose[:, 3:7] = init_quat
             vel = torch.zeros((num_reset, 6), device=self.device)
             agv.write_root_pose_to_sim(pose, env_ids=env_ids)
