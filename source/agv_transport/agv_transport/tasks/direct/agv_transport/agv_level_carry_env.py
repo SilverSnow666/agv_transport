@@ -43,6 +43,9 @@ class AgvLevelCarryEnv(DirectRLEnv):
             (self.num_envs, 3), float(self.cfg.lift_neutral_height), device=self.device
         )
         self.lift_velocity = torch.zeros((self.num_envs, 3), device=self.device)
+        self.agv_terrain_roll = torch.zeros((self.num_envs, 3), device=self.device)
+        self.agv_terrain_pitch = torch.zeros((self.num_envs, 3), device=self.device)
+        self.agv_terrain_samples = torch.zeros((self.num_envs, 3, 4), device=self.device)
 
         target_xy = self._get_target_xy()
         payload_xy = self.payload.data.root_pos_w[:, :2]
@@ -281,10 +284,19 @@ class AgvLevelCarryEnv(DirectRLEnv):
 
             rel_xy = torch.clamp(new_xy - env_xy, -self.cfg.workspace_limit, self.cfg.workspace_limit)
             new_xy = env_xy + rel_xy
-            local_xy = new_xy - env_xy
-            z = self.cfg.agv_center_z + self._terrain_height(local_xy) + self.base_z_disturbance[:, i]
-
-            quat = self._yaw_to_quat(self.agv_yaw[:, i])
+            terrain_center, terrain_roll, terrain_pitch, terrain_samples = self._sample_agv_terrain_plane(
+                new_xy, self.agv_yaw[:, i]
+            )
+            self.agv_terrain_roll[:, i] = terrain_roll
+            self.agv_terrain_pitch[:, i] = terrain_pitch
+            self.agv_terrain_samples[:, i, :] = terrain_samples
+            quat = self._rpy_to_quat(terrain_roll, terrain_pitch, self.agv_yaw[:, i])
+            local_z = self._quat_rotate_z(quat)
+            z = (
+                terrain_center
+                + self.base_z_disturbance[:, i]
+                + 0.5 * float(self.cfg.agv_size[2]) * local_z[:, 2]
+            )
             agv_state[:, 0:2] = new_xy
             agv_state[:, 2] = z
             agv_state[:, 3:7] = quat
@@ -328,26 +340,26 @@ class AgvLevelCarryEnv(DirectRLEnv):
             self._apply_virtual_friction_carry(dt)
 
     def _update_lift_poses(self, env_ids: torch.Tensor | None = None) -> None:
-        """Place each Lift Plate above its AGV while preserving independent lift state."""
+        """Place each Lift along its AGV local +Z axis with the full AGV attitude."""
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
 
         for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
             agv_state = agv.data.root_state_w[env_ids]
             lift_pose = torch.zeros((len(env_ids), 7), device=self.device)
-            lift_pose[:, 0:2] = agv_state[:, 0:2]
-            lift_pose[:, 2] = (
-                agv_state[:, 2]
-                + 0.5 * float(self.cfg.agv_size[2])
+            local_z = self._quat_rotate_z(agv_state[:, 3:7])
+            axis_offset = (
+                0.5 * float(self.cfg.agv_size[2])
                 + self.lift_height[env_ids, i]
                 + 0.5 * float(self.cfg.lift_plate_size[2])
             )
-            lift_pose[:, 3:7] = self._yaw_to_quat(self.agv_yaw[env_ids, i])
+            lift_pose[:, 0:3] = agv_state[:, 0:3] + local_z * axis_offset.unsqueeze(-1)
+            lift_pose[:, 3:7] = agv_state[:, 3:7]
 
             lift_velocity = torch.zeros((len(env_ids), 6), device=self.device)
             lift_velocity[:, 0:2] = agv_state[:, 7:9]
-            lift_velocity[:, 2] = self.lift_velocity[env_ids, i]
-            lift_velocity[:, 5] = agv_state[:, 12]
+            lift_velocity[:, 0:3] += local_z * self.lift_velocity[env_ids, i].unsqueeze(-1)
+            lift_velocity[:, 3:6] = agv_state[:, 10:13]
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
 
@@ -1034,6 +1046,9 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.lift_target_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_velocity[env_ids] = 0.0
+        self.agv_terrain_roll[env_ids] = 0.0
+        self.agv_terrain_pitch[env_ids] = 0.0
+        self.agv_terrain_samples[env_ids] = 0.0
 
         # Payload 初始状态。
         payload_init_pos = torch.tensor(self.cfg.payload_init_pos, device=self.device, dtype=torch.float32)
@@ -1053,7 +1068,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
         move_dir = direction / direction_norm
         lateral_dir = torch.stack((-move_dir[:, 1], move_dir[:, 0]), dim=1)
         init_yaw = torch.atan2(move_dir[:, 1], move_dir[:, 0])
-        init_quat = self._yaw_to_quat(init_yaw)
         self.agv_yaw[env_ids] = init_yaw.unsqueeze(1).repeat(1, 3)
 
         offsets = torch.tensor(self.cfg.support_offsets_xy, device=self.device, dtype=torch.float32)
@@ -1061,12 +1075,20 @@ class AgvLevelCarryEnv(DirectRLEnv):
             pose = torch.zeros((num_reset, 7), device=self.device)
             support_xy = payload_xy + offsets[i, 0] * move_dir + offsets[i, 1] * lateral_dir
             pose[:, 0:2] = support_xy
-            pose[:, 2] = (
-                self.cfg.agv_center_z
-                + self._terrain_height(support_xy - env_origins[:, :2])
-                + self.base_z_disturbance[env_ids, i]
+            terrain_center, terrain_roll, terrain_pitch, terrain_samples = self._sample_agv_terrain_plane(
+                support_xy, init_yaw, env_origins[:, :2]
             )
-            pose[:, 3:7] = init_quat
+            self.agv_terrain_roll[env_ids, i] = terrain_roll
+            self.agv_terrain_pitch[env_ids, i] = terrain_pitch
+            self.agv_terrain_samples[env_ids, i, :] = terrain_samples
+            quat = self._rpy_to_quat(terrain_roll, terrain_pitch, init_yaw)
+            local_z = self._quat_rotate_z(quat)
+            pose[:, 2] = (
+                terrain_center
+                + self.base_z_disturbance[env_ids, i]
+                + 0.5 * float(self.cfg.agv_size[2]) * local_z[:, 2]
+            )
+            pose[:, 3:7] = quat
             vel = torch.zeros((num_reset, 6), device=self.device)
             agv.write_root_pose_to_sim(pose, env_ids=env_ids)
             agv.write_root_velocity_to_sim(vel, env_ids=env_ids)
@@ -1143,7 +1165,11 @@ class AgvLevelCarryEnv(DirectRLEnv):
         payload_bottom_z = self.payload.data.root_pos_w[:, 2] - 0.5 * self.cfg.payload_size[2]
         gaps = []
         for lift in self.lifts:
-            lift_top_z = lift.data.root_pos_w[:, 2] + 0.5 * self.cfg.lift_plate_size[2]
+            local_z = self._quat_rotate_z(lift.data.root_quat_w)
+            lift_top_z = (
+                lift.data.root_pos_w[:, 2]
+                + 0.5 * float(self.cfg.lift_plate_size[2]) * local_z[:, 2]
+            )
             gaps.append(torch.abs(payload_bottom_z - lift_top_z))
         return torch.stack(gaps, dim=1)
 
@@ -1264,6 +1290,50 @@ class AgvLevelCarryEnv(DirectRLEnv):
         phase_y = float(getattr(self.cfg, "bump_phase_y", 0.0))
         return amp * math.sin(kx * float(x) + phase_x) * math.sin(ky * float(y) + phase_y)
 
+    def _sample_agv_terrain_plane(
+        self, world_xy: torch.Tensor, yaw: torch.Tensor, env_xy: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample four equivalent contacts and fit the local support-plane attitude.
+
+        Sample order is front-left, front-right, rear-left, rear-right.  The
+        analytic terrain is expressed in environment-local coordinates while
+        the footprint offsets rotate with the commanded AGV yaw.
+        """
+        half_wheelbase = 0.5 * float(self.cfg.terrain_contact_wheelbase)
+        half_track = 0.5 * float(self.cfg.terrain_contact_track)
+        local_contacts = torch.tensor(
+            (
+                (half_wheelbase, half_track),
+                (half_wheelbase, -half_track),
+                (-half_wheelbase, half_track),
+                (-half_wheelbase, -half_track),
+            ),
+            device=self.device,
+            dtype=world_xy.dtype,
+        )
+        cos_yaw = torch.cos(yaw).unsqueeze(1)
+        sin_yaw = torch.sin(yaw).unsqueeze(1)
+        offset_x = cos_yaw * local_contacts[None, :, 0] - sin_yaw * local_contacts[None, :, 1]
+        offset_y = sin_yaw * local_contacts[None, :, 0] + cos_yaw * local_contacts[None, :, 1]
+        sample_xy_w = world_xy[:, None, :] + torch.stack((offset_x, offset_y), dim=2)
+        if env_xy is None:
+            env_xy = self.scene.env_origins[:, :2]
+        samples = self._terrain_height(
+            (sample_xy_w - env_xy[:, None, :]).reshape(-1, 2)
+        ).reshape(-1, 4)
+
+        front_mean = 0.5 * (samples[:, 0] + samples[:, 1])
+        rear_mean = 0.5 * (samples[:, 2] + samples[:, 3])
+        left_mean = 0.5 * (samples[:, 0] + samples[:, 2])
+        right_mean = 0.5 * (samples[:, 1] + samples[:, 3])
+        slope_x = (front_mean - rear_mean) / max(2.0 * half_wheelbase, 1.0e-6)
+        slope_y = (left_mean - right_mean) / max(2.0 * half_track, 1.0e-6)
+        # Isaac/robotics ZYX convention: uphill along local +X is negative pitch;
+        # uphill along local +Y is positive roll.
+        pitch = -torch.atan(slope_x)
+        roll = torch.atan(slope_y * torch.cos(pitch))
+        return samples.mean(dim=1), roll, pitch, samples
+
     @staticmethod
     def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
         return torch.atan2(torch.sin(angle), torch.cos(angle))
@@ -1274,6 +1344,35 @@ class AgvLevelCarryEnv(DirectRLEnv):
         quat[:, 0] = torch.cos(0.5 * yaw)
         quat[:, 3] = torch.sin(0.5 * yaw)
         return quat
+
+    @staticmethod
+    def _rpy_to_quat(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+        """Return scalar-first quaternion for intrinsic roll/pitch/yaw (ZYX)."""
+        cr, sr = torch.cos(0.5 * roll), torch.sin(0.5 * roll)
+        cp, sp = torch.cos(0.5 * pitch), torch.sin(0.5 * pitch)
+        cy, sy = torch.cos(0.5 * yaw), torch.sin(0.5 * yaw)
+        return torch.stack(
+            (
+                cr * cp * cy + sr * sp * sy,
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+            ),
+            dim=1,
+        )
+
+    @staticmethod
+    def _quat_rotate_z(quat: torch.Tensor) -> torch.Tensor:
+        """Rotate local unit +Z by scalar-first quaternions."""
+        qw, qx, qy, qz = quat.unbind(dim=1)
+        return torch.stack(
+            (
+                2.0 * (qx * qz + qw * qy),
+                2.0 * (qy * qz - qw * qx),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ),
+            dim=1,
+        )
 
     def _get_payload_rpy(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         quat = getattr(self.payload.data, "root_quat_w", None)

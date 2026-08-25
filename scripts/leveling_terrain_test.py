@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""V7.1 bumpy-terrain validation for geometric active leveling."""
+"""V7.1.1 four-contact terrain-attitude and active-leveling validation."""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ import traceback
 from isaaclab.app import AppLauncher
 
 
-parser = argparse.ArgumentParser(description="Compare fixed and geometric lift targets on bumpy terrain.")
+parser = argparse.ArgumentParser(description="Validate terrain-following AGV attitude and geometric leveling.")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--task", type=str, default="Template-Agv-Level-Carry-Direct-v0")
 parser.add_argument("--mode", choices=("no_leveling", "geometric", "both"), default="both")
 parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
-parser.add_argument("--log_dir", type=str, default="logs/v7_1")
+parser.add_argument("--log_dir", type=str, default="logs/v7_1_1")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.num_envs = 1
@@ -41,9 +41,16 @@ CSV_FIELDS = (
     "time",
     "agv1_z", "agv2_z", "agv3_z",
     "terrain_z1", "terrain_z2", "terrain_z3",
+    "agv1_roll_deg", "agv2_roll_deg", "agv3_roll_deg",
+    "agv1_pitch_deg", "agv2_pitch_deg", "agv3_pitch_deg",
+    "agv1_fl_z", "agv1_fr_z", "agv1_rl_z", "agv1_rr_z",
+    "agv2_fl_z", "agv2_fr_z", "agv2_rl_z", "agv2_rr_z",
+    "agv3_fl_z", "agv3_fr_z", "agv3_rl_z", "agv3_rr_z",
     "lift1_height", "lift2_height", "lift3_height",
     "lift1_velocity", "lift2_velocity", "lift3_velocity",
-    "lift_top_world_z1", "lift_top_world_z2", "lift_top_world_z3",
+    "lift_top_world_x1", "lift_top_world_y1", "lift_top_world_z1",
+    "lift_top_world_x2", "lift_top_world_y2", "lift_top_world_z2",
+    "lift_top_world_x3", "lift_top_world_y3", "lift_top_world_z3",
     "support_height_error_rms",
     "board_z", "board_roll_deg", "board_pitch_deg",
     "board_roll_rate", "board_pitch_rate",
@@ -72,10 +79,14 @@ def _make_actions(raw_env, target_speed: float) -> tuple[torch.Tensor, float, fl
     return actions, actual_target, linear_action
 
 
-def _terrain_heights(raw_env) -> torch.Tensor:
-    env_xy = raw_env.scene.env_origins[0, :2]
-    agv_xy = torch.stack([agv.data.root_pos_w[0, :2] for agv in raw_env.agvs])
-    return raw_env._terrain_height(agv_xy - env_xy)
+def _lift_top_centers(raw_env) -> torch.Tensor:
+    centers = []
+    half_thickness = 0.5 * float(raw_env.cfg.lift_plate_size[2])
+    for lift in raw_env.lifts:
+        quat = lift.data.root_quat_w[0].unsqueeze(0)
+        local_z = raw_env._quat_rotate_z(quat)[0]
+        centers.append(lift.data.root_pos_w[0] + half_thickness * local_z)
+    return torch.stack(centers)
 
 
 def _summarize(rows: list[dict[str, float]], step_dt: float) -> dict[str, float]:
@@ -152,11 +163,17 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     )
 
     while simulation_app.is_running() and elapsed < float(args_cli.duration):
-        terrain_before = _terrain_heights(raw_env)
         if mode == "geometric":
-            raw_target = neutral - (terrain_before - terrain_before.mean())
+            # V7.1.1 controls the three actual top reference-center world
+            # heights.  A local-axis displacement changes world z by the
+            # corresponding AGV local +Z component.
+            top_before = _lift_top_centers(raw_env)
+            top_error = top_before[:, 2].mean() - top_before[:, 2]
+            agv_quat = torch.stack([agv.data.root_quat_w[0] for agv in raw_env.agvs])
+            axis_z = raw_env._quat_rotate_z(agv_quat)[:, 2].clamp_min(0.25)
+            raw_target = raw_env.lift_height[0] + top_error / axis_z
         else:
-            raw_target = torch.full_like(terrain_before, neutral)
+            raw_target = torch.full_like(raw_env.lift_height[0], neutral)
         saturated = (raw_target < lift_min) | (raw_target > lift_max)
         raw_env.lift_target_height[0] = torch.clamp(raw_target, min=lift_min, max=lift_max)
         raw_env.base_z_disturbance[0] = 0.0
@@ -170,17 +187,21 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
                 f"(terminated={bool(terminated[0])}, truncated={bool(truncated[0])})"
             )
 
-        terrain_z = _terrain_heights(raw_env)
+        terrain_z = raw_env.agv_terrain_samples[0].mean(dim=1)
         agv_z = torch.stack([agv.data.root_pos_w[0, 2] for agv in raw_env.agvs])
-        lift_top_z = torch.stack([lift.data.root_pos_w[0, 2] for lift in raw_env.lifts])
-        lift_top_z += 0.5 * float(raw_env.cfg.lift_plate_size[2])
+        lift_top = _lift_top_centers(raw_env)
+        lift_top_z = lift_top[:, 2]
         support_error = torch.sqrt(torch.mean(torch.square(lift_top_z - lift_top_z.mean())))
         roll, pitch, _ = raw_env._get_payload_rpy()
         board_pos = raw_env.payload.data.root_pos_w[0]
         board_ang_vel = raw_env.payload.data.root_ang_vel_w[0]
 
         values = torch.cat((
-            agv_z, terrain_z, raw_env.lift_height[0], raw_env.lift_velocity[0], lift_top_z,
+            agv_z, terrain_z,
+            torch.rad2deg(raw_env.agv_terrain_roll[0]),
+            torch.rad2deg(raw_env.agv_terrain_pitch[0]),
+            raw_env.agv_terrain_samples[0].reshape(-1),
+            raw_env.lift_height[0], raw_env.lift_velocity[0], lift_top.reshape(-1),
             support_error.reshape(1), board_pos[2].reshape(1),
             torch.rad2deg(roll[0]).reshape(1), torch.rad2deg(pitch[0]).reshape(1),
             board_ang_vel[0:2], saturated.float(),

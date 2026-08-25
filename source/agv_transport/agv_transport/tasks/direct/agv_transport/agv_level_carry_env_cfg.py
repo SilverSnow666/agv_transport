@@ -92,6 +92,13 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     agv_center_z = 0.08
     agv_top_z = agv_center_z + 0.5 * agv_size[2]
 
+    # V7.1.1 equivalent wheel/ground contact footprint.  The visible iwhub
+    # model and the kinematic collision proxy do not have identical extents,
+    # so these are deliberately defined from (and kept inside) the 0.55 x
+    # 0.42 m physical proxy rather than claimed as exact tyre locations.
+    terrain_contact_wheelbase = 0.46
+    terrain_contact_track = 0.34
+
     # V7.0 carrier board.
     # 暂时沿用 payload 变量名，后续加入独立 Cargo 后再正式重命名。
     payload_size = (1.60, 1.20, 0.08)
