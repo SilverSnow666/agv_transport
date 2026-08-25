@@ -252,7 +252,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
         V6.0 默认 z 不变；若 cfg.enable_bumpy_support=True，则 AGV 支撑面高度随位置变化，
         可用于下一阶段模拟低幅坑洼激励，但这不等同于真实轮地接触。
         """
-        dt = self.cfg.sim.dt * self.cfg.decimation
+        # DirectRLEnv calls _apply_action() once per physics substep.  Use the
+        # physics dt here; multiplying by decimation would apply the configured
+        # AGV and Lift velocities ``decimation`` times too fast.
+        dt = self.cfg.sim.dt
         env_xy = self.scene.env_origins[:, :2]
 
         # 平地直线驮运阶段采用后侧线速度共享先验：
@@ -298,8 +301,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
             agv.write_root_velocity_to_sim(agv_state[:, 7:])
 
         # V7.0-B: independent ideal lift actuators track bounded targets at a
-        # finite speed.  This update runs once per environment step, so ``dt``
-        # includes simulation decimation.
+        # finite speed.  This update runs once per physics substep.
         lift_target = torch.clamp(
             self.lift_target_height,
             min=float(self.cfg.lift_min_height),
