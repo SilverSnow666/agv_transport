@@ -18,6 +18,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--duration", type=float, default=None, help="Optional finite validation duration in seconds.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -56,9 +57,20 @@ def main():
     print(f"[INFO]: Gym action space: {env.action_space}")
     # reset environment
     env.reset()
+    raw_env = env.unwrapped
+    neutral = float(raw_env.cfg.lift_neutral_height)
+    print(
+        f"[CHECK] lift travel={1000.0 * float(raw_env.cfg.lift_min_height):.1f}-"
+        f"{1000.0 * float(raw_env.cfg.lift_max_height):.1f} mm, "
+        f"neutral={1000.0 * neutral:.1f} mm"
+    )
+    step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
+    elapsed = 0.0
     # simulate environment
     # simulate environment
-    while simulation_app.is_running():
+    while simulation_app.is_running() and (
+        args_cli.duration is None or elapsed < float(args_cli.duration)
+    ):
         with torch.inference_mode():
             # V7.0-A static test:
             # action layout = [v1, w1, v2, w2, v3, w3]
@@ -78,6 +90,23 @@ def main():
             actions[:, 4] = -1.0
 
             env.step(actions)
+            elapsed += step_dt
+
+            values = torch.cat(
+                (
+                    raw_env.lift_height.reshape(-1),
+                    *[lift.data.root_pos_w.reshape(-1) for lift in raw_env.lifts],
+                    raw_env.payload.data.root_pos_w.reshape(-1),
+                )
+            )
+            if not bool(torch.isfinite(values).all()):
+                raise RuntimeError(f"NaN/Inf detected at t={elapsed:.3f} s")
+
+    heights = 1000.0 * raw_env.lift_height[0]
+    print(
+        f"[RESULT] static: duration={elapsed:.3f} s, "
+        f"lift heights={heights.tolist()} mm"
+    )
 
 
 if __name__ == "__main__":

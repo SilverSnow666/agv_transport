@@ -75,7 +75,9 @@ def main() -> None:
 
     actions = torch.zeros(env.action_space.shape, device=raw_env.device)
     actions[:, 0::2] = -1.0
-    disturbance_final = torch.tensor((0.030, -0.015, 0.010), device=raw_env.device)
+    # Keep the V7.0-B demonstration away from the exact lower travel stop now
+    # that the configured transport working height is 30 mm.
+    disturbance_final = torch.tensor((0.020, -0.010, 0.010), device=raw_env.device)
     neutral = float(raw_env.cfg.lift_neutral_height)
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     csv_path = Path(args_cli.csv_path).expanduser().resolve()

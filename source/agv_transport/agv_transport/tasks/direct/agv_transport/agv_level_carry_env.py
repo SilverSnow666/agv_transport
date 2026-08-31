@@ -8,6 +8,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectRLEnv
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from pxr import Gf, Usd, UsdGeom, Vt
 
@@ -81,6 +82,36 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.payload = RigidObject(self.cfg.payload_cfg)
         self.agvs = [self.agv1, self.agv2, self.agv3]
         self.lifts = [self.lift1, self.lift2, self.lift3]
+
+        actuator_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/LiftActuators",
+            markers={
+                "actuator": sim_utils.CuboidCfg(
+                    size=(1.0, 1.0, 1.0),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=tuple(float(v) for v in self.cfg.lift_actuator_visual_color),
+                        metallic=0.65,
+                        roughness=0.28,
+                    ),
+                )
+            },
+        )
+        self.lift_actuator_visualizer = VisualizationMarkers(actuator_cfg)
+        # Give Fabric the final instance count before simulation starts.  The
+        # marker poses are replaced with real AGV poses during the first reset.
+        actuator_count = 3 * int(self.scene.cfg.num_envs)
+        initial_positions = torch.zeros((actuator_count, 3), device=self.device)
+        initial_positions[:, 2] = -10.0
+        initial_orientations = torch.zeros((actuator_count, 4), device=self.device)
+        initial_orientations[:, 0] = 1.0
+        initial_scales = torch.empty((actuator_count, 3), device=self.device)
+        initial_scales[:, 0:2] = float(self.cfg.lift_actuator_visual_width)
+        initial_scales[:, 2] = float(self.cfg.lift_actuator_visual_min_height)
+        self.lift_actuator_visualizer.visualize(
+            translations=initial_positions,
+            orientations=initial_orientations,
+            scales=initial_scales,
+        )
 
         self.scene.rigid_objects["agv1"] = self.agv1
         self.scene.rigid_objects["agv2"] = self.agv2
@@ -344,6 +375,12 @@ class AgvLevelCarryEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
 
+        actuator_positions = []
+        actuator_orientations = []
+        actuator_scales = []
+        actuator_width = float(self.cfg.lift_actuator_visual_width)
+        actuator_min_height = float(self.cfg.lift_actuator_visual_min_height)
+
         for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
             agv_state = agv.data.root_state_w[env_ids]
             lift_pose = torch.zeros((len(env_ids), 7), device=self.device)
@@ -362,6 +399,35 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift_velocity[:, 3:6] = agv_state[:, 10:13]
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
+
+            # Purely visual telescoping column: its physical length remains the
+            # exact AGV-top-to-plate-bottom gap.  At zero travel, a thin marker
+            # straddles the touching surfaces so no visible floating gap appears.
+            visual_height = torch.clamp(self.lift_height[env_ids, i], min=actuator_min_height)
+            visual_center_offset = (
+                0.5 * float(self.cfg.agv_size[2])
+                + 0.5 * self.lift_height[env_ids, i]
+            )
+            actuator_positions.append(
+                agv_state[:, 0:3] + local_z * visual_center_offset.unsqueeze(-1)
+            )
+            actuator_orientations.append(agv_state[:, 3:7])
+            actuator_scales.append(
+                torch.stack(
+                    (
+                        torch.full_like(visual_height, actuator_width),
+                        torch.full_like(visual_height, actuator_width),
+                        visual_height,
+                    ),
+                    dim=1,
+                )
+            )
+
+        self.lift_actuator_visualizer.visualize(
+            translations=torch.cat(actuator_positions, dim=0),
+            orientations=torch.cat(actuator_orientations, dim=0),
+            scales=torch.cat(actuator_scales, dim=0),
+        )
 
     def _apply_virtual_friction_carry(self, dt: float) -> None:
         """用虚拟摩擦耦合修正 kinematic 支撑台无法可靠带动 payload 的问题。

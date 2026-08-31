@@ -56,10 +56,16 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
 
     # 顶升行程。
     lift_min_height = 0.00
-    lift_max_height = 0.12
+    lift_max_height = 0.10
 
-    # 中位高度，允许后续向上和向下各补偿约 60 mm。
-    lift_neutral_height = 0.06
+    # 运输工作高度只预顶升 30 mm；完全收缩时 Lift Plate 底面贴合 AGV 顶面。
+    lift_neutral_height = 0.03
+
+    # 无碰撞、无质量的纯视觉伸缩柱。柱体原型为单位高度 cuboid，运行时沿
+    # AGV 局部 +Z 缩放并放置在 AGV 顶面与 Lift Plate 底面之间。
+    lift_actuator_visual_width = 0.075
+    lift_actuator_visual_min_height = 0.002
+    lift_actuator_visual_color = (0.16, 0.18, 0.22)
 
     # 后续动态调平时使用，目前 V7.0-A 暂时不控制。
     max_lift_speed = 0.04  # m/s
