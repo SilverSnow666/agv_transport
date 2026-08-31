@@ -86,8 +86,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
         actuator_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/LiftActuators",
             markers={
-                "actuator": sim_utils.CuboidCfg(
-                    size=(1.0, 1.0, 1.0),
+                "actuator": sim_utils.CylinderCfg(
+                    radius=float(self.cfg.lift_actuator_visual_radius),
+                    height=1.0,
+                    axis="Z",
                     visual_material=sim_utils.PreviewSurfaceCfg(
                         diffuse_color=tuple(float(v) for v in self.cfg.lift_actuator_visual_color),
                         metallic=0.65,
@@ -105,7 +107,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         initial_orientations = torch.zeros((actuator_count, 4), device=self.device)
         initial_orientations[:, 0] = 1.0
         initial_scales = torch.empty((actuator_count, 3), device=self.device)
-        initial_scales[:, 0:2] = float(self.cfg.lift_actuator_visual_width)
+        initial_scales[:, 0:2] = 1.0
         initial_scales[:, 2] = float(self.cfg.lift_actuator_visual_min_height)
         self.lift_actuator_visualizer.visualize(
             translations=initial_positions,
@@ -146,6 +148,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 translation=tuple(float(v) for v in self.cfg.agv_visual_translation),
                 orientation=(1.0, 0.0, 0.0, 0.0),
             )
+
+        # Independent visual-only mount calibrated against the yellow USD in
+        # the GUI.  The Lift Plate still uses cfg.agv_size and lift_height.
+        self._lift_visual_mount_height = float(self.cfg.lift_visual_mount_height)
 
         # payload 的物理刚体和碰撞几何也保持 V6.2.1 高度。
         # 单独创建无碰撞的黄色可视子节点，并向下补偿 0.064 m，使其外观高度
@@ -273,6 +279,14 @@ class AgvLevelCarryEnv(DirectRLEnv):
                     if imageable:
                         imageable.MakeInvisible()
 
+    def _lift_actuator_external_lengths(
+        self, env_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Return the true exposed rod lengths, excluding the 1 mm embed."""
+        if env_ids is None:
+            env_ids = self.payload._ALL_INDICES
+        return self.lift_height[env_ids]
+
     # ---------------------------------------------------------------------
     # Action
     # ---------------------------------------------------------------------
@@ -378,7 +392,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
         actuator_positions = []
         actuator_orientations = []
         actuator_scales = []
-        actuator_width = float(self.cfg.lift_actuator_visual_width)
         actuator_min_height = float(self.cfg.lift_actuator_visual_min_height)
 
         for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
@@ -400,14 +413,17 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
 
-            # Purely visual telescoping column: its physical length remains the
-            # exact AGV-top-to-plate-bottom gap.  At zero travel, a thin marker
-            # straddles the touching surfaces so no visible floating gap appears.
-            visual_height = torch.clamp(self.lift_height[env_ids, i], min=actuator_min_height)
-            visual_center_offset = (
-                0.5 * float(self.cfg.agv_size[2])
-                + 0.5 * self.lift_height[env_ids, i]
+            # Purely visual embedded actuator.  The top face stays at the
+            # physical Lift Plate bottom while the lower face reaches the
+            # independently calibrated visual mount.  At zero exposed length
+            # the 2 mm minimum marker remains inside the roof/plate interface
+            # rather than forming an external block above the AGV.
+            plate_bottom_offset = 0.5 * float(self.cfg.agv_size[2]) + self.lift_height[env_ids, i]
+            visual_height = torch.clamp(
+                plate_bottom_offset - self._lift_visual_mount_height,
+                min=actuator_min_height,
             )
+            visual_center_offset = plate_bottom_offset - 0.5 * visual_height
             actuator_positions.append(
                 agv_state[:, 0:3] + local_z * visual_center_offset.unsqueeze(-1)
             )
@@ -415,8 +431,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
             actuator_scales.append(
                 torch.stack(
                     (
-                        torch.full_like(visual_height, actuator_width),
-                        torch.full_like(visual_height, actuator_width),
+                        torch.ones_like(visual_height),
+                        torch.ones_like(visual_height),
                         visual_height,
                     ),
                     dim=1,

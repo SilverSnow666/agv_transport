@@ -61,11 +61,16 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 运输工作高度只预顶升 30 mm；完全收缩时 Lift Plate 底面贴合 AGV 顶面。
     lift_neutral_height = 0.03
 
-    # 无碰撞、无质量的纯视觉伸缩柱。柱体原型为单位高度 cuboid，运行时沿
-    # AGV 局部 +Z 缩放并放置在 AGV 顶面与 Lift Plate 底面之间。
-    lift_actuator_visual_width = 0.075
+    # 无碰撞、无质量的纯视觉伸缩杆。杆原型为单位高度 cylinder，运行时沿
+    # AGV 局部 +Z 缩放并放置在黄色 USD 外观顶面与 Lift Plate 底面之间。
+    lift_actuator_visual_radius = 0.024
     lift_actuator_visual_min_height = 0.002
     lift_actuator_visual_color = (0.16, 0.18, 0.22)
+
+    # 独立的纯视觉安装基准（AGV 局部 +Z）。GUI 校准后把杆根部放在车体
+    # 内部 1 mm，而不是由隐藏物理代理的 agv_top_z 在运行时推导。该量仅影响
+    # marker，不改变 AGV/Lift Plate 物理位姿。
+    lift_visual_mount_height = 0.079
 
     # 后续动态调平时使用，目前 V7.0-A 暂时不控制。
     max_lift_speed = 0.04  # m/s
