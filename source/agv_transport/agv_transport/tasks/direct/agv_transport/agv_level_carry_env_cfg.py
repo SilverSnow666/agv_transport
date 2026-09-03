@@ -121,6 +121,17 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     payload_size = (1.60, 1.20, 0.08)
     payload_mass = 12.0
 
+    # V7.2 free-cargo evaluation baseline.  It remains opt-in so existing
+    # training, reward, action and observation behaviour is unchanged.
+    enable_cargo = False
+    cargo_size = (0.30, 0.30, 0.20)
+    cargo_mass = 4.0
+    cargo_static_friction = 0.80
+    cargo_dynamic_friction = 0.65
+    cargo_board_clearance = 0.0
+    cargo_contact_tolerance = 0.012
+    cargo_tip_threshold = 0.7853981633974483  # 45 deg
+
     # 保持 V6.2.1 的物理支撑间隙与初始高度，确保旧 checkpoint 兼容。
     board_support_clearance = 0.003
 
@@ -133,6 +144,13 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     )
 
     payload_init_pos = (0.0, 0.0, payload_init_z)
+
+    # Cargo starts exactly face-to-face with the Board: no initial overlap and
+    # no suspension gap.  It is centred and never attached to the Board.
+    cargo_init_z = (
+        payload_init_z + 0.5 * payload_size[2] + 0.5 * cargo_size[2] + cargo_board_clearance
+    )
+    cargo_init_pos = (0.0, 0.0, cargo_init_z)
 
     # 支撑三角形：local_x 为运输方向，local_y 为横向。
     # AGV1 在前中，AGV2 在后左，AGV3 在后右。三点都位于 payload 投影内。
@@ -369,6 +387,11 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
         dynamic_friction=0.95,
         restitution=0.0,
     )
+    _cargo_material = sim_utils.RigidBodyMaterialCfg(
+        static_friction=cargo_static_friction,
+        dynamic_friction=cargo_dynamic_friction,
+        restitution=0.0,
+    )
     _lift_material = sim_utils.RigidBodyMaterialCfg(
         static_friction=1.30,
         dynamic_friction=1.10,
@@ -493,4 +516,22 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.55, 0.0), metallic=0.0),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=payload_init_pos, rot=(1.0, 0.0, 0.0, 0.0)),
+    )
+
+    cargo_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Cargo",
+        spawn=sim_utils.CuboidCfg(
+            size=cargo_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=False,
+                disable_gravity=False,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=cargo_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=_cargo_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.10, 0.65, 0.95), metallic=0.0, roughness=0.35
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=cargo_init_pos, rot=(1.0, 0.0, 0.0, 0.0)),
     )

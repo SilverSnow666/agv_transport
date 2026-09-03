@@ -80,6 +80,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.lift2 = RigidObject(self.cfg.lift2_cfg)
         self.lift3 = RigidObject(self.cfg.lift3_cfg)
         self.payload = RigidObject(self.cfg.payload_cfg)
+        self.cargo = RigidObject(self.cfg.cargo_cfg) if bool(self.cfg.enable_cargo) else None
         self.agvs = [self.agv1, self.agv2, self.agv3]
         self.lifts = [self.lift1, self.lift2, self.lift3]
 
@@ -140,6 +141,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.scene.rigid_objects["lift2"] = self.lift2
         self.scene.rigid_objects["lift3"] = self.lift3
         self.scene.rigid_objects["payload"] = self.payload
+        if self.cargo is not None:
+            self.scene.rigid_objects["cargo"] = self.cargo
 
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self._move_ground_plane_for_visual_terrain()
@@ -1195,6 +1198,17 @@ class AgvLevelCarryEnv(DirectRLEnv):
         payload_vel = torch.zeros((num_reset, 6), device=self.device)
         self.payload.write_root_pose_to_sim(payload_pose, env_ids=env_ids)
         self.payload.write_root_velocity_to_sim(payload_vel, env_ids=env_ids)
+
+        # Optional V7.2 Cargo is a free dynamic rigid body.  Reset only sets its
+        # pose/velocity; gravity, collision and friction govern all later motion.
+        if self.cargo is not None:
+            cargo_init_pos = torch.tensor(self.cfg.cargo_init_pos, device=self.device, dtype=torch.float32)
+            cargo_pose = torch.zeros((num_reset, 7), device=self.device)
+            cargo_pose[:, :3] = env_origins + cargo_init_pos
+            cargo_pose[:, 3] = 1.0
+            cargo_vel = torch.zeros((num_reset, 6), device=self.device)
+            self.cargo.write_root_pose_to_sim(cargo_pose, env_ids=env_ids)
+            self.cargo.write_root_velocity_to_sim(cargo_vel, env_ids=env_ids)
 
         # 根据 payload->target 方向初始化三台 AGV 的支撑三角形与车头朝向。
         # 这样即使后续把 target 改到别的方向，也不会出现开局三车顶着货物原地大角度旋转。

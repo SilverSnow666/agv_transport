@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""V7.1.1 four-contact terrain-attitude and active-leveling validation."""
+"""V7.2 free-Cargo stability comparison on the V7.1.1 terrain baseline."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ parser.add_argument("--task", type=str, default="Template-Agv-Level-Carry-Direct
 parser.add_argument("--mode", choices=("no_leveling", "geometric", "both"), default="both")
 parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
-parser.add_argument("--log_dir", type=str, default="logs/v7_1_1")
+parser.add_argument("--log_dir", type=str, default="logs/v7_2")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.num_envs = 1
@@ -54,12 +54,79 @@ CSV_FIELDS = (
     "support_height_error_rms",
     "board_z", "board_roll_deg", "board_pitch_deg",
     "board_roll_rate", "board_pitch_rate",
-    "lift1_saturated", "lift2_saturated", "lift3_saturated",
+    "lift1_saturated", "lift2_saturated", "lift3_saturated", "board_yaw_deg",
+    "cargo_x", "cargo_y", "cargo_z",
+    "cargo_rel_x", "cargo_rel_y", "cargo_rel_z",
+    "cargo_rel_dx", "cargo_rel_dy", "cargo_rel_dz",
+    "cargo_relative_xy_displacement", "cargo_xy_slip_step",
+    "cargo_xy_slip_distance", "cargo_max_xy_slip_distance",
+    "cargo_roll_deg", "cargo_pitch_deg", "cargo_yaw_deg",
+    "cargo_rel_roll_deg", "cargo_rel_pitch_deg", "cargo_rel_yaw_deg",
+    "cargo_ang_vel_x", "cargo_ang_vel_y", "cargo_ang_vel_z", "cargo_ang_speed",
+    "cargo_board_surface_gap",
+    "cargo_center_over_board", "cargo_fully_supported", "cargo_contact",
+    "cargo_dropped", "cargo_tipped",
 )
 
 
 def _rms(values: list[float]) -> float:
     return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def _quat_conjugate(quat: torch.Tensor) -> torch.Tensor:
+    result = quat.clone()
+    result[1:4] = -result[1:4]
+    return result
+
+
+def _quat_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    lw, lx, ly, lz = left.unbind()
+    rw, rx, ry, rz = right.unbind()
+    return torch.stack((
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    ))
+
+
+def _quat_rotate(quat: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    quat_vector = quat[1:4]
+    twice_cross = 2.0 * torch.cross(quat_vector, vector, dim=0)
+    return vector + quat[0] * twice_cross + torch.cross(quat_vector, twice_cross, dim=0)
+
+
+def _quat_to_rpy(quat: torch.Tensor) -> torch.Tensor:
+    quat = quat / torch.linalg.norm(quat).clamp_min(1.0e-12)
+    qw, qx, qy, qz = quat.unbind()
+    roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+    pitch = torch.asin(torch.clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0))
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    return torch.stack((roll, pitch, yaw))
+
+
+def _cargo_board_state(raw_env) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    board_pos = raw_env.payload.data.root_pos_w[0]
+    board_quat = raw_env.payload.data.root_quat_w[0]
+    cargo_pos = raw_env.cargo.data.root_pos_w[0]
+    cargo_quat = raw_env.cargo.data.root_quat_w[0]
+    board_inverse = _quat_conjugate(board_quat)
+    relative_pos = _quat_rotate(board_inverse, cargo_pos - board_pos)
+    relative_quat = _quat_multiply(board_inverse, cargo_quat)
+    relative_quat = relative_quat / torch.linalg.norm(relative_quat).clamp_min(1.0e-12)
+
+    # Project the Cargo oriented half-extents onto Board local +Z.  This gives
+    # a face gap that remains meaningful while either body rolls or pitches.
+    qw, qx, qy, qz = relative_quat.unbind()
+    vertical_axis_projection = torch.stack((
+        2.0 * (qx * qz - qw * qy),
+        2.0 * (qy * qz + qw * qx),
+        1.0 - 2.0 * (qx * qx + qy * qy),
+    )).abs()
+    cargo_half_size = 0.5 * torch.tensor(raw_env.cfg.cargo_size, device=raw_env.device)
+    cargo_vertical_radius = torch.sum(vertical_axis_projection * cargo_half_size)
+    surface_gap = relative_pos[2] - cargo_vertical_radius - 0.5 * float(raw_env.cfg.payload_size[2])
+    return relative_pos, relative_quat, cargo_pos, surface_gap
 
 
 def _make_actions(raw_env, target_speed: float) -> tuple[torch.Tensor, float, float]:
@@ -97,6 +164,20 @@ def _summarize(rows: list[dict[str, float]], step_dt: float) -> dict[str, float]
         "max_abs_pitch_deg": max(abs(row["board_pitch_deg"]) for row in rows),
         "support_height_rms_mm": 1000.0 * _rms([row["support_height_error_rms"] for row in rows]),
     }
+    result.update({
+        "cargo_relative_xy_rms_mm": 1000.0 * _rms(
+            [row["cargo_relative_xy_displacement"] for row in rows]
+        ),
+        "cargo_final_relative_xy_mm": 1000.0 * rows[-1]["cargo_relative_xy_displacement"],
+        "cargo_max_relative_xy_mm": 1000.0 * max(row["cargo_relative_xy_displacement"] for row in rows),
+        "cargo_cumulative_slip_mm": 1000.0 * rows[-1]["cargo_xy_slip_distance"],
+        "cargo_roll_rms_deg": _rms([row["cargo_roll_deg"] for row in rows]),
+        "cargo_pitch_rms_deg": _rms([row["cargo_pitch_deg"] for row in rows]),
+        "cargo_ang_speed_rms": _rms([row["cargo_ang_speed"] for row in rows]),
+        "cargo_contact_fraction": sum(row["cargo_contact"] for row in rows) / len(rows),
+        "cargo_dropped": max(row["cargo_dropped"] for row in rows),
+        "cargo_tipped": max(row["cargo_tipped"] for row in rows),
+    })
     saturated_samples = 0
     for lift_index in range(1, 4):
         heights = [row[f"lift{lift_index}_height"] for row in rows]
@@ -118,6 +199,15 @@ def _print_summary(mode: str, summary: dict[str, float]) -> None:
         f"max |pitch|={summary['max_abs_pitch_deg']:.4f} deg, "
         f"support RMS={summary['support_height_rms_mm']:.3f} mm"
     )
+    print(
+        f"[RESULT] {mode}: Cargo relative XY RMS={summary['cargo_relative_xy_rms_mm']:.3f} mm, "
+        f"max={summary['cargo_max_relative_xy_mm']:.3f} mm, "
+        f"cumulative slip={summary['cargo_cumulative_slip_mm']:.3f} mm, "
+        f"roll/pitch RMS={summary['cargo_roll_rms_deg']:.4f}/{summary['cargo_pitch_rms_deg']:.4f} deg, "
+        f"angular-speed RMS={summary['cargo_ang_speed_rms']:.4f} rad/s, "
+        f"contact={100.0 * summary['cargo_contact_fraction']:.2f}%, "
+        f"dropped={bool(summary['cargo_dropped'])}, tipped={bool(summary['cargo_tipped'])}"
+    )
     for lift_index in range(1, 4):
         print(
             f"[RESULT] {mode}: lift{lift_index}="
@@ -134,6 +224,7 @@ def _make_environment():
     env_cfg.enable_front_position_guard = False
     env_cfg.enable_rear_lateral_guard = False
     env_cfg.enable_bumpy_support = True
+    env_cfg.enable_cargo = True
     # The AGVs/lifts are kinematic proxies.  Reuse the existing V6 no-slip
     # coupling so the dynamic board follows the translating supports; without
     # it the board stays behind and the comparison terminates on support loss.
@@ -147,6 +238,8 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     raw_env = env.unwrapped
     with torch.inference_mode():
         env.reset(seed=0)
+    if raw_env.cargo is None:
+        raise RuntimeError("V7.2 Cargo was not created")
     raw_env.base_z_disturbance.zero_()
 
     actions, target_speed, linear_action = _make_actions(raw_env, args_cli.target_speed)
@@ -157,6 +250,29 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     rows: list[dict[str, float]] = []
     elapsed = 0.0
     initial_xy = torch.stack([agv.data.root_pos_w[0, :2] for agv in raw_env.agvs]).clone()
+    initial_cargo_rel, _, _, initial_surface_gap = _cargo_board_state(raw_env)
+    initial_cargo_rel = initial_cargo_rel.clone()
+    previous_cargo_rel_xy = initial_cargo_rel[:2].clone()
+    cumulative_slip = 0.0
+    max_relative_slip = 0.0
+    board_half_xy = 0.5 * torch.tensor(raw_env.cfg.payload_size[:2], device=raw_env.device)
+    cargo_half_xy = 0.5 * torch.tensor(raw_env.cfg.cargo_size[:2], device=raw_env.device)
+    initial_center_over_board = bool(torch.all(torch.abs(initial_cargo_rel[:2]) <= board_half_xy))
+    if not initial_center_over_board:
+        raise RuntimeError(f"Cargo initial XY is outside Board: relative={initial_cargo_rel.tolist()} m")
+    if abs(float(initial_surface_gap)) > 1.0e-4:
+        raise RuntimeError(
+            f"Cargo initial face gap must be zero (no penetration/suspension), got "
+            f"{1000.0 * float(initial_surface_gap):.4f} mm"
+        )
+    print(
+        f"[CHECK] {mode}: Cargo size={tuple(float(v) for v in raw_env.cfg.cargo_size)} m, "
+        f"mass={float(raw_env.cfg.cargo_mass):.2f} kg, "
+        f"friction={float(raw_env.cfg.cargo_static_friction):.2f}/"
+        f"{float(raw_env.cfg.cargo_dynamic_friction):.2f} static/dynamic, "
+        f"initial Board-frame xyz={initial_cargo_rel.tolist()} m, "
+        f"face gap={1000.0 * float(initial_surface_gap):.4f} mm"
+    )
     print(
         f"[INFO] {mode}: target speed={target_speed:.4f} m/s, action={linear_action:.6f}, "
         f"duration={args_cli.duration:.2f} s"
@@ -192,9 +308,31 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
         lift_top = _lift_top_centers(raw_env)
         lift_top_z = lift_top[:, 2]
         support_error = torch.sqrt(torch.mean(torch.square(lift_top_z - lift_top_z.mean())))
-        roll, pitch, _ = raw_env._get_payload_rpy()
+        roll, pitch, board_yaw = raw_env._get_payload_rpy()
         board_pos = raw_env.payload.data.root_pos_w[0]
         board_ang_vel = raw_env.payload.data.root_ang_vel_w[0]
+        cargo_rel, cargo_rel_quat, cargo_pos, cargo_surface_gap = _cargo_board_state(raw_env)
+        cargo_rel_delta = cargo_rel - initial_cargo_rel
+        relative_xy_displacement = torch.linalg.norm(cargo_rel_delta[:2])
+        slip_step = torch.linalg.norm(cargo_rel[:2] - previous_cargo_rel_xy)
+        cumulative_slip += float(slip_step)
+        max_relative_slip = max(max_relative_slip, float(relative_xy_displacement))
+        previous_cargo_rel_xy = cargo_rel[:2].clone()
+        cargo_rpy = _quat_to_rpy(raw_env.cargo.data.root_quat_w[0])
+        cargo_rel_rpy = _quat_to_rpy(cargo_rel_quat)
+        cargo_ang_vel = raw_env.cargo.data.root_ang_vel_w[0]
+        cargo_ang_speed = torch.linalg.norm(cargo_ang_vel)
+        center_over_board = torch.all(torch.abs(cargo_rel[:2]) <= board_half_xy)
+        fully_supported = torch.all(torch.abs(cargo_rel[:2]) <= board_half_xy - cargo_half_xy)
+        cargo_contact = center_over_board & (
+            torch.abs(cargo_surface_gap) <= float(raw_env.cfg.cargo_contact_tolerance)
+        )
+        cargo_dropped = (~center_over_board) | (
+            cargo_pos[2] < board_pos[2] - 0.5 * float(raw_env.cfg.payload_size[2])
+        )
+        cargo_tipped = torch.maximum(torch.abs(cargo_rpy[0]), torch.abs(cargo_rpy[1])) > float(
+            raw_env.cfg.cargo_tip_threshold
+        )
 
         values = torch.cat((
             agv_z, terrain_z,
@@ -204,7 +342,15 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
             raw_env.lift_height[0], raw_env.lift_velocity[0], lift_top.reshape(-1),
             support_error.reshape(1), board_pos[2].reshape(1),
             torch.rad2deg(roll[0]).reshape(1), torch.rad2deg(pitch[0]).reshape(1),
-            board_ang_vel[0:2], saturated.float(),
+            board_ang_vel[0:2], saturated.float(), torch.rad2deg(board_yaw[0]).reshape(1),
+            cargo_pos, cargo_rel, cargo_rel_delta,
+            relative_xy_displacement.reshape(1), slip_step.reshape(1),
+            torch.tensor((cumulative_slip, max_relative_slip), device=raw_env.device),
+            torch.rad2deg(cargo_rpy), torch.rad2deg(cargo_rel_rpy),
+            cargo_ang_vel, cargo_ang_speed.reshape(1), cargo_surface_gap.reshape(1),
+            center_over_board.float().reshape(1), fully_supported.float().reshape(1),
+            cargo_contact.float().reshape(1), cargo_dropped.float().reshape(1),
+            cargo_tipped.float().reshape(1),
         ))
         if not bool(torch.isfinite(values).all()):
             raise RuntimeError(f"NaN/Inf detected at t={elapsed:.3f} s")
@@ -230,7 +376,7 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     if terrain_span < 1.0e-3:
         raise RuntimeError(f"Terrain excitation too small: span={1000.0 * terrain_span:.3f} mm")
 
-    csv_name = "geometric_leveling.csv" if mode == "geometric" else "no_leveling.csv"
+    csv_name = "cargo_geometric_leveling.csv" if mode == "geometric" else "cargo_no_leveling.csv"
     csv_path = log_dir / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
@@ -266,6 +412,12 @@ def main() -> None:
             ("max_abs_roll_deg", "max |roll|"),
             ("max_abs_pitch_deg", "max |pitch|"),
             ("support_height_rms_mm", "support height RMS"),
+            ("cargo_relative_xy_rms_mm", "Cargo relative XY RMS"),
+            ("cargo_max_relative_xy_mm", "Cargo max relative XY"),
+            ("cargo_cumulative_slip_mm", "Cargo cumulative slip"),
+            ("cargo_roll_rms_deg", "Cargo roll RMS"),
+            ("cargo_pitch_rms_deg", "Cargo pitch RMS"),
+            ("cargo_ang_speed_rms", "Cargo angular-speed RMS"),
         ):
             improvement = 100.0 * (baseline[key] - geometric[key]) / max(baseline[key], 1.0e-12)
             print(f"[COMPARISON] {label}: {improvement:+.2f}%")
