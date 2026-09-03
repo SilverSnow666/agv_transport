@@ -121,7 +121,7 @@ def main() -> None:
     )
     print(
         f"[CHECK] visual mount={1000.0 * raw_env._lift_visual_mount_height:.2f} mm above AGV root, "
-        f"initial visible rod lengths={initial_visible.tolist()} mm"
+        f"initial roof-to-head rod lengths={initial_visible.tolist()} mm"
     )
     print(
         f"[CHECK] physical plate visible/debug="
@@ -171,7 +171,7 @@ def main() -> None:
     print(
         f"[RESULT] static: duration={elapsed:.3f} s, "
         f"lift heights={heights.tolist()} mm, "
-        f"visible rod lengths={visible_lengths.tolist()} mm"
+        f"roof-to-head rod lengths={visible_lengths.tolist()} mm"
     )
     if args_cli.screenshot_path is not None:
         screenshot_path = _capture_viewport(args_cli.screenshot_path)

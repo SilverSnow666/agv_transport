@@ -72,8 +72,8 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # marker，不改变 AGV/Lift Plate 物理位姿。
     lift_visual_mount_height = 0.079
 
-    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其底面从黄色
-    # AGV 外观顶面随 lift_height 沿车体局部 +Z 抬升，不参与 PhysX。
+    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面与隐藏
+    # 物理板顶面重合，使小承载头贴近 Board；圆杆负责连接黄色车顶，不参与 PhysX。
     lift_head_visual_size = (0.14, 0.14, 0.015)
     lift_head_visual_color = (0.20, 0.23, 0.28)
     debug_show_lift_collision_proxies = False

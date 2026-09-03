@@ -314,10 +314,16 @@ class AgvLevelCarryEnv(DirectRLEnv):
     def _lift_actuator_external_lengths(
         self, env_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Return the true exposed rod lengths, excluding the 1 mm embed."""
+        """Return roof-to-head visual rod lengths for the three lifts."""
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
-        return self.lift_height[env_ids]
+        fixed_visual_span = (
+            0.5 * float(self.cfg.agv_size[2])
+            + float(self.cfg.lift_plate_size[2])
+            - float(self.cfg.lift_head_visual_size[2])
+            - self._lift_visual_mount_height
+        )
+        return self.lift_height[env_ids] + fixed_visual_span
 
     # ---------------------------------------------------------------------
     # Action
@@ -447,17 +453,20 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
 
-            # Purely visual embedded actuator.  The top face stays at the
-            # physical Lift Plate bottom while the lower face reaches the
-            # independently calibrated visual mount.  At zero exposed length
-            # the 2 mm minimum marker remains inside the roof/plate interface
-            # rather than forming an external block above the AGV.
-            plate_bottom_offset = 0.5 * float(self.cfg.agv_size[2]) + self.lift_height[env_ids, i]
+            # Connect the calibrated yellow roof directly to the visual head.
+            # The head top is aligned with the hidden physical plate top, so it
+            # sits just below the Board instead of floating near the AGV roof.
+            plate_top_offset = (
+                0.5 * float(self.cfg.agv_size[2])
+                + self.lift_height[env_ids, i]
+                + float(self.cfg.lift_plate_size[2])
+            )
+            head_bottom_offset = plate_top_offset - float(self.cfg.lift_head_visual_size[2])
             visual_height = torch.clamp(
-                plate_bottom_offset - self._lift_visual_mount_height,
+                head_bottom_offset - self._lift_visual_mount_height,
                 min=actuator_min_height,
             )
-            visual_center_offset = plate_bottom_offset - 0.5 * visual_height
+            visual_center_offset = head_bottom_offset - 0.5 * visual_height
             actuator_positions.append(
                 agv_state[:, 0:3] + local_z * visual_center_offset.unsqueeze(-1)
             )
@@ -473,13 +482,9 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 )
             )
 
-            # Visual-only head: at zero travel its lower face is flush with the
-            # calibrated yellow-roof datum; lift travel moves it along local +Z.
-            head_center_offset = (
-                self._lift_visual_mount_height
-                + self.lift_height[env_ids, i]
-                + 0.5 * float(self.cfg.lift_head_visual_size[2])
-            )
+            # Its top face follows the hidden physical support surface, while
+            # retaining the compact 15 mm visual thickness.
+            head_center_offset = plate_top_offset - 0.5 * float(self.cfg.lift_head_visual_size[2])
             head_positions.append(
                 agv_state[:, 0:3] + local_z * head_center_offset.unsqueeze(-1)
             )
