@@ -123,6 +123,12 @@ def main() -> None:
         f"[CHECK] visual mount={1000.0 * raw_env._lift_visual_mount_height:.2f} mm above AGV root, "
         f"initial visible rod lengths={initial_visible.tolist()} mm"
     )
+    print(
+        f"[CHECK] physical plate visible/debug="
+        f"{bool(raw_env.cfg.debug_show_lift_collision_proxies)}, "
+        f"visual head size={tuple(1000.0 * float(v) for v in raw_env.cfg.lift_head_visual_size)} mm, "
+        f"rod diameter={2000.0 * float(raw_env.cfg.lift_actuator_visual_radius):.1f} mm"
+    )
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     elapsed = 0.0
     # simulate environment

@@ -63,7 +63,7 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
 
     # 无碰撞、无质量的纯视觉伸缩杆。杆原型为单位高度 cylinder，运行时沿
     # AGV 局部 +Z 缩放并放置在黄色 USD 外观顶面与 Lift Plate 底面之间。
-    lift_actuator_visual_radius = 0.024
+    lift_actuator_visual_radius = 0.028
     lift_actuator_visual_min_height = 0.002
     lift_actuator_visual_color = (0.16, 0.18, 0.22)
 
@@ -71,6 +71,12 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 内部 1 mm，而不是由隐藏物理代理的 agv_top_z 在运行时推导。该量仅影响
     # marker，不改变 AGV/Lift Plate 物理位姿。
     lift_visual_mount_height = 0.079
+
+    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其底面从黄色
+    # AGV 外观顶面随 lift_height 沿车体局部 +Z 抬升，不参与 PhysX。
+    lift_head_visual_size = (0.14, 0.14, 0.015)
+    lift_head_visual_color = (0.20, 0.23, 0.28)
+    debug_show_lift_collision_proxies = False
 
     # 后续动态调平时使用，目前 V7.0-A 暂时不控制。
     max_lift_speed = 0.04  # m/s

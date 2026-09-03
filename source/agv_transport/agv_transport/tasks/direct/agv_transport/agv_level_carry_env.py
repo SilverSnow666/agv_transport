@@ -99,6 +99,20 @@ class AgvLevelCarryEnv(DirectRLEnv):
             },
         )
         self.lift_actuator_visualizer = VisualizationMarkers(actuator_cfg)
+        head_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/LiftHeads",
+            markers={
+                "head": sim_utils.CuboidCfg(
+                    size=tuple(float(v) for v in self.cfg.lift_head_visual_size),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=tuple(float(v) for v in self.cfg.lift_head_visual_color),
+                        metallic=0.55,
+                        roughness=0.30,
+                    ),
+                )
+            },
+        )
+        self.lift_head_visualizer = VisualizationMarkers(head_cfg)
         # Give Fabric the final instance count before simulation starts.  The
         # marker poses are replaced with real AGV poses during the first reset.
         actuator_count = 3 * int(self.scene.cfg.num_envs)
@@ -113,6 +127,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
             translations=initial_positions,
             orientations=initial_orientations,
             scales=initial_scales,
+        )
+        self.lift_head_visualizer.visualize(
+            translations=initial_positions,
+            orientations=initial_orientations,
         )
 
         self.scene.rigid_objects["agv1"] = self.agv1
@@ -250,6 +268,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         stage = sim_utils.get_current_stage()
         show_agv_proxy = bool(getattr(self.cfg, "debug_show_agv_collision_proxies", False))
         show_payload_proxy = bool(getattr(self.cfg, "debug_show_payload_collision_proxy", False))
+        show_lift_proxy = bool(getattr(self.cfg, "debug_show_lift_collision_proxies", False))
 
         for env_id in range(self.num_envs):
             if not show_agv_proxy:
@@ -278,6 +297,19 @@ class AgvLevelCarryEnv(DirectRLEnv):
                     imageable = UsdGeom.Imageable(prim)
                     if imageable:
                         imageable.MakeInvisible()
+
+            if not show_lift_proxy:
+                for lift_name in ["Lift1", "Lift2", "Lift3"]:
+                    lift_root_path = f"/World/envs/env_{env_id}/{lift_name}"
+                    lift_root = stage.GetPrimAtPath(lift_root_path)
+                    if not lift_root.IsValid():
+                        continue
+                    for prim in Usd.PrimRange(lift_root):
+                        if prim.GetPath().pathString == lift_root_path:
+                            continue
+                        imageable = UsdGeom.Imageable(prim)
+                        if imageable:
+                            imageable.MakeInvisible()
 
     def _lift_actuator_external_lengths(
         self, env_ids: torch.Tensor | None = None
@@ -392,6 +424,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
         actuator_positions = []
         actuator_orientations = []
         actuator_scales = []
+        head_positions = []
+        head_orientations = []
         actuator_min_height = float(self.cfg.lift_actuator_visual_min_height)
 
         for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
@@ -439,10 +473,26 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 )
             )
 
+            # Visual-only head: at zero travel its lower face is flush with the
+            # calibrated yellow-roof datum; lift travel moves it along local +Z.
+            head_center_offset = (
+                self._lift_visual_mount_height
+                + self.lift_height[env_ids, i]
+                + 0.5 * float(self.cfg.lift_head_visual_size[2])
+            )
+            head_positions.append(
+                agv_state[:, 0:3] + local_z * head_center_offset.unsqueeze(-1)
+            )
+            head_orientations.append(agv_state[:, 3:7])
+
         self.lift_actuator_visualizer.visualize(
             translations=torch.cat(actuator_positions, dim=0),
             orientations=torch.cat(actuator_orientations, dim=0),
             scales=torch.cat(actuator_scales, dim=0),
+        )
+        self.lift_head_visualizer.visualize(
+            translations=torch.cat(head_positions, dim=0),
+            orientations=torch.cat(head_orientations, dim=0),
         )
 
     def _apply_virtual_friction_carry(self, dt: float) -> None:
