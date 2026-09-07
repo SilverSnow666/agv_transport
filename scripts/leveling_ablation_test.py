@@ -60,6 +60,8 @@ CASES = {
 
 FIELDS = (
     "time", "case", "direct_support", "virtual_friction", "geometric_leveling",
+    "cargo_enabled", "payload_vertical_damping", "payload_roll_pitch_damping",
+    "payload_yaw_damping", "payload_yaw_alignment_coupling",
     "agv1_z", "agv2_z", "agv3_z",
     "agv1_roll_deg", "agv2_roll_deg", "agv3_roll_deg",
     "agv1_pitch_deg", "agv2_pitch_deg", "agv3_pitch_deg",
@@ -172,12 +174,25 @@ def support_proxy(raw, spec, top):
     return xy_ok & z_ok
 
 
-def make_env(spec):
+ASSIST_NAMES = (
+    "virtual_friction_coupling", "slip_correction_gain", "payload_vertical_damping",
+    "payload_roll_pitch_damping", "payload_yaw_damping",
+    "payload_yaw_alignment_gain", "payload_yaw_alignment_coupling",
+)
+
+
+def make_env():
     cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric)
+    cfg.seed = 0
     cfg.enable_front_position_guard = False
     cfg.enable_rear_lateral_guard = False
     cfg.enable_bumpy_support = True
-    cfg.enable_virtual_friction_carry = bool(spec.vf)
+    # The benchmark concerns the carrier Board only.  V7.2 Cargo must never
+    # change its mass/contact response, even if a future task default enables it.
+    cfg.enable_cargo = False
+    # Build once and reset the same scene for every case.  Recreating Isaac Sim
+    # physics scenes in one process is both expensive and less comparable.
+    cfg.enable_virtual_friction_carry = True
     # Keep the benchmark running even when legacy Lift-based termination logic says support is lost.
     cfg.critical_support_contacts = 0.0
     cfg.payload_min_z = -100.0
@@ -185,24 +200,42 @@ def make_env(spec):
     cfg.workspace_limit = max(float(getattr(cfg, "workspace_limit", 5.0)), 100.0)
     cfg.episode_length_s = max(float(cfg.episode_length_s), float(args_cli.duration) + float(args_cli.settle_duration) + 2.0)
     env = gym.make(args_cli.task, cfg=cfg)
-    if spec.direct:
-        env.unwrapped._update_lift_poses = types.MethodType(park_lifts, env.unwrapped)
+    raw = env.unwrapped
+    assert raw.cargo is None, "Cargo must be absent from the Board ablation"
+    raw._ablation_lift_update = raw._update_lift_poses
+    raw._ablation_assist_defaults = {name: float(getattr(raw.cfg, name)) for name in ASSIST_NAMES}
     return env
+
+
+def configure_case(raw, spec):
+    raw.cfg.enable_virtual_friction_carry = bool(spec.vf)
+    for name, value in raw._ablation_assist_defaults.items():
+        setattr(raw.cfg, name, value if spec.vf else 0.0)
+    raw._update_lift_poses = (
+        types.MethodType(park_lifts, raw) if spec.direct else raw._ablation_lift_update
+    )
+    assert bool(raw.cfg.enable_virtual_friction_carry) is spec.vf
+    if not spec.vf:
+        for name in ASSIST_NAMES:
+            assert float(getattr(raw.cfg, name)) == 0.0, f"{name} leaked into Case {spec.key}"
 
 
 def settle(env, spec):
     raw = env.unwrapped
-    with torch.inference_mode(): env.reset(seed=0)
-    raw.base_z_disturbance.zero_()
-    if spec.direct:
-        place_direct_board(raw); raw._update_lift_poses()
+    configure_case(raw, spec)
     dt = float(raw.cfg.sim.dt) * int(raw.cfg.decimation)
     elapsed = 0.0
-    a = stop_actions(raw)
-    while simulation_app.is_running() and elapsed < max(float(args_cli.settle_duration), 0.0):
-        set_lift_target(raw, spec)
-        with torch.inference_mode(): env.step(a)
-        elapsed += dt
+    with torch.inference_mode():
+        env.reset(seed=0)
+        raw.base_z_disturbance.zero_()
+        if spec.direct:
+            place_direct_board(raw)
+            raw._update_lift_poses()
+        a = stop_actions(raw)
+        while simulation_app.is_running() and elapsed < max(float(args_cli.settle_duration), 0.0):
+            set_lift_target(raw, spec)
+            env.step(a)
+            elapsed += dt
 
 
 def summarize(rows):
@@ -223,21 +256,31 @@ def summarize(rows):
     }
 
 
-def run(spec, log_dir):
-    env = make_env(spec); raw = env.unwrapped
-    try:
-        settle(env, spec)
-        a, speed, lin_a = actions_for(raw, args_cli.target_speed)
+def run(env, spec, log_dir):
+    raw = env.unwrapped
+    settle(env, spec)
+    a, speed, lin_a = actions_for(raw, args_cli.target_speed)
+    with torch.inference_mode():
         dt = float(raw.cfg.sim.dt) * int(raw.cfg.decimation)
         p0 = raw.payload.data.root_pos_w[0, :2].clone()
         target = raw._get_target_xy()[0]
         move = (target - p0) / torch.linalg.norm(target - p0).clamp_min(1e-6)
-        prev_vz = float(raw.payload.data.root_lin_vel_w[0, 2]); prev_az = 0.0
+        prev_vz = float(raw.payload.data.root_lin_vel_w[0, 2]); prev_az = None
         rows = []; elapsed = 0.0
-        print(f"[INFO] {spec.key} {spec.label}: direct={spec.direct}, vf={spec.vf}, geometric={spec.geometric}, speed={speed:.3f}, action={lin_a:.6f}")
+        print(
+            f"[INFO] {spec.key} {spec.label}: direct={spec.direct}, vf={spec.vf}, "
+            f"geometric={spec.geometric}, cargo={raw.cargo is not None}, "
+            f"speed={speed:.3f}, action={lin_a:.6f}"
+        )
+        print(
+            f"[ISOLATION] vertical={float(raw.cfg.payload_vertical_damping):.3f}, "
+            f"roll_pitch={float(raw.cfg.payload_roll_pitch_damping):.3f}, "
+            f"yaw={float(raw.cfg.payload_yaw_damping):.3f}, "
+            f"yaw_alignment={float(raw.cfg.payload_yaw_alignment_coupling):.3f}"
+        )
         while simulation_app.is_running() and elapsed < float(args_cli.duration):
             set_lift_target(raw, spec); raw.base_z_disturbance[0] = 0.0
-            with torch.inference_mode(): env.step(a)
+            env.step(a)
             elapsed += dt
             top = agv_tops(raw) if spec.direct else lift_tops(raw)
             z = top[:, 2]
@@ -245,10 +288,16 @@ def run(spec, log_dir):
             count = float(support_proxy(raw, spec, top).float().sum())
             pos = raw.payload.data.root_pos_w[0]; lv = raw.payload.data.root_lin_vel_w[0]; av = raw.payload.data.root_ang_vel_w[0]
             roll, pitch, yaw = raw._get_payload_rpy()
-            vz = float(lv[2]); az = (vz - prev_vz) / dt; jerk = (az - prev_az) / dt
+            vz = float(lv[2]); az = (vz - prev_vz) / dt
+            jerk = 0.0 if prev_az is None else (az - prev_az) / dt
             prev_vz, prev_az = vz, az
             row = dict(
                 time=elapsed, case=spec.key, direct_support=float(spec.direct), virtual_friction=float(spec.vf), geometric_leveling=float(spec.geometric),
+                cargo_enabled=float(raw.cargo is not None),
+                payload_vertical_damping=float(raw.cfg.payload_vertical_damping),
+                payload_roll_pitch_damping=float(raw.cfg.payload_roll_pitch_damping),
+                payload_yaw_damping=float(raw.cfg.payload_yaw_damping),
+                payload_yaw_alignment_coupling=float(raw.cfg.payload_yaw_alignment_coupling),
                 agv1_z=float(raw.agvs[0].data.root_pos_w[0,2]), agv2_z=float(raw.agvs[1].data.root_pos_w[0,2]), agv3_z=float(raw.agvs[2].data.root_pos_w[0,2]),
                 agv1_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,0])), agv2_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,1])), agv3_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,2])),
                 agv1_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,0])), agv2_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,1])), agv3_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,2])),
@@ -267,12 +316,18 @@ def run(spec, log_dir):
         with path.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=FIELDS); w.writeheader(); w.writerows(rows)
         s = summarize(rows)
-        print(f"[RESULT] {spec.key}: roll RMS={s['roll_rms']:.4f}deg, pitch RMS={s['pitch_rms']:.4f}deg, az RMS={s['az_rms']:.4f}m/s2, RP w RMS={s['w_rms']:.4f}rad/s, jerk RMS={s['jerk_rms']:.4f}m/s3")
+        print(
+            f"[RESULT] {spec.key}: roll RMS={s['roll_rms']:.4f}deg, "
+            f"pitch RMS={s['pitch_rms']:.4f}deg, max |roll|={s['max_roll']:.4f}deg, "
+            f"max |pitch|={s['max_pitch']:.4f}deg"
+        )
+        print(
+            f"[RESULT] {spec.key}: az RMS={s['az_rms']:.4f}m/s2, "
+            f"RP w RMS={s['w_rms']:.4f}rad/s, jerk RMS={s['jerk_rms']:.4f}m/s3"
+        )
         print(f"[RESULT] {spec.key}: support RMS={s['support_rms_mm']:.3f}mm, mean support={s['mean_support']:.3f}/3, loss={100*s['loss_frac']:.2f}%, critical loss={100*s['critical_loss_frac']:.2f}%, Z range={s['z_range_mm']:.3f}mm, forward={s['forward_m']:.3f}m")
         print(f"[CHECK] CSV={path}")
-        return s
-    finally:
-        env.close()
+    return s
 
 
 def improvement(a, b): return 100.0 * (a - b) / max(abs(a), 1e-12)
@@ -280,20 +335,39 @@ def improvement(a, b): return 100.0 * (a - b) / max(abs(a), 1e-12)
 
 def compare(name, a, b):
     print(f"[ABLATION] {name}")
-    for key, label in (("roll_rms","roll RMS"),("pitch_rms","pitch RMS"),("az_rms","vertical acceleration RMS"),("w_rms","RP angular-speed RMS"),("jerk_rms","Z jerk RMS"),("support_rms_mm","support-height RMS")):
-        print(f"[ABLATION] {label}: {a[key]:.6g} -> {b[key]:.6g} ({improvement(a[key], b[key]):+.2f}% lower)")
-    print(f"[ABLATION] mean support: {a['mean_support']:.3f}->{b['mean_support']:.3f}; contact loss: {100*a['loss_frac']:.2f}%->{100*b['loss_frac']:.2f}%")
+    for key, label in (
+        ("roll_rms", "roll RMS"), ("pitch_rms", "pitch RMS"),
+        ("max_roll", "max |roll|"), ("max_pitch", "max |pitch|"),
+        ("az_rms", "vertical acceleration RMS"), ("w_rms", "RP angular-speed RMS"),
+        ("jerk_rms", "Z jerk RMS"), ("z_range_mm", "Board Z range"),
+        ("support_rms_mm", "support-height RMS"), ("loss_frac", "contact-loss proxy fraction"),
+    ):
+        delta = a[key] - b[key]
+        print(
+            f"[ABLATION] {label}: {a[key]:.6g} -> {b[key]:.6g}; "
+            f"absolute reduction={delta:+.6g}, percent reduction={improvement(a[key], b[key]):+.2f}%"
+        )
+    support_delta = b["mean_support"] - a["mean_support"]
+    support_pct = 100.0 * support_delta / max(abs(a["mean_support"]), 1.0e-12)
+    print(
+        f"[ABLATION] mean support proxy: {a['mean_support']:.3f} -> {b['mean_support']:.3f}; "
+        f"absolute increase={support_delta:+.3f}, percent increase={support_pct:+.2f}%"
+    )
 
 
 def main():
     log_dir = Path(args_cli.log_dir).expanduser().resolve(); log_dir.mkdir(parents=True, exist_ok=True)
     keys = tuple(CASES) if args_cli.case == "all" else (args_cli.case,)
-    out = {k: run(CASES[k], log_dir) for k in keys}
+    env = make_env()
+    try:
+        out = {k: run(env, CASES[k], log_dir) for k in keys}
+    finally:
+        env.close()
+    print("[NOTE] support/contact fields are analytical proxies, not PhysX contact-sensor measurements.")
     if args_cli.case == "all":
         compare("A -> B : Lift support/contact-topology contribution", out["A"], out["B"])
         compare("B -> C : virtual friction/damping contribution", out["B"], out["C"])
         compare("C -> D : geometric active-leveling contribution", out["C"], out["D"])
-        print("[NOTE] support_count_proxy is analytical geometry, not a PhysX contact-sensor measurement.")
         if out["B"]["forward_m"] < 0.25 * float(args_cli.target_speed) * float(args_cli.duration):
             print("[NOTE] Case B transports the Board poorly without virtual carry assist. This is a valid result for the current kinematic-AGV model; no hidden assist was re-enabled.")
 
