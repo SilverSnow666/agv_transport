@@ -327,6 +327,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         fixed_visual_span = (
             0.5 * float(self.cfg.agv_size[2])
             + float(self.cfg.lift_plate_size[2])
+            + float(self.cfg.board_support_clearance)
             - float(self.cfg.lift_head_visual_size[2])
             - self._lift_visual_mount_height
         )
@@ -460,15 +461,16 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
 
-            # Connect the calibrated yellow roof directly to the visual head.
-            # The head top is aligned with the hidden physical plate top, so it
-            # sits just below the Board instead of floating near the AGV roof.
+            # Connect the measured yellow-USD roof directly to the visual head.
+            # The visual head alone fills the intentional 3 mm physics clearance
+            # so the rendered assembly is continuous without changing collision.
             plate_top_offset = (
                 0.5 * float(self.cfg.agv_size[2])
                 + self.lift_height[env_ids, i]
                 + float(self.cfg.lift_plate_size[2])
             )
-            head_bottom_offset = plate_top_offset - float(self.cfg.lift_head_visual_size[2])
+            visual_head_top_offset = plate_top_offset + float(self.cfg.board_support_clearance)
+            head_bottom_offset = visual_head_top_offset - float(self.cfg.lift_head_visual_size[2])
             visual_height = torch.clamp(
                 head_bottom_offset - self._lift_visual_mount_height,
                 min=actuator_min_height,
@@ -489,9 +491,11 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 )
             )
 
-            # Its top face follows the hidden physical support surface, while
-            # retaining the compact 15 mm visual thickness.
-            head_center_offset = plate_top_offset - 0.5 * float(self.cfg.lift_head_visual_size[2])
+            # The top face reaches the nominal Board underside; the lower 12 mm
+            # still overlaps the hidden physical support plate.
+            head_center_offset = visual_head_top_offset - 0.5 * float(
+                self.cfg.lift_head_visual_size[2]
+            )
             head_positions.append(
                 agv_state[:, 0:3] + local_z * head_center_offset.unsqueeze(-1)
             )

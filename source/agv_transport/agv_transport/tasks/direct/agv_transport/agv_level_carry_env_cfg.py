@@ -67,13 +67,14 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     lift_actuator_visual_min_height = 0.002
     lift_actuator_visual_color = (0.16, 0.18, 0.22)
 
-    # 独立的纯视觉安装基准（AGV 局部 +Z）。GUI 校准后把杆根部放在车体
-    # 内部 1 mm，而不是由隐藏物理代理的 agv_top_z 在运行时推导。该量仅影响
-    # marker，不改变 AGV/Lift Plate 物理位姿。
-    lift_visual_mount_height = 0.079
+    # 独立的纯视觉安装基准（AGV 局部 +Z）。场景包围盒测得缩放后的黄色
+    # iwhub 可见车顶位于根节点上方约 20.06 mm；19 mm 将杆根嵌入车顶约
+    # 1 mm。不能使用 80 mm 高的隐藏碰撞代理顶面，否则会留下约 59 mm 空隙。
+    # 该量仅影响 marker，不改变 AGV/Lift Plate 物理位姿。
+    lift_visual_mount_height = 0.019
 
-    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面与隐藏
-    # 物理板顶面重合，使小承载头贴近 Board；圆杆负责连接黄色车顶，不参与 PhysX。
+    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面补齐
+    # board_support_clearance 并贴到 Board；圆杆连接黄色车顶，二者都不参与 PhysX。
     lift_head_visual_size = (0.14, 0.14, 0.015)
     lift_head_visual_color = (0.20, 0.23, 0.28)
     debug_show_lift_collision_proxies = False
