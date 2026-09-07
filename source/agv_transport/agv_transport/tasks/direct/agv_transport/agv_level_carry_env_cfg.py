@@ -226,6 +226,14 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     virtual_friction_coupling = 0.90
     slip_correction_gain = 1.10
     max_payload_planar_speed = 0.40
+
+    # Planar carry and pose stabilization are deliberately gated separately.
+    # Two supports may still provide limited tangential transport, but they must
+    # not receive artificial vertical/attitude damping.  Stabilization is only
+    # allowed with all three analytical contacts and the Board CoM inside the
+    # triangular support polygon.
+    virtual_stabilization_min_contacts = 3.0
+    virtual_stabilization_support_margin = 0.0
     payload_vertical_damping = 0.16
     payload_roll_pitch_damping = 0.22
 

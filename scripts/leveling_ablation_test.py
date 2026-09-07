@@ -29,6 +29,12 @@ parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--settle_duration", type=float, default=1.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
 parser.add_argument("--log_dir", type=str, default="logs/v7_ablation")
+parser.add_argument(
+    "--force_front_support_loss_at",
+    type=float,
+    default=None,
+    help="Diagnostic only: lower AGV1 by 1 m at this run time to force a two-support state.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.num_envs = 1
@@ -62,6 +68,7 @@ FIELDS = (
     "time", "case", "direct_support", "virtual_friction", "geometric_leveling",
     "cargo_enabled", "payload_vertical_damping", "payload_roll_pitch_damping",
     "payload_yaw_damping", "payload_yaw_alignment_coupling",
+    "virtual_carry_active", "virtual_stabilization_active",
     "agv1_z", "agv2_z", "agv3_z",
     "agv1_roll_deg", "agv2_roll_deg", "agv3_roll_deg",
     "agv1_pitch_deg", "agv2_pitch_deg", "agv3_pitch_deg",
@@ -279,7 +286,13 @@ def run(env, spec, log_dir):
             f"yaw_alignment={float(raw.cfg.payload_yaw_alignment_coupling):.3f}"
         )
         while simulation_app.is_running() and elapsed < float(args_cli.duration):
-            set_lift_target(raw, spec); raw.base_z_disturbance[0] = 0.0
+            set_lift_target(raw, spec)
+            raw.base_z_disturbance[0] = 0.0
+            if (
+                args_cli.force_front_support_loss_at is not None
+                and elapsed >= float(args_cli.force_front_support_loss_at)
+            ):
+                raw.base_z_disturbance[0, 0] = -1.0
             env.step(a)
             elapsed += dt
             top = agv_tops(raw) if spec.direct else lift_tops(raw)
@@ -298,6 +311,8 @@ def run(env, spec, log_dir):
                 payload_roll_pitch_damping=float(raw.cfg.payload_roll_pitch_damping),
                 payload_yaw_damping=float(raw.cfg.payload_yaw_damping),
                 payload_yaw_alignment_coupling=float(raw.cfg.payload_yaw_alignment_coupling),
+                virtual_carry_active=float(raw.last_virtual_carry_active[0]),
+                virtual_stabilization_active=float(raw.last_virtual_stabilization_active[0]),
                 agv1_z=float(raw.agvs[0].data.root_pos_w[0,2]), agv2_z=float(raw.agvs[1].data.root_pos_w[0,2]), agv3_z=float(raw.agvs[2].data.root_pos_w[0,2]),
                 agv1_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,0])), agv2_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,1])), agv3_roll_deg=float(torch.rad2deg(raw.agv_terrain_roll[0,2])),
                 agv1_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,0])), agv2_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,1])), agv3_pitch_deg=float(torch.rad2deg(raw.agv_terrain_pitch[0,2])),

@@ -68,6 +68,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.last_rear_lateral_error = torch.zeros((self.num_envs, 2), device=self.device)
         self.last_rear_lateral_correction = torch.zeros((self.num_envs, 2), device=self.device)
         self.last_applied_angular_speed = torch.zeros((self.num_envs, 3), device=self.device)
+        self.last_virtual_carry_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.last_virtual_stabilization_active = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
 
     # ---------------------------------------------------------------------
     # Scene
@@ -518,8 +522,14 @@ class AgvLevelCarryEnv(DirectRLEnv):
         contact_flags = self._compute_support_contact_flags(support_targets)
         contact_float = contact_flags.float()
         contact_count = contact_float.sum(dim=1)
-        valid = contact_count >= float(self.cfg.virtual_friction_min_contacts)
-        if not torch.any(valid):
+        carry_valid = contact_count >= float(self.cfg.virtual_friction_min_contacts)
+        support_margin = self._compute_support_polygon_margin(payload_xy)
+        stabilization_valid = (
+            contact_count >= float(self.cfg.virtual_stabilization_min_contacts)
+        ) & (support_margin > float(self.cfg.virtual_stabilization_support_margin))
+        self.last_virtual_carry_active[:] = carry_valid.detach()
+        self.last_virtual_stabilization_active[:] = stabilization_valid.detach()
+        if not torch.any(carry_valid):
             return
 
         weights = contact_float.unsqueeze(-1)
@@ -542,15 +552,27 @@ class AgvLevelCarryEnv(DirectRLEnv):
         alpha = float(self.cfg.virtual_friction_coupling)
         current_vxy = payload_state[:, 7:9]
         new_vxy = (1.0 - alpha) * current_vxy + alpha * desired_vxy
-        payload_state[:, 7:9] = torch.where(valid.unsqueeze(-1), new_vxy, current_vxy)
+        payload_state[:, 7:9] = torch.where(carry_valid.unsqueeze(-1), new_vxy, current_vxy)
 
-        # 在支撑有效时增加垂向、roll/pitch 角速度阻尼，避免最小闭环阶段货物持续抖动。
+        # Artificial vertical/attitude damping is stricter than planar carry.
+        # With only two supports, or once the CoM leaves the support polygon,
+        # gravity and PhysX contacts must be free to tip/drop the Board.
         vz = payload_state[:, 9]
         roll_w = payload_state[:, 10]
         pitch_w = payload_state[:, 11]
-        payload_state[:, 9] = torch.where(valid, vz * (1.0 - float(self.cfg.payload_vertical_damping)), vz)
-        payload_state[:, 10] = torch.where(valid, roll_w * (1.0 - float(self.cfg.payload_roll_pitch_damping)), roll_w)
-        payload_state[:, 11] = torch.where(valid, pitch_w * (1.0 - float(self.cfg.payload_roll_pitch_damping)), pitch_w)
+        payload_state[:, 9] = torch.where(
+            stabilization_valid, vz * (1.0 - float(self.cfg.payload_vertical_damping)), vz
+        )
+        payload_state[:, 10] = torch.where(
+            stabilization_valid,
+            roll_w * (1.0 - float(self.cfg.payload_roll_pitch_damping)),
+            roll_w,
+        )
+        payload_state[:, 11] = torch.where(
+            stabilization_valid,
+            pitch_w * (1.0 - float(self.cfg.payload_roll_pitch_damping)),
+            pitch_w,
+        )
 
         # Fix4：增加 payload yaw 软阻尼/对齐。
         # Fix3 只耦合平动速度，三车速度差、接触摩擦和支撑点不完全对称会给 payload
@@ -570,7 +592,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         damped_wz = current_wz * (1.0 - float(self.cfg.payload_yaw_damping))
         yaw_alpha = float(self.cfg.payload_yaw_alignment_coupling)
         new_wz = (1.0 - yaw_alpha) * damped_wz + yaw_alpha * desired_wz
-        payload_state[:, 12] = torch.where(valid, new_wz, current_wz)
+        payload_state[:, 12] = torch.where(stabilization_valid, new_wz, current_wz)
 
         self.payload.write_root_velocity_to_sim(payload_state[:, 7:])
 
@@ -1262,6 +1284,8 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.last_rear_lateral_error[env_ids] = 0.0
         self.last_rear_lateral_correction[env_ids] = 0.0
         self.last_applied_angular_speed[env_ids] = 0.0
+        self.last_virtual_carry_active[env_ids] = False
+        self.last_virtual_stabilization_active[env_ids] = False
 
     # ---------------------------------------------------------------------
     # Helper functions
