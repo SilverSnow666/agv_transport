@@ -12,6 +12,7 @@ D: Lift support + virtual carry/damping + geometric leveling
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 from dataclasses import dataclass
 import math
@@ -29,6 +30,7 @@ parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--settle_duration", type=float, default=1.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
 parser.add_argument("--log_dir", type=str, default="logs/v7_ablation")
+parser.add_argument("--screenshot_path", type=str, default=None)
 parser.add_argument(
     "--force_front_support_loss_at",
     type=float,
@@ -43,7 +45,9 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
+import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab_tasks.utils import parse_env_cfg
 import agv_transport.tasks  # noqa: F401
 
@@ -85,6 +89,24 @@ def rms(xs):
     return math.sqrt(sum(x * x for x in xs) / len(xs)) if xs else 0.0
 
 
+def capture_viewport(file_path, spec):
+    from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
+
+    output_path = Path(file_path).expanduser().resolve()
+    if args_cli.case == "all":
+        output_path = output_path.with_name(
+            f"{output_path.stem}_{spec.key}{output_path.suffix or '.png'}"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    capture = capture_viewport_to_file(get_active_viewport(), file_path=str(output_path))
+    future = asyncio.ensure_future(capture.wait_for_result(completion_frames=30))
+    while simulation_app.is_running() and not future.done():
+        simulation_app.update()
+    if not future.done() or not future.result() or not output_path.is_file():
+        raise RuntimeError(f"Viewport capture failed: {output_path}")
+    print(f"[CHECK] Screenshot={output_path}")
+
+
 def actions_for(raw, speed):
     vmax = float(raw.cfg.max_agv_linear_speed)
     speed = min(max(float(speed), 0.0), vmax)
@@ -120,6 +142,32 @@ def lift_tops(raw):
     return torch.stack(tops)
 
 
+def update_direct_support_visuals(raw, env_ids=None, visible=True):
+    """Show the full-footprint AGV roof volume used by physical Case A."""
+    if env_ids is None:
+        env_ids = raw.payload._ALL_INDICES
+    positions = []
+    orientations = []
+    for agv in raw.agvs:
+        state = agv.data.root_state_w[env_ids]
+        local_z = raw._quat_rotate_z(state[:, 3:7])
+        positions.append(
+            state[:, 0:3] + local_z * raw._direct_support_visual_center_offset
+        )
+        orientations.append(state[:, 3:7])
+    translations = torch.cat(positions, dim=0)
+    rotations = torch.cat(orientations, dim=0)
+    if not visible:
+        translations.zero_()
+        translations[:, 2] = -10.0
+        rotations.zero_()
+        rotations[:, 0] = 1.0
+    raw.direct_support_visualizer.visualize(
+        translations=translations,
+        orientations=rotations,
+    )
+
+
 def park_lifts(self, env_ids=None):
     if env_ids is None:
         env_ids = self.payload._ALL_INDICES
@@ -138,6 +186,7 @@ def park_lifts(self, env_ids=None):
     s[:, 2] = float(self.cfg.lift_actuator_visual_min_height)
     self.lift_actuator_visualizer.visualize(translations=p, orientations=q, scales=s)
     self.lift_head_visualizer.visualize(translations=p, orientations=q)
+    update_direct_support_visuals(self, env_ids=env_ids, visible=True)
 
 
 def place_direct_board(raw):
@@ -209,6 +258,35 @@ def make_env():
     env = gym.make(args_cli.task, cfg=cfg)
     raw = env.unwrapped
     assert raw.cargo is None, "Cargo must be absent from the Board ablation"
+    if args_cli.screenshot_path is not None:
+        raw.sim.set_camera_view(eye=(1.25, -1.35, 0.42), target=(0.20, 0.0, 0.14))
+    direct_visual_bottom = float(raw.cfg.lift_visual_mount_height)
+    direct_visual_top = (
+        0.5 * float(raw.cfg.agv_size[2]) + float(raw.cfg.board_support_clearance)
+    )
+    direct_visual_height = direct_visual_top - direct_visual_bottom
+    if direct_visual_height <= 0.0:
+        raise ValueError("Direct-support visual deck height must be positive")
+    raw._direct_support_visual_center_offset = direct_visual_bottom + 0.5 * direct_visual_height
+    direct_support_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/DirectSupportDecks",
+        markers={
+            "deck": sim_utils.CuboidCfg(
+                size=(
+                    float(raw.cfg.agv_size[0]),
+                    float(raw.cfg.agv_size[1]),
+                    direct_visual_height,
+                ),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.12, 0.14, 0.16),
+                    metallic=0.65,
+                    roughness=0.32,
+                ),
+            )
+        },
+    )
+    raw.direct_support_visualizer = VisualizationMarkers(direct_support_cfg)
+    update_direct_support_visuals(raw, visible=False)
     raw._ablation_lift_update = raw._update_lift_poses
     raw._ablation_assist_defaults = {name: float(getattr(raw.cfg, name)) for name in ASSIST_NAMES}
     return env
@@ -221,6 +299,8 @@ def configure_case(raw, spec):
     raw._update_lift_poses = (
         types.MethodType(park_lifts, raw) if spec.direct else raw._ablation_lift_update
     )
+    if not spec.direct:
+        update_direct_support_visuals(raw, visible=False)
     assert bool(raw.cfg.enable_virtual_friction_carry) is spec.vf
     if not spec.vf:
         for name in ASSIST_NAMES:
@@ -342,6 +422,8 @@ def run(env, spec, log_dir):
         )
         print(f"[RESULT] {spec.key}: support RMS={s['support_rms_mm']:.3f}mm, mean support={s['mean_support']:.3f}/3, loss={100*s['loss_frac']:.2f}%, critical loss={100*s['critical_loss_frac']:.2f}%, Z range={s['z_range_mm']:.3f}mm, forward={s['forward_m']:.3f}m")
         print(f"[CHECK] CSV={path}")
+    if args_cli.screenshot_path is not None:
+        capture_viewport(args_cli.screenshot_path, spec)
     return s
 
 
