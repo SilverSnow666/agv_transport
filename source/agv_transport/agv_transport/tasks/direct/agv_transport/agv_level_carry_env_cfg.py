@@ -67,11 +67,14 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     lift_actuator_visual_min_height = 0.002
     lift_actuator_visual_color = (0.16, 0.18, 0.22)
 
-    # 独立的纯视觉安装基准（AGV 局部 +Z）。场景包围盒测得缩放后的黄色
-    # iwhub 可见车顶位于根节点上方约 20.06 mm；19 mm 将杆根嵌入车顶约
-    # 1 mm。不能使用 80 mm 高的隐藏碰撞代理顶面，否则会留下约 59 mm 空隙。
-    # 该量仅影响 marker，不改变 AGV/Lift Plate 物理位姿。
-    lift_visual_mount_height = 0.019
+    # 场景包围盒测得原始黄色 iwhub 升降台顶面位于根节点上方约 20.061 mm。
+    # 只抬升 USD 内独立的 lift 可视子树，使其顶面与 80 mm 高的物理代理顶面
+    # 重合；底盘和车轮不移动。该量只影响显示，不改变碰撞、质量或刚体位姿。
+    agv_visual_roof_height = 0.020061
+    agv_native_lift_visual_raise = 0.059939
+
+    # V7 视觉伸缩杆从抬升后的原生升降台顶面内约 1 mm 处开始。
+    lift_visual_mount_height = 0.079
 
     # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面补齐
     # board_support_clearance 并贴到 Board；圆杆连接黄色车顶，二者都不参与 PhysX。
@@ -84,14 +87,10 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     lift_position_kp = 5.0
 
     # ------------------------- 纯视觉高度补偿 -------------------------
-    # 物理代理尺寸、根节点高度和 payload 物理高度全部恢复 V6.2.1。
-    # 这里只改变无碰撞外观子节点的局部变换，避免再次改变 checkpoint 的状态分布。
-    # V6.2.3 中 AGV 根高度为 0.0525、visual_z=-0.020；恢复根高度 0.080 后，
-    # 使用 -0.0475 可使可视模型原点的世界高度仍约为 0.0325 m。
+    # 黄色 USD 的世界位姿保持不变，让轮子继续贴合解析地形。
     agv_visual_translation = (0.05, 0.0, -0.0475)
 
-    # V6.2.1 的 payload 物理中心比 V6.2.3 高 0.064 m
-    # （代理顶面差 0.055 m + clearance 差 0.009 m）。黄色外观单独向下补偿。
+    # Board 的黄色外观与物理碰撞体共用局部原点。
     payload_visual_translation = (0.0, 0.0, 0.0)
     payload_visual_cfg = sim_utils.CuboidCfg(
         size=(1.60, 1.20, 0.08),
