@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import isaaclab.sim as sim_utils
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.utils import configclass
 
 from .agv_level_carry_env_cfg import AgvLevelCarryEnvCfg
@@ -7,15 +9,172 @@ from .agv_level_carry_env_cfg import AgvLevelCarryEnvCfg
 
 @configclass
 class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
-    """V7 visual-only telescopic Lift overlay.
+    """V7 telescopic-Lift geometry with a thinner hidden support proxy.
 
-    The hidden 0.28 x 0.28 x 0.04 m kinematic Lift plates remain the only
-    physical Board supports. These parameters only rebuild what the user sees:
-    a mostly embedded base, two telescopic guide posts, and a compact moving
-    head whose top surface follows the physical support surface.
+    The active-leveling task still uses three hidden kinematic Lift plates as
+    the physical Board supports.  The old proxy was 40 mm thick, which made a
+    30 mm neutral actuator height place the Board about 73 mm above the AGV
+    roof (30 mm travel + 40 mm proxy + 3 mm reset clearance).  That thickness
+    was only an ideal collision proxy, not a real mechanical requirement.
+
+    This config reduces the hidden Lift plate thickness to 15 mm while keeping
+    the 0--100 mm actuator travel and 30 mm neutral working point unchanged.
+    The nominal roof-to-Board-bottom distance therefore becomes about 48 mm:
+    30 mm neutral travel + 15 mm support proxy + 3 mm clearance.
+
+    All dependent initial heights and RigidObjectCfg instances are rebuilt here
+    so visual geometry, physical Lift collision, Board reset height, Cargo reset
+    height and drop threshold use the same 15 mm support thickness.
     """
 
+    # ------------------------------------------------------------------
+    # Physical Lift geometry override
+    # ------------------------------------------------------------------
+    lift_plate_size = (0.28, 0.28, 0.015)
+    lift_plate_mass = AgvLevelCarryEnvCfg.lift_plate_mass
+
+    # Recompute every height that the base class originally derived from the
+    # old 40 mm plate.  Do not simply override lift_plate_size: class-level
+    # derived values/RigidObjectCfg objects in the parent have already been
+    # constructed by that point.
+    payload_init_z = (
+        AgvLevelCarryEnvCfg.agv_top_z
+        + AgvLevelCarryEnvCfg.lift_neutral_height
+        + lift_plate_size[2]
+        + 0.5 * AgvLevelCarryEnvCfg.payload_size[2]
+        + AgvLevelCarryEnvCfg.board_support_clearance
+    )
+    payload_init_pos = (0.0, 0.0, payload_init_z)
+
+    cargo_init_z = (
+        payload_init_z
+        + 0.5 * AgvLevelCarryEnvCfg.payload_size[2]
+        + 0.5 * AgvLevelCarryEnvCfg.cargo_size[2]
+        + AgvLevelCarryEnvCfg.cargo_board_clearance
+    )
+    cargo_init_pos = (0.0, 0.0, cargo_init_z)
+
+    # Preserve the same allowed drop distance below the new nominal Board pose.
+    payload_min_z = payload_init_z - 0.093
+
+    lift_init_z = (
+        AgvLevelCarryEnvCfg.agv_top_z
+        + AgvLevelCarryEnvCfg.lift_neutral_height
+        + 0.5 * lift_plate_size[2]
+    )
+
+    _support_offsets = AgvLevelCarryEnvCfg.support_offsets_xy
+
+    lift1_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift1",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(_support_offsets[0][0], _support_offsets[0][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    lift2_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift2",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(_support_offsets[1][0], _support_offsets[1][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    lift3_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Lift3",
+        spawn=sim_utils.CuboidCfg(
+            size=lift_plate_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(_support_offsets[2][0], _support_offsets[2][1], lift_init_z),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    # Rebuild Board/Cargo configs because their inherited init-state objects
+    # still contain the old 40 mm-stack heights even after overriding the scalar
+    # payload_init_z/cargo_init_z values above.
+    payload_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Payload",
+        spawn=sim_utils.CuboidCfg(
+            size=AgvLevelCarryEnvCfg.payload_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=AgvLevelCarryEnvCfg.payload_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=AgvLevelCarryEnvCfg._payload_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(1.0, 0.55, 0.0), metallic=0.0
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=payload_init_pos,
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    cargo_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Cargo",
+        spawn=sim_utils.CuboidCfg(
+            size=AgvLevelCarryEnvCfg.cargo_size,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=False,
+                disable_gravity=False,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=AgvLevelCarryEnvCfg.cargo_mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=AgvLevelCarryEnvCfg._cargo_material,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.10, 0.65, 0.95), metallic=0.0, roughness=0.35
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=cargo_init_pos,
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Visual telescopic mechanism
+    # ------------------------------------------------------------------
     lift_visual_base_size = (0.17, 0.15, 0.024)
+    # Match the visible moving head thickness to the new thin support proxy.
     lift_visual_head_size = (0.18, 0.16, 0.015)
     # Unit-height cuboid. Runtime Z scale equals the exposed post length.
     lift_visual_column_size = (0.026, 0.026, 1.0)
