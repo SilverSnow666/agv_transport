@@ -1,7 +1,18 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""V7.2 free-Cargo stability comparison on the V7.1.1 terrain baseline."""
+"""V7.3 Board-attitude feedback comparison on the V7.1.1 terrain baseline.
+
+The three modes keep terrain, motion, support geometry, Cargo, and virtual-carry
+settings identical. Only the Lift controller changes:
+
+* ``no_leveling`` (C): fixed 30 mm neutral height.
+* ``geometric`` (D): support-height feedforward.
+* ``feedback`` (E): geometric feedforward plus Board-local roll/pitch PD.
+
+Cargo support/contact values are analytical geometry proxies, not PhysX contact
+sensor readings.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +25,25 @@ import traceback
 from isaaclab.app import AppLauncher
 
 
-parser = argparse.ArgumentParser(description="Validate terrain-following AGV attitude and geometric leveling.")
+parser = argparse.ArgumentParser(
+    description="Compare fixed, geometric, and Board-feedback Lift leveling on terrain."
+)
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--task", type=str, default="Template-Agv-Level-Carry-Direct-v0")
-parser.add_argument("--mode", choices=("no_leveling", "geometric", "both"), default="both")
+parser.add_argument(
+    "--mode",
+    choices=("no_leveling", "geometric", "feedback", "both", "all"),
+    default="both",
+)
 parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
-parser.add_argument("--log_dir", type=str, default="logs/v7_2")
+parser.add_argument("--log_dir", type=str, default="logs/v7_3")
+parser.add_argument("--feedback_roll_kp", type=float, default=None)
+parser.add_argument("--feedback_pitch_kp", type=float, default=None)
+parser.add_argument("--feedback_roll_kd", type=float, default=None)
+parser.add_argument("--feedback_pitch_kd", type=float, default=None)
+parser.add_argument("--feedback_max_correction_mm", type=float, default=None)
+parser.add_argument("--feedback_filter_alpha", type=float, default=None)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.num_envs = 1
@@ -54,6 +77,9 @@ CSV_FIELDS = (
     "support_height_error_rms",
     "board_z", "board_roll_deg", "board_pitch_deg",
     "board_roll_rate", "board_pitch_rate",
+    "board_rp_angular_speed", "board_vertical_accel",
+    "feedback_roll_cmd", "feedback_pitch_cmd",
+    "feedback_height1", "feedback_height2", "feedback_height3",
     "lift1_saturated", "lift2_saturated", "lift3_saturated", "board_yaw_deg",
     "cargo_x", "cargo_y", "cargo_z",
     "cargo_rel_x", "cargo_rel_y", "cargo_rel_z",
@@ -156,6 +182,59 @@ def _lift_top_centers(raw_env) -> torch.Tensor:
     return torch.stack(centers)
 
 
+def _geometric_lift_target(raw_env) -> tuple[torch.Tensor, torch.Tensor]:
+    """Equalize the three physical support-top world heights."""
+    top_before = _lift_top_centers(raw_env)
+    top_error = top_before[:, 2].mean() - top_before[:, 2]
+    agv_quat = torch.stack([agv.data.root_quat_w[0] for agv in raw_env.agvs])
+    axis_z = raw_env._quat_rotate_z(agv_quat)[:, 2].clamp_min(0.25)
+    return raw_env.lift_height[0] + top_error / axis_z, axis_z
+
+
+def _feedback_lift_target(
+    raw_env, filtered_height: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Add a zero-mean Board roll/pitch PD correction to geometric leveling."""
+    geometric_target, axis_z = _geometric_lift_target(raw_env)
+    roll, pitch, _ = raw_env._get_payload_rpy()
+    board_quat = raw_env.payload.data.root_quat_w[0]
+    board_ang_vel_local = _quat_rotate(
+        _quat_conjugate(board_quat), raw_env.payload.data.root_ang_vel_w[0]
+    )
+
+    roll_cmd = -(
+        float(raw_env.cfg.leveling_feedback_roll_kp) * roll[0]
+        + float(raw_env.cfg.leveling_feedback_roll_kd) * board_ang_vel_local[0]
+    )
+    pitch_cmd = -(
+        float(raw_env.cfg.leveling_feedback_pitch_kp) * pitch[0]
+        + float(raw_env.cfg.leveling_feedback_pitch_kd) * board_ang_vel_local[1]
+    )
+
+    offsets = torch.tensor(
+        raw_env.cfg.support_offsets_xy,
+        device=raw_env.device,
+        dtype=raw_env.lift_height.dtype,
+    )
+    height = -offsets[:, 0] * torch.tan(pitch_cmd) + offsets[:, 1] * torch.tan(roll_cmd)
+    height -= height.mean()
+    max_height = float(raw_env.cfg.leveling_feedback_max_correction)
+    max_abs = torch.max(torch.abs(height)).clamp_min(1.0e-9)
+    height *= torch.clamp(
+        torch.tensor(max_height, device=raw_env.device, dtype=height.dtype) / max_abs,
+        max=1.0,
+    )
+
+    alpha = float(raw_env.cfg.leveling_feedback_filter_alpha)
+    filtered_height = (1.0 - alpha) * filtered_height + alpha * height
+    return (
+        geometric_target + filtered_height / axis_z,
+        filtered_height,
+        roll_cmd,
+        pitch_cmd,
+    )
+
+
 def _summarize(rows: list[dict[str, float]], step_dt: float) -> dict[str, float]:
     result = {
         "roll_rms_deg": _rms([row["board_roll_deg"] for row in rows]),
@@ -163,6 +242,26 @@ def _summarize(rows: list[dict[str, float]], step_dt: float) -> dict[str, float]
         "max_abs_roll_deg": max(abs(row["board_roll_deg"]) for row in rows),
         "max_abs_pitch_deg": max(abs(row["board_pitch_deg"]) for row in rows),
         "support_height_rms_mm": 1000.0 * _rms([row["support_height_error_rms"] for row in rows]),
+        "board_rp_angular_speed_rms": _rms(
+            [row["board_rp_angular_speed"] for row in rows]
+        ),
+        "board_vertical_accel_rms": _rms([row["board_vertical_accel"] for row in rows]),
+        "lift_velocity_rms_mm_s": 1000.0
+        * _rms(
+            [
+                row[f"lift{lift_index}_velocity"]
+                for row in rows
+                for lift_index in range(1, 4)
+            ]
+        ),
+        "feedback_height_rms_mm": 1000.0
+        * _rms(
+            [
+                row[f"feedback_height{lift_index}"]
+                for row in rows
+                for lift_index in range(1, 4)
+            ]
+        ),
     }
     result.update({
         "cargo_relative_xy_rms_mm": 1000.0 * _rms(
@@ -200,6 +299,13 @@ def _print_summary(mode: str, summary: dict[str, float]) -> None:
         f"support RMS={summary['support_height_rms_mm']:.3f} mm"
     )
     print(
+        f"[RESULT] {mode}: Board roll/pitch angular-speed RMS="
+        f"{summary['board_rp_angular_speed_rms']:.5f} rad/s, "
+        f"vertical-acceleration RMS={summary['board_vertical_accel_rms']:.5f} m/s^2, "
+        f"Lift velocity RMS={summary['lift_velocity_rms_mm_s']:.3f} mm/s, "
+        f"feedback-height RMS={summary['feedback_height_rms_mm']:.3f} mm"
+    )
+    print(
         f"[RESULT] {mode}: Cargo relative XY RMS={summary['cargo_relative_xy_rms_mm']:.3f} mm, "
         f"max={summary['cargo_max_relative_xy_mm']:.3f} mm, "
         f"cumulative slip={summary['cargo_cumulative_slip_mm']:.3f} mm, "
@@ -221,6 +327,31 @@ def _make_environment():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric
     )
+    overrides = (
+        ("feedback_roll_kp", "leveling_feedback_roll_kp", 1.0),
+        ("feedback_pitch_kp", "leveling_feedback_pitch_kp", 1.0),
+        ("feedback_roll_kd", "leveling_feedback_roll_kd", 1.0),
+        ("feedback_pitch_kd", "leveling_feedback_pitch_kd", 1.0),
+        ("feedback_max_correction_mm", "leveling_feedback_max_correction", 0.001),
+        ("feedback_filter_alpha", "leveling_feedback_filter_alpha", 1.0),
+    )
+    for arg_name, cfg_name, scale in overrides:
+        value = getattr(args_cli, arg_name)
+        if value is not None:
+            setattr(env_cfg, cfg_name, float(value) * scale)
+    gains = (
+        float(env_cfg.leveling_feedback_roll_kp),
+        float(env_cfg.leveling_feedback_pitch_kp),
+        float(env_cfg.leveling_feedback_roll_kd),
+        float(env_cfg.leveling_feedback_pitch_kd),
+    )
+    if any(value < 0.0 for value in gains):
+        raise ValueError(f"Feedback gains must be non-negative, got {gains}")
+    if float(env_cfg.leveling_feedback_max_correction) <= 0.0:
+        raise ValueError("Feedback maximum height correction must be positive")
+    alpha = float(env_cfg.leveling_feedback_filter_alpha)
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"Feedback filter alpha must be in (0, 1], got {alpha}")
     env_cfg.enable_front_position_guard = False
     env_cfg.enable_rear_lateral_guard = False
     env_cfg.enable_bumpy_support = True
@@ -255,6 +386,10 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     previous_cargo_rel_xy = initial_cargo_rel[:2].clone()
     cumulative_slip = 0.0
     max_relative_slip = 0.0
+    filtered_feedback_height = torch.zeros(3, device=raw_env.device)
+    feedback_roll_cmd = torch.zeros((), device=raw_env.device)
+    feedback_pitch_cmd = torch.zeros((), device=raw_env.device)
+    previous_board_vz = raw_env.payload.data.root_lin_vel_w[0, 2].clone()
     board_half_xy = 0.5 * torch.tensor(raw_env.cfg.payload_size[:2], device=raw_env.device)
     cargo_half_xy = 0.5 * torch.tensor(raw_env.cfg.cargo_size[:2], device=raw_env.device)
     initial_center_over_board = bool(torch.all(torch.abs(initial_cargo_rel[:2]) <= board_half_xy))
@@ -274,22 +409,42 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
         f"face gap={1000.0 * float(initial_surface_gap):.4f} mm"
     )
     print(
+        f"[CHECK] {mode}: Cargo support/contact are analytical geometry proxies; "
+        "no PhysX contact sensor is used."
+    )
+    print(
         f"[INFO] {mode}: target speed={target_speed:.4f} m/s, action={linear_action:.6f}, "
         f"duration={args_cli.duration:.2f} s"
     )
+    if mode == "feedback":
+        print(
+            f"[CHECK] feedback gains: roll Kp/Kd="
+            f"{float(raw_env.cfg.leveling_feedback_roll_kp):.3f}/"
+            f"{float(raw_env.cfg.leveling_feedback_roll_kd):.3f} s, "
+            f"pitch Kp/Kd={float(raw_env.cfg.leveling_feedback_pitch_kp):.3f}/"
+            f"{float(raw_env.cfg.leveling_feedback_pitch_kd):.3f} s, "
+            f"max correction={1000.0 * float(raw_env.cfg.leveling_feedback_max_correction):.2f} mm, "
+            f"filter alpha={float(raw_env.cfg.leveling_feedback_filter_alpha):.3f}"
+        )
 
     while simulation_app.is_running() and elapsed < float(args_cli.duration):
-        if mode == "geometric":
-            # V7.1.1 controls the three actual top reference-center world
-            # heights.  A local-axis displacement changes world z by the
-            # corresponding AGV local +Z component.
-            top_before = _lift_top_centers(raw_env)
-            top_error = top_before[:, 2].mean() - top_before[:, 2]
-            agv_quat = torch.stack([agv.data.root_quat_w[0] for agv in raw_env.agvs])
-            axis_z = raw_env._quat_rotate_z(agv_quat)[:, 2].clamp_min(0.25)
-            raw_target = raw_env.lift_height[0] + top_error / axis_z
+        if mode == "feedback":
+            (
+                raw_target,
+                filtered_feedback_height,
+                feedback_roll_cmd,
+                feedback_pitch_cmd,
+            ) = _feedback_lift_target(raw_env, filtered_feedback_height)
+        elif mode == "geometric":
+            raw_target, _ = _geometric_lift_target(raw_env)
+            filtered_feedback_height.zero_()
+            feedback_roll_cmd.zero_()
+            feedback_pitch_cmd.zero_()
         else:
             raw_target = torch.full_like(raw_env.lift_height[0], neutral)
+            filtered_feedback_height.zero_()
+            feedback_roll_cmd.zero_()
+            feedback_pitch_cmd.zero_()
         saturated = (raw_target < lift_min) | (raw_target > lift_max)
         raw_env.lift_target_height[0] = torch.clamp(raw_target, min=lift_min, max=lift_max)
         raw_env.base_z_disturbance[0] = 0.0
@@ -311,6 +466,13 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
         roll, pitch, board_yaw = raw_env._get_payload_rpy()
         board_pos = raw_env.payload.data.root_pos_w[0]
         board_ang_vel = raw_env.payload.data.root_ang_vel_w[0]
+        board_ang_vel_local = _quat_rotate(
+            _quat_conjugate(raw_env.payload.data.root_quat_w[0]), board_ang_vel
+        )
+        board_rp_angular_speed = torch.linalg.norm(board_ang_vel_local[0:2])
+        board_vz = raw_env.payload.data.root_lin_vel_w[0, 2]
+        board_vertical_accel = (board_vz - previous_board_vz) / step_dt
+        previous_board_vz = board_vz.clone()
         cargo_rel, cargo_rel_quat, cargo_pos, cargo_surface_gap = _cargo_board_state(raw_env)
         cargo_rel_delta = cargo_rel - initial_cargo_rel
         relative_xy_displacement = torch.linalg.norm(cargo_rel_delta[:2])
@@ -342,7 +504,11 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
             raw_env.lift_height[0], raw_env.lift_velocity[0], lift_top.reshape(-1),
             support_error.reshape(1), board_pos[2].reshape(1),
             torch.rad2deg(roll[0]).reshape(1), torch.rad2deg(pitch[0]).reshape(1),
-            board_ang_vel[0:2], saturated.float(), torch.rad2deg(board_yaw[0]).reshape(1),
+            board_ang_vel[0:2], board_rp_angular_speed.reshape(1),
+            board_vertical_accel.reshape(1),
+            feedback_roll_cmd.reshape(1), feedback_pitch_cmd.reshape(1),
+            filtered_feedback_height, saturated.float(),
+            torch.rad2deg(board_yaw[0]).reshape(1),
             cargo_pos, cargo_rel, cargo_rel_delta,
             relative_xy_displacement.reshape(1), slip_step.reshape(1),
             torch.tensor((cumulative_slip, max_relative_slip), device=raw_env.device),
@@ -376,7 +542,11 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     if terrain_span < 1.0e-3:
         raise RuntimeError(f"Terrain excitation too small: span={1000.0 * terrain_span:.3f} mm")
 
-    csv_name = "cargo_geometric_leveling.csv" if mode == "geometric" else "cargo_no_leveling.csv"
+    csv_name = {
+        "no_leveling": "cargo_no_leveling.csv",
+        "geometric": "cargo_geometric_leveling.csv",
+        "feedback": "cargo_feedback_leveling.csv",
+    }[mode]
     csv_path = log_dir / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
@@ -396,22 +566,31 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
 def main() -> None:
     log_dir = Path(args_cli.log_dir).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
-    modes = ("no_leveling", "geometric") if args_cli.mode == "both" else (args_cli.mode,)
+    if args_cli.mode == "both":
+        modes = ("no_leveling", "geometric")
+    elif args_cli.mode == "all":
+        modes = ("no_leveling", "geometric", "feedback")
+    else:
+        modes = (args_cli.mode,)
     env = _make_environment()
     try:
         summaries = {mode: run_mode(env, mode, log_dir) for mode in modes}
     finally:
         env.close()
-    if args_cli.mode == "both":
-        baseline = summaries["no_leveling"]
-        geometric = summaries["geometric"]
-        print("[COMPARISON] geometric improvement relative to no_leveling:")
+
+    def print_comparison(
+        title: str, baseline: dict[str, float], candidate: dict[str, float]
+    ) -> None:
+        print(f"[COMPARISON] {title}:")
         for key, label in (
-            ("roll_rms_deg", "board roll RMS"),
-            ("pitch_rms_deg", "board pitch RMS"),
+            ("roll_rms_deg", "Board roll RMS"),
+            ("pitch_rms_deg", "Board pitch RMS"),
             ("max_abs_roll_deg", "max |roll|"),
             ("max_abs_pitch_deg", "max |pitch|"),
+            ("board_rp_angular_speed_rms", "Board roll/pitch angular-speed RMS"),
+            ("board_vertical_accel_rms", "Board vertical-acceleration RMS"),
             ("support_height_rms_mm", "support height RMS"),
+            ("lift_velocity_rms_mm_s", "Lift velocity RMS"),
             ("cargo_relative_xy_rms_mm", "Cargo relative XY RMS"),
             ("cargo_max_relative_xy_mm", "Cargo max relative XY"),
             ("cargo_cumulative_slip_mm", "Cargo cumulative slip"),
@@ -419,8 +598,31 @@ def main() -> None:
             ("cargo_pitch_rms_deg", "Cargo pitch RMS"),
             ("cargo_ang_speed_rms", "Cargo angular-speed RMS"),
         ):
-            improvement = 100.0 * (baseline[key] - geometric[key]) / max(baseline[key], 1.0e-12)
-            print(f"[COMPARISON] {label}: {improvement:+.2f}%")
+            absolute = baseline[key] - candidate[key]
+            if abs(baseline[key]) < 1.0e-9:
+                print(
+                    f"[COMPARISON] {label}: {baseline[key]:.6g} -> "
+                    f"{candidate[key]:.6g}, percentage=n/a"
+                )
+            else:
+                improvement = 100.0 * absolute / abs(baseline[key])
+                print(
+                    f"[COMPARISON] {label}: {absolute:+.6g} absolute, "
+                    f"{improvement:+.2f}% improvement"
+                )
+
+    if args_cli.mode in ("both", "all"):
+        print_comparison(
+            "C -> D, geometric contribution",
+            summaries["no_leveling"],
+            summaries["geometric"],
+        )
+    if args_cli.mode == "all":
+        print_comparison(
+            "D -> E, Board-attitude feedback contribution",
+            summaries["geometric"],
+            summaries["feedback"],
+        )
 
 
 if __name__ == "__main__":
