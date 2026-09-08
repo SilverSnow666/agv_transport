@@ -171,7 +171,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 translation=tuple(float(v) for v in self.cfg.agv_visual_translation),
                 orientation=(1.0, 0.0, 0.0, 0.0),
             )
-        self._raise_native_lift_visuals()
 
         # Independent visual-only mount calibrated against the yellow USD in
         # the GUI.  The Lift Plate still uses cfg.agv_size and lift_height.
@@ -193,57 +192,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2500.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-
-    def _raise_native_lift_visuals(self) -> None:
-        """Align the iwhub's visual lift top with the hidden AGV support plane."""
-        raise_world = float(getattr(self.cfg, "agv_native_lift_visual_raise", 0.0))
-        if abs(raise_world) < 1.0e-9:
-            return
-        visual_top = float(self.cfg.agv_visual_roof_height) + raise_world
-        physical_top = 0.5 * float(self.cfg.agv_size[2])
-        if abs(visual_top - physical_top) > 1.0e-5:
-            raise ValueError(
-                "Raised AGV visual lift top must match the physical support plane: "
-                f"visual={visual_top:.6f} m, physical={physical_top:.6f} m"
-            )
-        scale_z = float(self.cfg.agv_visual_cfg.scale[2])
-        if scale_z <= 0.0:
-            raise ValueError("AGV visual Z scale must be positive")
-        raise_local = raise_world / scale_z
-        stage = sim_utils.get_current_stage()
-        for agv_name in ("AGV1", "AGV2", "AGV3"):
-            # Move only the visible mesh branch.  The sibling Collision prim
-            # under /Visual/lift is intentionally left untouched.
-            path = f"/World/envs/env_0/{agv_name}/Visual/lift/Lift"
-            prim = stage.GetPrimAtPath(path)
-            if not prim.IsValid():
-                raise RuntimeError(f"Missing native AGV lift visual prim: {path}")
-            for descendant in Usd.PrimRange(prim):
-                applied = descendant.GetAppliedSchemas()
-                if any(
-                    "CollisionAPI" in schema or "RigidBodyAPI" in schema
-                    for schema in applied
-                ):
-                    raise RuntimeError(f"Native AGV lift is not visual-only: {descendant.GetPath()}")
-            xformable = UsdGeom.Xformable(prim)
-            transform_ops = [
-                op
-                for op in xformable.GetOrderedXformOps()
-                if op.GetOpType() == UsdGeom.XformOp.TypeTransform
-            ]
-            if len(transform_ops) != 1:
-                raise RuntimeError(f"Expected one native-lift transform op at {path}")
-            op = transform_ops[0]
-            matrix = Gf.Matrix4d(op.Get())
-            translation = matrix.ExtractTranslation()
-            matrix.SetTranslateOnly(
-                Gf.Vec3d(
-                    float(translation[0]),
-                    float(translation[1]),
-                    float(translation[2]) + raise_local,
-                )
-            )
-            op.Set(matrix)
 
     def _move_ground_plane_for_visual_terrain(self) -> None:
         """将默认 ground plane 下移，避免遮挡可视化崎岖地形 mesh。

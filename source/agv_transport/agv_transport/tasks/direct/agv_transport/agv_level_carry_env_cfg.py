@@ -47,6 +47,13 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
         scale=(0.45, 0.45, 0.45),
     )
 
+    # The unmodified, scaled iwhub roof is 0.100061 m above flat ground.
+    # Match its height to 0.061 mm while retaining the existing support footprint.
+    agv_size = (0.55, 0.42, 0.10)
+    agv_mass = 30.0
+    agv_center_z = 0.5 * agv_size[2]
+    agv_top_z = agv_center_z + 0.5 * agv_size[2]
+
     # ------------------------- V7.0 顶升机构 -------------------------
 
     # 第一阶段使用理想 kinematic 顶升平台。
@@ -67,14 +74,8 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     lift_actuator_visual_min_height = 0.002
     lift_actuator_visual_color = (0.16, 0.18, 0.22)
 
-    # 场景包围盒测得原始黄色 iwhub 升降台顶面位于根节点上方约 20.061 mm。
-    # 只抬升 USD 内独立的 lift 可视子树，使其顶面与 80 mm 高的物理代理顶面
-    # 重合；底盘和车轮不移动。该量只影响显示，不改变碰撞、质量或刚体位姿。
-    agv_visual_roof_height = 0.020061
-    agv_native_lift_visual_raise = 0.059939
-
-    # V7 视觉伸缩杆从抬升后的原生升降台顶面内约 1 mm 处开始。
-    lift_visual_mount_height = 0.079
+    # 杆根嵌入原始车顶约 1 mm；车型内部网格保持原始姿态。
+    lift_visual_mount_height = 0.5 * agv_size[2] - 0.001
 
     # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面补齐
     # board_support_clearance 并贴到 Board；圆杆连接黄色车顶，二者都不参与 PhysX。
@@ -87,8 +88,9 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     lift_position_kp = 5.0
 
     # ------------------------- 纯视觉高度补偿 -------------------------
-    # 黄色 USD 的世界位姿保持不变，让轮子继续贴合解析地形。
-    agv_visual_translation = (0.05, 0.0, -0.0475)
+    # 根节点随较薄的碰撞体降低；补偿子节点原点，使平地上原始车型和车轮
+    # 的世界高度保持不变。不是抬升车型内部的原生升降台。
+    agv_visual_translation = (0.05, 0.0, 0.0325 - agv_center_z)
 
     # Board 的黄色外观与物理碰撞体共用局部原点。
     payload_visual_translation = (0.0, 0.0, 0.0)
@@ -102,12 +104,6 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 调试开关只影响显示，不影响碰撞和训练。
     debug_show_agv_collision_proxies = False
     debug_show_payload_collision_proxy = False
-
-    # 三台 AGV 是移动支撑台。保持 V6.2.1 的 kinematic cuboid。
-    agv_size = (0.55, 0.42, 0.16)
-    agv_mass = 30.0
-    agv_center_z = 0.08
-    agv_top_z = agv_center_z + 0.5 * agv_size[2]
 
     # V7.1.1 equivalent wheel/ground contact footprint.  The visible iwhub
     # model and the kinematic collision proxy do not have identical extents,
@@ -132,7 +128,7 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     cargo_contact_tolerance = 0.012
     cargo_tip_threshold = 0.7853981633974483  # 45 deg
 
-    # 保持 V6.2.1 的物理支撑间隙与初始高度，确保旧 checkpoint 兼容。
+    # 初始投放间隙；Board/Lift/Cargo 的物理高度由当前 AGV 顶面推导。
     board_support_clearance = 0.003
 
     payload_init_z = (
@@ -304,7 +300,8 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 姿态稳定阈值：当前阶段只约束 roll/pitch，不把 yaw 作为成功或奖励目标。
     stable_roll_pitch_radius = 0.12
     tip_roll_pitch_threshold = 0.50
-    payload_min_z = 0.18
+    # Preserve the drop distance below the nominal Board pose after resizing.
+    payload_min_z = payload_init_z - 0.093
 
     # ------------------------- 奖励权重 -------------------------
     # 软约束版奖励：训练过程用连续质量因子引导，成功条件仍严格要求三车支撑。

@@ -229,6 +229,12 @@ def make_env():
     env = gym.make(args_cli.task, cfg=cfg)
     raw = env.unwrapped
     assert raw.cargo is None, "Cargo must be absent from the Board ablation"
+    print(
+        f"[GEOMETRY] AGV collider={tuple(cfg.agv_size)} m; "
+        f"root flat-Z={cfg.agv_center_z:.6f} m; "
+        f"support flat-Z={cfg.agv_top_z:.6f} m; original iwhub visual pose. "
+        "Use this geometry consistently for all four cases; legacy 160 mm runs differ."
+    )
     if args_cli.screenshot_path is not None:
         raw.sim.set_camera_view(eye=(1.25, -1.35, 0.42), target=(0.20, 0.0, 0.14))
     raw._ablation_lift_update = raw._update_lift_poses
