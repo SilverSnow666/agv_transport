@@ -34,7 +34,7 @@ parser.add_argument(
     "--visual_mount_height_mm",
     type=float,
     default=None,
-    help="Optional diagnostic override for the visual mount height above the AGV root.",
+    help=argparse.SUPPRESS,
 )
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -91,10 +91,12 @@ def main() -> None:
     env.reset()
     raw_env = env.unwrapped
     if args_cli.visual_mount_height_mm is not None:
-        raw_env._lift_visual_mount_height = 0.001 * float(args_cli.visual_mount_height_mm)
-        raw_env._update_lift_poses()
+        print(
+            "[WARN] --visual_mount_height_mm is deprecated and ignored; "
+            "the native iwhub asset is calibrated from its measured top surface."
+        )
     if args_cli.screenshot_path is not None:
-        raw_env.sim.set_camera_view(eye=(1.25, -1.35, 0.42), target=(0.20, 0.0, 0.14))
+        raw_env.sim.set_camera_view(eye=(1.45, -1.65, 0.25), target=(0.15, 0.0, 0.14))
     neutral = float(raw_env.cfg.lift_neutral_height)
     requested_height = (
         neutral if args_cli.lift_height_mm is None else 0.001 * float(args_cli.lift_height_mm)
@@ -112,7 +114,7 @@ def main() -> None:
         raw_env.lift_height.fill_(requested_height)
         raw_env.lift_velocity.zero_()
         raw_env._update_lift_poses()
-    initial_visible = 1000.0 * raw_env._lift_actuator_external_lengths()[0]
+    initial_native_offsets = 1000.0 * raw_env._native_lift_visual_offsets()[0]
     print(
         f"[CHECK] lift travel={1000.0 * float(raw_env.cfg.lift_min_height):.1f}-"
         f"{1000.0 * float(raw_env.cfg.lift_max_height):.1f} mm, "
@@ -120,14 +122,13 @@ def main() -> None:
         f"target={1000.0 * requested_height:.1f} mm"
     )
     print(
-        f"[CHECK] visual mount={1000.0 * raw_env._lift_visual_mount_height:.2f} mm above AGV root, "
-        f"initial roof-to-head rod lengths={initial_visible.tolist()} mm"
+        f"[CHECK] source native-Lift top={1000.0 * float(raw_env.cfg.agv_native_lift_visual_top_z):.3f} "
+        f"mm above flat ground, initial native-mesh translations={initial_native_offsets.tolist()} mm"
     )
     print(
         f"[CHECK] physical plate visible/debug="
         f"{bool(raw_env.cfg.debug_show_lift_collision_proxies)}, "
-        f"visual head size={tuple(1000.0 * float(v) for v in raw_env.cfg.lift_head_visual_size)} mm, "
-        f"rod diameter={2000.0 * float(raw_env.cfg.lift_actuator_visual_radius):.1f} mm"
+        "visual=single native iwhub Lift mesh; temporary cylinder/head markers=removed"
     )
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     elapsed = 0.0
@@ -167,11 +168,11 @@ def main() -> None:
                 raise RuntimeError(f"NaN/Inf detected at t={elapsed:.3f} s")
 
     heights = 1000.0 * raw_env.lift_height[0]
-    visible_lengths = 1000.0 * raw_env._lift_actuator_external_lengths()[0]
+    native_offsets = 1000.0 * raw_env._native_lift_visual_offsets()[0]
     print(
         f"[RESULT] static: duration={elapsed:.3f} s, "
         f"lift heights={heights.tolist()} mm, "
-        f"roof-to-head rod lengths={visible_lengths.tolist()} mm"
+        f"native-mesh translations={native_offsets.tolist()} mm"
     )
     if args_cli.screenshot_path is not None:
         screenshot_path = _capture_viewport(args_cli.screenshot_path)

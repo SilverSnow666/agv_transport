@@ -68,19 +68,10 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 运输工作高度只预顶升 30 mm；完全收缩时 Lift Plate 底面贴合 AGV 顶面。
     lift_neutral_height = 0.03
 
-    # 无碰撞、无质量的纯视觉伸缩杆。杆原型为单位高度 cylinder，运行时沿
-    # AGV 局部 +Z 缩放并放置在黄色 USD 外观顶面与 Lift Plate 底面之间。
-    lift_actuator_visual_radius = 0.028
-    lift_actuator_visual_min_height = 0.002
-    lift_actuator_visual_color = (0.16, 0.18, 0.22)
-
-    # 杆根嵌入原始车顶约 1 mm；车型内部网格保持原始姿态。
-    lift_visual_mount_height = 0.5 * agv_size[2] - 0.001
-
-    # 与 280 x 280 x 40 mm 隐藏碰撞代理解耦的纯视觉承载头。其顶面补齐
-    # board_support_clearance 并贴到 Board；圆杆连接黄色车顶，二者都不参与 PhysX。
-    lift_head_visual_size = (0.14, 0.14, 0.015)
-    lift_head_visual_color = (0.20, 0.23, 0.28)
+    # iwhub 自带的 Lift 是一个独立、无碰撞的合并网格；其 sibling Collision
+    # 不随它运动。下面是原始外观在平地上的实测顶面高度，运行时据此只平移
+    # 可见 Lift，使顶面贴住 Board 下表面。常用 30 mm 工作高度下底座仍与车体搭接。
+    agv_native_lift_visual_top_z = 0.100061
     debug_show_lift_collision_proxies = False
 
     # 后续动态调平时使用，目前 V7.0-A 暂时不控制。

@@ -8,7 +8,6 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectRLEnv
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from pxr import Gf, Usd, UsdGeom, Vt
 
@@ -47,6 +46,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.agv_terrain_roll = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_terrain_pitch = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_terrain_samples = torch.zeros((self.num_envs, 3, 4), device=self.device)
+        self._update_native_lift_visuals()
 
         target_xy = self._get_target_xy()
         payload_xy = self.payload.data.root_pos_w[:, :2]
@@ -88,56 +88,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.agvs = [self.agv1, self.agv2, self.agv3]
         self.lifts = [self.lift1, self.lift2, self.lift3]
 
-        actuator_cfg = VisualizationMarkersCfg(
-            prim_path="/Visuals/LiftActuators",
-            markers={
-                "actuator": sim_utils.CylinderCfg(
-                    radius=float(self.cfg.lift_actuator_visual_radius),
-                    height=1.0,
-                    axis="Z",
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=tuple(float(v) for v in self.cfg.lift_actuator_visual_color),
-                        metallic=0.65,
-                        roughness=0.28,
-                    ),
-                )
-            },
-        )
-        self.lift_actuator_visualizer = VisualizationMarkers(actuator_cfg)
-        head_cfg = VisualizationMarkersCfg(
-            prim_path="/Visuals/LiftHeads",
-            markers={
-                "head": sim_utils.CuboidCfg(
-                    size=tuple(float(v) for v in self.cfg.lift_head_visual_size),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=tuple(float(v) for v in self.cfg.lift_head_visual_color),
-                        metallic=0.55,
-                        roughness=0.30,
-                    ),
-                )
-            },
-        )
-        self.lift_head_visualizer = VisualizationMarkers(head_cfg)
-        # Give Fabric the final instance count before simulation starts.  The
-        # marker poses are replaced with real AGV poses during the first reset.
-        actuator_count = 3 * int(self.scene.cfg.num_envs)
-        initial_positions = torch.zeros((actuator_count, 3), device=self.device)
-        initial_positions[:, 2] = -10.0
-        initial_orientations = torch.zeros((actuator_count, 4), device=self.device)
-        initial_orientations[:, 0] = 1.0
-        initial_scales = torch.empty((actuator_count, 3), device=self.device)
-        initial_scales[:, 0:2] = 1.0
-        initial_scales[:, 2] = float(self.cfg.lift_actuator_visual_min_height)
-        self.lift_actuator_visualizer.visualize(
-            translations=initial_positions,
-            orientations=initial_orientations,
-            scales=initial_scales,
-        )
-        self.lift_head_visualizer.visualize(
-            translations=initial_positions,
-            orientations=initial_orientations,
-        )
-
         self.scene.rigid_objects["agv1"] = self.agv1
         self.scene.rigid_objects["agv2"] = self.agv2
         self.scene.rigid_objects["agv3"] = self.agv3
@@ -172,10 +122,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 orientation=(1.0, 0.0, 0.0, 0.0),
             )
 
-        # Independent visual-only mount calibrated against the yellow USD in
-        # the GUI.  The Lift Plate still uses cfg.agv_size and lift_height.
-        self._lift_visual_mount_height = float(self.cfg.lift_visual_mount_height)
-
         # Board 的黄色可视子节点与物理刚体共用局部原点。
         self.cfg.payload_visual_cfg.func(
             "/World/envs/env_0/Payload/Visual",
@@ -185,6 +131,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
         )
 
         self.scene.clone_environments(copy_from_source=False)
+        self._configure_native_lift_visuals()
         self._configure_proxy_visual_visibility()
 
         if self.device == "cpu":
@@ -192,6 +139,112 @@ class AgvLevelCarryEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2500.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def _configure_native_lift_visuals(self) -> None:
+        """Cache the visual-only iwhub Lift transforms for runtime articulation.
+
+        The source USD contains a single visible Lift mesh and a sibling
+        ``/lift/Collision`` prim.  Only ``/lift/Lift`` is moved here, so this
+        changes rendering without altering the AGV or hidden Lift collision.
+        """
+        self._native_lift_visual_ops = {}
+        # Skip thousands of USD edits during large headless training jobs, but
+        # keep small headless validation scenes inspectable.
+        if self.num_envs > 8 and not (self.sim.has_gui() or self.sim.has_rtx_sensors()):
+            return
+
+        stage = sim_utils.get_current_stage()
+        for env_id in range(self.num_envs):
+            for lift_index, agv_name in enumerate(("AGV1", "AGV2", "AGV3")):
+                path = f"/World/envs/env_{env_id}/{agv_name}/Visual/lift/Lift"
+                prim = stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    raise RuntimeError(f"Missing native AGV Lift visual prim: {path}")
+                for descendant in Usd.PrimRange(prim):
+                    if any(
+                        "CollisionAPI" in schema or "RigidBodyAPI" in schema
+                        for schema in descendant.GetAppliedSchemas()
+                    ):
+                        raise RuntimeError(
+                            f"Native AGV Lift branch is not visual-only: {descendant.GetPath()}"
+                        )
+                xformable = UsdGeom.Xformable(prim)
+                transform_ops = [
+                    op
+                    for op in xformable.GetOrderedXformOps()
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTransform
+                ]
+                if len(transform_ops) != 1:
+                    raise RuntimeError(f"Expected one native-Lift transform op at {path}")
+                op = transform_ops[0]
+                base_matrix = Gf.Matrix4d(op.Get())
+                self._native_lift_visual_ops[(env_id, lift_index)] = (
+                    prim,
+                    op,
+                    base_matrix,
+                    base_matrix.ExtractTranslation(),
+                )
+
+    def _native_lift_visual_offsets(
+        self, env_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Return the native Lift translation needed to touch the Board underside."""
+        if env_ids is None:
+            env_ids = self.payload._ALL_INDICES
+        source_top_from_root = (
+            float(self.cfg.agv_native_lift_visual_top_z) - float(self.cfg.agv_center_z)
+        )
+        target_top_from_root = (
+            0.5 * float(self.cfg.agv_size[2])
+            + self.lift_height[env_ids]
+            + float(self.cfg.lift_plate_size[2])
+            + float(self.cfg.board_support_clearance)
+        )
+        return target_top_from_root - source_top_from_root
+
+    def _update_native_lift_visuals(self, env_ids: torch.Tensor | None = None) -> None:
+        """Drive each iwhub Lift mesh from its corresponding ideal actuator height."""
+        if not getattr(self, "_native_lift_visual_ops", None):
+            return
+        if env_ids is None:
+            env_ids = self.payload._ALL_INDICES
+        selected_envs = [int(v) for v in env_ids.detach().cpu().tolist()]
+        offsets = self._native_lift_visual_offsets(env_ids).detach().cpu()
+        scale_z = float(self.cfg.agv_visual_cfg.scale[2])
+        if scale_z <= 0.0:
+            raise ValueError("AGV visual Z scale must be positive")
+
+        for row, env_id in enumerate(selected_envs):
+            for lift_index in range(3):
+                _, op, base_matrix, base_translation = self._native_lift_visual_ops[
+                    (env_id, lift_index)
+                ]
+                matrix = Gf.Matrix4d(base_matrix)
+                matrix.SetTranslateOnly(
+                    Gf.Vec3d(
+                        float(base_translation[0]),
+                        float(base_translation[1]),
+                        float(base_translation[2]) + float(offsets[row, lift_index]) / scale_z,
+                    )
+                )
+                op.Set(matrix)
+
+    def _set_native_lift_visual_visibility(
+        self, visible: bool, env_ids: torch.Tensor | None = None
+    ) -> None:
+        """Show the native Lift for B/C/D or hide it for direct-support Case A."""
+        if not getattr(self, "_native_lift_visual_ops", None):
+            return
+        if env_ids is None:
+            env_ids = self.payload._ALL_INDICES
+        for env_id in (int(v) for v in env_ids.detach().cpu().tolist()):
+            for lift_index in range(3):
+                prim = self._native_lift_visual_ops[(env_id, lift_index)][0]
+                imageable = UsdGeom.Imageable(prim)
+                if visible:
+                    imageable.MakeVisible()
+                else:
+                    imageable.MakeInvisible()
 
     def _move_ground_plane_for_visual_terrain(self) -> None:
         """将默认 ground plane 下移，避免遮挡可视化崎岖地形 mesh。
@@ -314,21 +367,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
                         if imageable:
                             imageable.MakeInvisible()
 
-    def _lift_actuator_external_lengths(
-        self, env_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Return roof-to-head visual rod lengths for the three lifts."""
-        if env_ids is None:
-            env_ids = self.payload._ALL_INDICES
-        fixed_visual_span = (
-            0.5 * float(self.cfg.agv_size[2])
-            + float(self.cfg.lift_plate_size[2])
-            + float(self.cfg.board_support_clearance)
-            - float(self.cfg.lift_head_visual_size[2])
-            - self._lift_visual_mount_height
-        )
-        return self.lift_height[env_ids] + fixed_visual_span
-
     # ---------------------------------------------------------------------
     # Action
     # ---------------------------------------------------------------------
@@ -431,13 +469,6 @@ class AgvLevelCarryEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
 
-        actuator_positions = []
-        actuator_orientations = []
-        actuator_scales = []
-        head_positions = []
-        head_orientations = []
-        actuator_min_height = float(self.cfg.lift_actuator_visual_min_height)
-
         for i, (agv, lift) in enumerate(zip(self.agvs, self.lifts)):
             agv_state = agv.data.root_state_w[env_ids]
             lift_pose = torch.zeros((len(env_ids), 7), device=self.device)
@@ -456,56 +487,7 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift_velocity[:, 3:6] = agv_state[:, 10:13]
             lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
             lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
-
-            # Connect the measured yellow-USD roof directly to the visual head.
-            # The visual head alone fills the intentional 3 mm physics clearance
-            # so the rendered assembly is continuous without changing collision.
-            plate_top_offset = (
-                0.5 * float(self.cfg.agv_size[2])
-                + self.lift_height[env_ids, i]
-                + float(self.cfg.lift_plate_size[2])
-            )
-            visual_head_top_offset = plate_top_offset + float(self.cfg.board_support_clearance)
-            head_bottom_offset = visual_head_top_offset - float(self.cfg.lift_head_visual_size[2])
-            visual_height = torch.clamp(
-                head_bottom_offset - self._lift_visual_mount_height,
-                min=actuator_min_height,
-            )
-            visual_center_offset = head_bottom_offset - 0.5 * visual_height
-            actuator_positions.append(
-                agv_state[:, 0:3] + local_z * visual_center_offset.unsqueeze(-1)
-            )
-            actuator_orientations.append(agv_state[:, 3:7])
-            actuator_scales.append(
-                torch.stack(
-                    (
-                        torch.ones_like(visual_height),
-                        torch.ones_like(visual_height),
-                        visual_height,
-                    ),
-                    dim=1,
-                )
-            )
-
-            # The top face reaches the nominal Board underside; the lower 12 mm
-            # still overlaps the hidden physical support plate.
-            head_center_offset = visual_head_top_offset - 0.5 * float(
-                self.cfg.lift_head_visual_size[2]
-            )
-            head_positions.append(
-                agv_state[:, 0:3] + local_z * head_center_offset.unsqueeze(-1)
-            )
-            head_orientations.append(agv_state[:, 3:7])
-
-        self.lift_actuator_visualizer.visualize(
-            translations=torch.cat(actuator_positions, dim=0),
-            orientations=torch.cat(actuator_orientations, dim=0),
-            scales=torch.cat(actuator_scales, dim=0),
-        )
-        self.lift_head_visualizer.visualize(
-            translations=torch.cat(head_positions, dim=0),
-            orientations=torch.cat(head_orientations, dim=0),
-        )
+        self._update_native_lift_visuals(env_ids)
 
     def _apply_virtual_friction_carry(self, dt: float) -> None:
         """用虚拟摩擦耦合修正 kinematic 支撑台无法可靠带动 payload 的问题。

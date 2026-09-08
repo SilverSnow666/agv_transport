@@ -151,13 +151,7 @@ def park_lifts(self, env_ids=None):
         pose[:, 3] = 1.0
         lift.write_root_pose_to_sim(pose, env_ids=env_ids)
         lift.write_root_velocity_to_sim(torch.zeros((n, 6), device=self.device), env_ids=env_ids)
-    p = torch.zeros((3 * n, 3), device=self.device)
-    p[:, 2] = -10.0
-    q = torch.zeros((3 * n, 4), device=self.device); q[:, 0] = 1.0
-    s = torch.ones((3 * n, 3), device=self.device)
-    s[:, 2] = float(self.cfg.lift_actuator_visual_min_height)
-    self.lift_actuator_visualizer.visualize(translations=p, orientations=q, scales=s)
-    self.lift_head_visualizer.visualize(translations=p, orientations=q)
+    self._set_native_lift_visual_visibility(False, env_ids)
 
 
 def place_direct_board(raw):
@@ -246,6 +240,7 @@ def configure_case(raw, spec):
     raw.cfg.enable_virtual_friction_carry = bool(spec.vf)
     for name, value in raw._ablation_assist_defaults.items():
         setattr(raw.cfg, name, value if spec.vf else 0.0)
+    raw._set_native_lift_visual_visibility(not spec.direct)
     raw._update_lift_poses = (
         types.MethodType(park_lifts, raw) if spec.direct else raw._ablation_lift_update
     )
