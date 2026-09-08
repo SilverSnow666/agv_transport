@@ -22,6 +22,16 @@ class AgvLevelCarryLiftVisualEnv(AgvLevelCarryEnv):
 
     cfg: AgvLevelCarryLiftVisualEnvCfg
 
+    def _all_env_ids(self) -> torch.Tensor:
+        """Return environment indices without relying on asset initialization internals.
+
+        During ``_setup_scene`` the RigidObject handles already exist, but Isaac
+        Lab has not necessarily initialized private helpers such as
+        ``payload._ALL_INDICES`` yet.  Visual setup must therefore derive the
+        indices directly from ``num_envs``.
+        """
+        return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+
     def _setup_scene(self) -> None:
         super()._setup_scene()
 
@@ -34,7 +44,11 @@ class AgvLevelCarryLiftVisualEnv(AgvLevelCarryEnv):
         # makes the whole frame float. Keep it hidden and draw a kinematically
         # meaningful visual overlay instead. The sibling/hidden physical Lift
         # plates are not changed here.
-        super()._set_native_lift_visual_visibility(False)
+        #
+        # Important: _setup_scene runs before RigidObject initialization is
+        # complete, so pass explicit env ids instead of letting the parent
+        # access payload._ALL_INDICES.
+        super()._set_native_lift_visual_visibility(False, self._all_env_ids())
 
         if not self._telescopic_lift_visual_enabled:
             return
@@ -215,6 +229,8 @@ class AgvLevelCarryLiftVisualEnv(AgvLevelCarryEnv):
         self, visible: bool, env_ids: torch.Tensor | None = None
     ) -> None:
         """Compatibility hook used by the A/B/C/D ablation script."""
+        if env_ids is None:
+            env_ids = self._all_env_ids()
         super()._set_native_lift_visual_visibility(False, env_ids)
         self._telescopic_lift_visual_visible = bool(visible)
         self._update_telescopic_lift_visuals()
@@ -228,7 +244,7 @@ class AgvLevelCarryLiftVisualEnv(AgvLevelCarryEnv):
     ) -> None:
         """Place Lift + Board consistently at one starting height for demos/tests."""
         if env_ids is None:
-            env_ids = self.payload._ALL_INDICES
+            env_ids = self._all_env_ids()
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
 
