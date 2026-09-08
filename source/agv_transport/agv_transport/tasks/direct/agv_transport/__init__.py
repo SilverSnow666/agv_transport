@@ -27,15 +27,16 @@ gym.register(
     },
 )
 
-# V7.0 active-leveling carrying task:
-# three AGVs support a common carrier board and will later
-# regulate independent lift heights for active leveling.
+# V7 active-leveling carrying task. The physical environment remains the
+# validated AgvLevelCarryEnv model; the subclass only rebuilds the visible Lift
+# as an embedded base + telescopic guides + moving head synchronized with the
+# hidden physical Lift plates.
 gym.register(
     id="Template-Agv-Level-Carry-Direct-v0",
-    entry_point=f"{__name__}.agv_level_carry_env:AgvLevelCarryEnv",
+    entry_point=f"{__name__}.agv_level_carry_lift_env:AgvLevelCarryLiftVisualEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.agv_level_carry_env_cfg:AgvLevelCarryEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.agv_level_carry_lift_env_cfg:AgvLevelCarryLiftVisualEnvCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_carry_cfg.yaml",
     },
 )
