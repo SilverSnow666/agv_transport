@@ -1,9 +1,7 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Single-environment static validation for the embedded Lift visual."""
+"""Single-environment static validation for the telescopic Lift visual."""
 
 import argparse
 import asyncio
@@ -11,53 +9,34 @@ from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Validate the embedded Lift visual in a static scene.")
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
-)
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
-parser.add_argument(
-    "--task", type=str, default="Template-Agv-Level-Carry-Direct-v0", help="Name of the task."
-)
-parser.add_argument("--duration", type=float, default=None, help="Optional finite validation duration in seconds.")
+parser = argparse.ArgumentParser(description="Validate the telescopic Lift visual in a static scene.")
+parser.add_argument("--disable_fabric", action="store_true", default=False)
+parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument("--task", type=str, default="Template-Agv-Level-Carry-Direct-v0")
+parser.add_argument("--duration", type=float, default=None)
 parser.add_argument(
     "--lift_height_mm",
     type=float,
     default=None,
-    help="Optional common Lift target in millimetres; defaults to the 30 mm neutral height.",
+    help="Optional common static Lift height in millimetres; defaults to 30 mm neutral.",
 )
-parser.add_argument(
-    "--screenshot_path", type=str, default=None, help="Optional viewport screenshot output path."
-)
-parser.add_argument(
-    "--visual_mount_height_mm",
-    type=float,
-    default=None,
-    help=argparse.SUPPRESS,
-)
-# append AppLauncher cli args
+parser.add_argument("--screenshot_path", type=str, default=None)
+parser.add_argument("--visual_mount_height_mm", type=float, default=None, help=argparse.SUPPRESS)
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
 args_cli = parser.parse_args()
 
-# launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
-
-"""Rest everything follows."""
 
 import gymnasium as gym
 import torch
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
-
 import agv_transport.tasks  # noqa: F401
 
 
 def _capture_viewport(file_path: str) -> Path:
-    """Capture the active GUI viewport after the validation settles."""
     from omni.kit.viewport.utility import capture_viewport_to_file, get_active_viewport
 
     output_path = Path(file_path).expanduser().resolve()
@@ -72,88 +51,78 @@ def _capture_viewport(file_path: str) -> Path:
 
 
 def main() -> None:
-    """Run the single-environment embedded-Lift validation."""
-    # create environment configuration
     env_cfg = parse_env_cfg(
-        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
+        args_cli.task,
+        device=args_cli.device,
+        num_envs=args_cli.num_envs,
+        use_fabric=not args_cli.disable_fabric,
     )
-    # V7.0-A static visualization test:
-    # disable old V6 motion-level feedback controllers
     env_cfg.enable_rear_lateral_guard = False
     env_cfg.enable_front_position_guard = False
-    # create environment
+    env_cfg.enable_bumpy_support = False
+    env_cfg.enable_virtual_friction_carry = False
+    env_cfg.enable_cargo = False
     env = gym.make(args_cli.task, cfg=env_cfg)
 
-    # print info (this is vectorized environment)
-    print(f"[INFO]: Gym observation space: {env.observation_space}")
-    print(f"[INFO]: Gym action space: {env.action_space}")
-    # reset environment
+    print(f"[INFO] Gym observation space: {env.observation_space}")
+    print(f"[INFO] Gym action space: {env.action_space}")
     env.reset()
     raw_env = env.unwrapped
+
     if args_cli.visual_mount_height_mm is not None:
-        print(
-            "[WARN] --visual_mount_height_mm is deprecated and ignored; "
-            "the native iwhub asset is calibrated from its measured top surface."
-        )
-    if args_cli.screenshot_path is not None:
-        raw_env.sim.set_camera_view(eye=(1.45, -1.65, 0.25), target=(0.15, 0.0, 0.14))
+        print("[WARN] --visual_mount_height_mm is deprecated and ignored.")
+
     neutral = float(raw_env.cfg.lift_neutral_height)
-    requested_height = (
-        neutral if args_cli.lift_height_mm is None else 0.001 * float(args_cli.lift_height_mm)
-    )
-    if not float(raw_env.cfg.lift_min_height) <= requested_height <= float(raw_env.cfg.lift_max_height):
+    requested_height = neutral if args_cli.lift_height_mm is None else 0.001 * float(args_cli.lift_height_mm)
+    lo = float(raw_env.cfg.lift_min_height)
+    hi = float(raw_env.cfg.lift_max_height)
+    if not lo <= requested_height <= hi:
         raise ValueError(
             f"Requested lift height {1000.0 * requested_height:.1f} mm is outside "
-            f"[{1000.0 * float(raw_env.cfg.lift_min_height):.1f}, "
-            f"{1000.0 * float(raw_env.cfg.lift_max_height):.1f}] mm"
+            f"[{1000.0 * lo:.1f}, {1000.0 * hi:.1f}] mm"
         )
-    raw_env.lift_target_height.fill_(requested_height)
-    if args_cli.lift_height_mm is not None:
-        # Directly select a static visual pose.  The Board initial pose remains
-        # untouched; dynamic actuator tracking is covered by the disturbance test.
+
+    if hasattr(raw_env, "set_lift_stack_initial_height"):
+        # Static selection moves the physical Lift and Board together. This
+        # avoids the old misleading screenshot where the Lift moved but the
+        # Board remained at the 30 mm neutral reset height.
+        with torch.inference_mode():
+            raw_env.set_lift_stack_initial_height(requested_height)
+    else:
+        raw_env.lift_target_height.fill_(requested_height)
         raw_env.lift_height.fill_(requested_height)
         raw_env.lift_velocity.zero_()
         raw_env._update_lift_poses()
-    initial_native_offsets = 1000.0 * raw_env._native_lift_visual_offsets()[0]
+
+    if args_cli.screenshot_path is not None:
+        raw_env.sim.set_camera_view(eye=(1.45, -1.65, 0.25), target=(0.15, 0.0, 0.14))
+
     print(
-        f"[CHECK] lift travel={1000.0 * float(raw_env.cfg.lift_min_height):.1f}-"
-        f"{1000.0 * float(raw_env.cfg.lift_max_height):.1f} mm, "
-        f"neutral={1000.0 * neutral:.1f} mm, "
-        f"target={1000.0 * requested_height:.1f} mm"
+        f"[CHECK] lift travel={1000.0 * lo:.1f}-{1000.0 * hi:.1f} mm, "
+        f"neutral={1000.0 * neutral:.1f} mm, target={1000.0 * requested_height:.1f} mm"
     )
+    if hasattr(raw_env, "lift_visual_column_lengths"):
+        lengths = 1000.0 * raw_env.lift_visual_column_lengths()[0]
+        print(
+            f"[CHECK] visual=embedded base + two telescopic posts + moving head; "
+            f"post lengths={lengths.tolist()} mm"
+        )
+    else:
+        print("[WARN] telescopic Lift visual helper is unavailable; using legacy task visual")
     print(
-        f"[CHECK] source native-Lift top={1000.0 * float(raw_env.cfg.agv_native_lift_visual_top_z):.3f} "
-        f"mm above flat ground, initial native-mesh translations={initial_native_offsets.tolist()} mm"
+        f"[CHECK] hidden physical Lift plate debug-visible="
+        f"{bool(raw_env.cfg.debug_show_lift_collision_proxies)}"
     )
-    print(
-        f"[CHECK] physical plate visible/debug="
-        f"{bool(raw_env.cfg.debug_show_lift_collision_proxies)}, "
-        "visual=single native iwhub Lift mesh; temporary cylinder/head markers=removed"
-    )
+
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     elapsed = 0.0
-    # simulate environment
     while simulation_app.is_running() and (
         args_cli.duration is None or elapsed < float(args_cli.duration)
     ):
         with torch.inference_mode():
-            # V7.0-A static test:
-            # action layout = [v1, w1, v2, w2, v3, w3]
-            #
-            # Because forward_only_linear_speed maps:
-            # -1 -> 0 speed
-            #  0 -> 50% speed
-            # +1 -> 100% speed
-            actions = torch.zeros(
-                env.action_space.shape,
-                device=env.unwrapped.device,
-            )
-
-            # Stop all three AGVs
-            actions[:, 0] = -1.0
-            actions[:, 2] = -1.0
-            actions[:, 4] = -1.0
-
+            actions = torch.zeros(env.action_space.shape, device=raw_env.device)
+            if bool(getattr(raw_env.cfg, "forward_only_linear_speed", True)):
+                actions[:, 0::2] = -1.0
             env.step(actions)
             elapsed += step_dt
 
@@ -168,11 +137,10 @@ def main() -> None:
                 raise RuntimeError(f"NaN/Inf detected at t={elapsed:.3f} s")
 
     heights = 1000.0 * raw_env.lift_height[0]
-    native_offsets = 1000.0 * raw_env._native_lift_visual_offsets()[0]
+    board_z = 1000.0 * float(raw_env.payload.data.root_pos_w[0, 2])
     print(
         f"[RESULT] static: duration={elapsed:.3f} s, "
-        f"lift heights={heights.tolist()} mm, "
-        f"native-mesh translations={native_offsets.tolist()} mm"
+        f"lift heights={heights.tolist()} mm, Board Z={board_z:.3f} mm"
     )
     if args_cli.screenshot_path is not None:
         screenshot_path = _capture_viewport(args_cli.screenshot_path)
