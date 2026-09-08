@@ -7,14 +7,21 @@ from isaaclab.utils import configclass
 from .agv_level_carry_env_cfg import AgvLevelCarryEnvCfg
 
 
+# Isaac Lab's @configclass converts the base configuration values into instance
+# fields.  Accessing them as ``AgvLevelCarryEnvCfg.some_field`` is therefore not
+# reliable after decoration (and caused an import-time AttributeError).  Keep a
+# private base instance only for constructing this derived geometry config.
+_BASE_CFG = AgvLevelCarryEnvCfg()
+
+
 @configclass
 class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     """V7 telescopic-Lift geometry with a thinner hidden support proxy.
 
     The active-leveling task still uses three hidden kinematic Lift plates as
-    the physical Board supports.  The old proxy was 40 mm thick, which made a
+    the physical Board supports. The old proxy was 40 mm thick, which made a
     30 mm neutral actuator height place the Board about 73 mm above the AGV
-    roof (30 mm travel + 40 mm proxy + 3 mm reset clearance).  That thickness
+    roof (30 mm travel + 40 mm proxy + 3 mm reset clearance). That thickness
     was only an ideal collision proxy, not a real mechanical requirement.
 
     This config reduces the hidden Lift plate thickness to 15 mm while keeping
@@ -31,26 +38,25 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     # Physical Lift geometry override
     # ------------------------------------------------------------------
     lift_plate_size = (0.28, 0.28, 0.015)
-    lift_plate_mass = AgvLevelCarryEnvCfg.lift_plate_mass
+    lift_plate_mass = float(_BASE_CFG.lift_plate_mass)
 
     # Recompute every height that the base class originally derived from the
-    # old 40 mm plate.  Do not simply override lift_plate_size: class-level
-    # derived values/RigidObjectCfg objects in the parent have already been
-    # constructed by that point.
+    # old 40 mm plate. Do not simply override lift_plate_size: inherited
+    # RigidObjectCfg defaults have already been constructed with the old size.
     payload_init_z = (
-        AgvLevelCarryEnvCfg.agv_top_z
-        + AgvLevelCarryEnvCfg.lift_neutral_height
+        float(_BASE_CFG.agv_top_z)
+        + float(_BASE_CFG.lift_neutral_height)
         + lift_plate_size[2]
-        + 0.5 * AgvLevelCarryEnvCfg.payload_size[2]
-        + AgvLevelCarryEnvCfg.board_support_clearance
+        + 0.5 * float(_BASE_CFG.payload_size[2])
+        + float(_BASE_CFG.board_support_clearance)
     )
     payload_init_pos = (0.0, 0.0, payload_init_z)
 
     cargo_init_z = (
         payload_init_z
-        + 0.5 * AgvLevelCarryEnvCfg.payload_size[2]
-        + 0.5 * AgvLevelCarryEnvCfg.cargo_size[2]
-        + AgvLevelCarryEnvCfg.cargo_board_clearance
+        + 0.5 * float(_BASE_CFG.payload_size[2])
+        + 0.5 * float(_BASE_CFG.cargo_size[2])
+        + float(_BASE_CFG.cargo_board_clearance)
     )
     cargo_init_pos = (0.0, 0.0, cargo_init_z)
 
@@ -58,12 +64,30 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     payload_min_z = payload_init_z - 0.093
 
     lift_init_z = (
-        AgvLevelCarryEnvCfg.agv_top_z
-        + AgvLevelCarryEnvCfg.lift_neutral_height
+        float(_BASE_CFG.agv_top_z)
+        + float(_BASE_CFG.lift_neutral_height)
         + 0.5 * lift_plate_size[2]
     )
 
-    _support_offsets = AgvLevelCarryEnvCfg.support_offsets_xy
+    _support_offsets = tuple(tuple(float(v) for v in pair) for pair in _BASE_CFG.support_offsets_xy)
+
+    # Recreate materials locally instead of depending on private decorated-class
+    # attributes. Values match the base V7 carrying environment.
+    _lift_material_thin = sim_utils.RigidBodyMaterialCfg(
+        static_friction=1.30,
+        dynamic_friction=1.10,
+        restitution=0.0,
+    )
+    _payload_material_thin = sim_utils.RigidBodyMaterialCfg(
+        static_friction=1.10,
+        dynamic_friction=0.95,
+        restitution=0.0,
+    )
+    _cargo_material_thin = sim_utils.RigidBodyMaterialCfg(
+        static_friction=float(_BASE_CFG.cargo_static_friction),
+        dynamic_friction=float(_BASE_CFG.cargo_dynamic_friction),
+        restitution=0.0,
+    )
 
     lift1_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Lift1",
@@ -75,7 +99,7 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            physics_material=_lift_material_thin,
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
             ),
@@ -96,7 +120,7 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            physics_material=_lift_material_thin,
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
             ),
@@ -117,7 +141,7 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=lift_plate_mass),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=AgvLevelCarryEnvCfg._lift_material,
+            physics_material=_lift_material_thin,
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.15, 0.45, 0.85), metallic=0.15
             ),
@@ -134,11 +158,11 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     payload_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Payload",
         spawn=sim_utils.CuboidCfg(
-            size=AgvLevelCarryEnvCfg.payload_size,
+            size=tuple(float(v) for v in _BASE_CFG.payload_size),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-            mass_props=sim_utils.MassPropertiesCfg(mass=AgvLevelCarryEnvCfg.payload_mass),
+            mass_props=sim_utils.MassPropertiesCfg(mass=float(_BASE_CFG.payload_mass)),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=AgvLevelCarryEnvCfg._payload_material,
+            physics_material=_payload_material_thin,
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(1.0, 0.55, 0.0), metallic=0.0
             ),
@@ -152,14 +176,14 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     cargo_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Cargo",
         spawn=sim_utils.CuboidCfg(
-            size=AgvLevelCarryEnvCfg.cargo_size,
+            size=tuple(float(v) for v in _BASE_CFG.cargo_size),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 kinematic_enabled=False,
                 disable_gravity=False,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=AgvLevelCarryEnvCfg.cargo_mass),
+            mass_props=sim_utils.MassPropertiesCfg(mass=float(_BASE_CFG.cargo_mass)),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            physics_material=AgvLevelCarryEnvCfg._cargo_material,
+            physics_material=_cargo_material_thin,
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.10, 0.65, 0.95), metallic=0.0, roughness=0.35
             ),
