@@ -9,7 +9,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from pxr import Gf, Usd, UsdGeom, Vt
+from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 from .agv_level_carry_env_cfg import AgvLevelCarryEnvCfg
 
@@ -288,12 +288,14 @@ class AgvLevelCarryEnv(DirectRLEnv):
         z_scale = float(self.cfg.visual_terrain_height_scale)
 
         points = []
+        heights = []
         for iy in range(ny):
             y = y_min + (y_max - y_min) * iy / float(ny - 1)
             for ix in range(nx):
                 x = x_min + (x_max - x_min) * ix / float(nx - 1)
                 z = z_offset + z_scale * self._terrain_height_scalar(x, y)
                 points.append(Gf.Vec3f(float(x), float(y), float(z)))
+                heights.append(float(z))
 
         face_vertex_counts = []
         face_vertex_indices = []
@@ -311,9 +313,26 @@ class AgvLevelCarryEnv(DirectRLEnv):
         mesh.CreateFaceVertexCountsAttr(Vt.IntArray(face_vertex_counts))
         mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(face_vertex_indices))
         mesh.CreateDoubleSidedAttr(True)
-        mesh.CreateDisplayColorAttr(
-            Vt.Vec3fArray([Gf.Vec3f(*tuple(float(c) for c in self.cfg.visual_terrain_color))])
-        )
+        low_color = tuple(float(c) for c in self.cfg.visual_terrain_low_color)
+        mid_color = tuple(float(c) for c in self.cfg.visual_terrain_color)
+        high_color = tuple(float(c) for c in self.cfg.visual_terrain_high_color)
+        height_min = min(heights)
+        height_span = max(max(heights) - height_min, 1.0e-6)
+        vertex_colors = []
+        for height in heights:
+            normalized_height = (height - height_min) / height_span
+            if normalized_height <= 0.5:
+                blend = 2.0 * normalized_height
+                color_a, color_b = low_color, mid_color
+            else:
+                blend = 2.0 * normalized_height - 1.0
+                color_a, color_b = mid_color, high_color
+            vertex_colors.append(
+                Gf.Vec3f(*(a + blend * (b - a) for a, b in zip(color_a, color_b)))
+            )
+        UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+        ).Set(Vt.Vec3fArray(vertex_colors))
 
     def _configure_proxy_visual_visibility(self) -> None:
         """隐藏物理代理原始几何，只保留独立的 AGV/payload 外观。

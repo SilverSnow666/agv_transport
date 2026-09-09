@@ -256,7 +256,11 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 1.0 表示视觉高度与训练高度一致；如果只为录视频想更明显，可临时改成 1.5~2.0。
     visual_terrain_height_scale = 1.0
     visual_terrain_z_offset = 0.0
-    visual_terrain_color = (0.42, 0.36, 0.28)
+    # Height-colored terrain makes crests and valleys readable even under the
+    # bright DomeLight: cool/dark valleys, earthy mid-height, warm/light peaks.
+    visual_terrain_low_color = (0.08, 0.18, 0.24)
+    visual_terrain_color = (0.38, 0.34, 0.20)
+    visual_terrain_high_color = (0.82, 0.66, 0.30)
     # 将默认 ground plane 放低，避免遮挡 mesh 的负高度谷底。
     visual_terrain_ground_z = -0.08
 
