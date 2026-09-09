@@ -40,3 +40,17 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_carry_cfg.yaml",
     },
 )
+
+# V7.6-A: independent 3D residual-Lift task. AGV translation is scripted
+# inside the environment; the policy cannot alter vehicle motion.
+gym.register(
+    id="Template-Agv-Level-Residual-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_residual_env_cfg:AgvLevelResidualEnvCfg"
+        ),
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_residual_cfg.yaml",
+    },
+)
