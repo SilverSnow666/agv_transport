@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""V7.3 Board-attitude feedback comparison on the V7.1.1 terrain baseline.
+"""V7.3/V7.4 Board-attitude feedback validation on terrain.
 
 The three modes keep terrain, motion, support geometry, Cargo, and virtual-carry
 settings identical. Only the Lift controller changes:
@@ -12,6 +12,10 @@ settings identical. Only the Lift controller changes:
 
 Cargo support/contact values are analytical geometry proxies, not PhysX contact
 sensor readings.
+
+The V7.4 robustness suite repeats D/E under controlled speed, terrain, and
+Cargo-mass variations. The terrain is analytic and deterministic, so changing
+the reset seed alone would not create a different road profile.
 """
 
 from __future__ import annotations
@@ -35,9 +39,19 @@ parser.add_argument(
     choices=("no_leveling", "geometric", "feedback", "both", "all"),
     default="both",
 )
+parser.add_argument(
+    "--suite",
+    choices=("single", "robustness"),
+    default="single",
+    help="Run one requested mode set or the V7.4 D/E robustness matrix.",
+)
 parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
 parser.add_argument("--log_dir", type=str, default="logs/v7_3")
+parser.add_argument("--cargo_mass", type=float, default=None)
+parser.add_argument("--bump_amplitude", type=float, default=None)
+parser.add_argument("--bump_phase_x", type=float, default=None)
+parser.add_argument("--bump_phase_y", type=float, default=None)
 parser.add_argument("--feedback_roll_kp", type=float, default=None)
 parser.add_argument("--feedback_pitch_kp", type=float, default=None)
 parser.add_argument("--feedback_roll_kd", type=float, default=None)
@@ -92,6 +106,77 @@ CSV_FIELDS = (
     "cargo_board_surface_gap",
     "cargo_center_over_board", "cargo_fully_supported", "cargo_contact",
     "cargo_dropped", "cargo_tipped",
+)
+
+ROBUSTNESS_CONDITIONS = (
+    {
+        "name": "baseline",
+        "target_speed": 0.10,
+        "bump_amplitude": 0.030,
+        "bump_phase_x": 0.25,
+        "bump_phase_y": 0.45,
+        "cargo_mass": 4.0,
+    },
+    {
+        "name": "slow",
+        "target_speed": 0.05,
+        "bump_amplitude": 0.030,
+        "bump_phase_x": 0.25,
+        "bump_phase_y": 0.45,
+        "cargo_mass": 4.0,
+    },
+    {
+        "name": "fast",
+        "target_speed": 0.15,
+        "bump_amplitude": 0.030,
+        "bump_phase_x": 0.25,
+        "bump_phase_y": 0.45,
+        "cargo_mass": 4.0,
+    },
+    {
+        "name": "rough",
+        "target_speed": 0.10,
+        "bump_amplitude": 0.045,
+        "bump_phase_x": 0.25,
+        "bump_phase_y": 0.45,
+        "cargo_mass": 4.0,
+    },
+    {
+        "name": "phase_shift",
+        "target_speed": 0.10,
+        "bump_amplitude": 0.030,
+        "bump_phase_x": 1.10,
+        "bump_phase_y": -0.35,
+        "cargo_mass": 4.0,
+    },
+    {
+        "name": "heavy_cargo",
+        "target_speed": 0.10,
+        "bump_amplitude": 0.030,
+        "bump_phase_x": 0.25,
+        "bump_phase_y": 0.45,
+        "cargo_mass": 8.0,
+    },
+)
+
+ROBUSTNESS_METRICS = (
+    "roll_rms_deg",
+    "pitch_rms_deg",
+    "max_abs_roll_deg",
+    "max_abs_pitch_deg",
+    "board_rp_angular_speed_rms",
+    "board_vertical_accel_rms",
+    "support_height_rms_mm",
+    "lift_velocity_rms_mm_s",
+    "cargo_relative_xy_rms_mm",
+    "cargo_max_relative_xy_mm",
+    "cargo_cumulative_slip_mm",
+    "cargo_ang_speed_rms",
+    "cargo_contact_fraction",
+    "cargo_dropped",
+    "cargo_tipped",
+    "lift_saturation_fraction",
+    "terrain_span_mm",
 )
 
 
@@ -339,6 +424,23 @@ def _make_environment():
         value = getattr(args_cli, arg_name)
         if value is not None:
             setattr(env_cfg, cfg_name, float(value) * scale)
+    scenario_overrides = (
+        ("bump_amplitude", "bump_amplitude"),
+        ("bump_phase_x", "bump_phase_x"),
+        ("bump_phase_y", "bump_phase_y"),
+    )
+    for arg_name, cfg_name in scenario_overrides:
+        value = getattr(args_cli, arg_name)
+        if value is not None:
+            setattr(env_cfg, cfg_name, float(value))
+    if args_cli.cargo_mass is not None:
+        cargo_mass = float(args_cli.cargo_mass)
+        if cargo_mass <= 0.0:
+            raise ValueError(f"Cargo mass must be positive, got {cargo_mass}")
+        env_cfg.cargo_mass = cargo_mass
+        env_cfg.cargo_cfg.spawn.mass_props.mass = cargo_mass
+    if float(env_cfg.bump_amplitude) <= 0.0:
+        raise ValueError(f"Terrain bump amplitude must be positive, got {env_cfg.bump_amplitude}")
     gains = (
         float(env_cfg.leveling_feedback_roll_kp),
         float(env_cfg.leveling_feedback_pitch_kp),
@@ -360,12 +462,47 @@ def _make_environment():
     # coupling so the dynamic board follows the translating supports; without
     # it the board stays behind and the comparison terminates on support loss.
     env_cfg.enable_virtual_friction_carry = True
+    env_cfg.seed = 0
     env_cfg.episode_length_s = max(float(args_cli.duration) + 2.0, float(env_cfg.episode_length_s))
     env = gym.make(args_cli.task, cfg=env_cfg)
     return env
 
 
-def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
+def _configure_robustness_condition(
+    raw_env,
+    condition: dict[str, float | str],
+    reference_cargo_masses: torch.Tensor,
+    reference_cargo_inertias: torch.Tensor,
+) -> None:
+    """Apply one V7.4 condition without changing controller parameters."""
+    raw_env.cfg.bump_amplitude = float(condition["bump_amplitude"])
+    raw_env.cfg.bump_phase_x = float(condition["bump_phase_x"])
+    raw_env.cfg.bump_phase_y = float(condition["bump_phase_y"])
+    cargo_mass = float(condition["cargo_mass"])
+    raw_env.cfg.cargo_mass = cargo_mass
+
+    reference_mass = float(reference_cargo_masses[0, 0])
+    mass_scale = cargo_mass / reference_mass
+    masses = torch.full_like(reference_cargo_masses, cargo_mass)
+    inertias = reference_cargo_inertias * mass_scale
+    indices = torch.arange(raw_env.num_envs, dtype=torch.int32, device="cpu")
+    raw_env.cargo.root_physx_view.set_masses(masses, indices)
+    raw_env.cargo.root_physx_view.set_inertias(inertias, indices)
+
+    # Keep the visible terrain consistent with the analytical support surface
+    # after amplitude or phase changes. This mesh remains visual-only.
+    raw_env._spawn_visual_bumpy_terrain()
+    print(
+        f"[CONDITION] {condition['name']}: speed={float(condition['target_speed']):.3f} m/s, "
+        f"amplitude={1000.0 * float(condition['bump_amplitude']):.1f} mm, "
+        f"phase=({float(condition['bump_phase_x']):.2f}, "
+        f"{float(condition['bump_phase_y']):.2f}), Cargo mass={cargo_mass:.1f} kg"
+    )
+
+
+def run_mode(
+    env, mode: str, log_dir: Path, target_speed_override: float | None = None
+) -> dict[str, float]:
     raw_env = env.unwrapped
     with torch.inference_mode():
         env.reset(seed=0)
@@ -373,7 +510,12 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
         raise RuntimeError("V7.2 Cargo was not created")
     raw_env.base_z_disturbance.zero_()
 
-    actions, target_speed, linear_action = _make_actions(raw_env, args_cli.target_speed)
+    requested_speed = (
+        float(args_cli.target_speed)
+        if target_speed_override is None
+        else float(target_speed_override)
+    )
+    actions, target_speed, linear_action = _make_actions(raw_env, requested_speed)
     neutral = float(raw_env.cfg.lift_neutral_height)
     lift_min = float(raw_env.cfg.lift_min_height)
     lift_max = float(raw_env.cfg.lift_max_height)
@@ -563,66 +705,153 @@ def run_mode(env, mode: str, log_dir: Path) -> dict[str, float]:
     return summary
 
 
-def main() -> None:
-    log_dir = Path(args_cli.log_dir).expanduser().resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
+def _print_comparison(
+    title: str, baseline: dict[str, float], candidate: dict[str, float]
+) -> None:
+    print(f"[COMPARISON] {title}:")
+    for key, label in (
+        ("roll_rms_deg", "Board roll RMS"),
+        ("pitch_rms_deg", "Board pitch RMS"),
+        ("max_abs_roll_deg", "max |roll|"),
+        ("max_abs_pitch_deg", "max |pitch|"),
+        ("board_rp_angular_speed_rms", "Board roll/pitch angular-speed RMS"),
+        ("board_vertical_accel_rms", "Board vertical-acceleration RMS"),
+        ("support_height_rms_mm", "support height RMS"),
+        ("lift_velocity_rms_mm_s", "Lift velocity RMS"),
+        ("cargo_relative_xy_rms_mm", "Cargo relative XY RMS"),
+        ("cargo_max_relative_xy_mm", "Cargo max relative XY"),
+        ("cargo_cumulative_slip_mm", "Cargo cumulative slip"),
+        ("cargo_roll_rms_deg", "Cargo roll RMS"),
+        ("cargo_pitch_rms_deg", "Cargo pitch RMS"),
+        ("cargo_ang_speed_rms", "Cargo angular-speed RMS"),
+    ):
+        absolute = baseline[key] - candidate[key]
+        if abs(baseline[key]) < 1.0e-9:
+            print(
+                f"[COMPARISON] {label}: {baseline[key]:.6g} -> "
+                f"{candidate[key]:.6g}, percentage=n/a"
+            )
+        else:
+            improvement = 100.0 * absolute / abs(baseline[key])
+            print(
+                f"[COMPARISON] {label}: {absolute:+.6g} absolute, "
+                f"{improvement:+.2f}% improvement"
+            )
+
+
+def _run_single_suite(env, log_dir: Path) -> None:
     if args_cli.mode == "both":
         modes = ("no_leveling", "geometric")
     elif args_cli.mode == "all":
         modes = ("no_leveling", "geometric", "feedback")
     else:
         modes = (args_cli.mode,)
-    env = _make_environment()
-    try:
-        summaries = {mode: run_mode(env, mode, log_dir) for mode in modes}
-    finally:
-        env.close()
-
-    def print_comparison(
-        title: str, baseline: dict[str, float], candidate: dict[str, float]
-    ) -> None:
-        print(f"[COMPARISON] {title}:")
-        for key, label in (
-            ("roll_rms_deg", "Board roll RMS"),
-            ("pitch_rms_deg", "Board pitch RMS"),
-            ("max_abs_roll_deg", "max |roll|"),
-            ("max_abs_pitch_deg", "max |pitch|"),
-            ("board_rp_angular_speed_rms", "Board roll/pitch angular-speed RMS"),
-            ("board_vertical_accel_rms", "Board vertical-acceleration RMS"),
-            ("support_height_rms_mm", "support height RMS"),
-            ("lift_velocity_rms_mm_s", "Lift velocity RMS"),
-            ("cargo_relative_xy_rms_mm", "Cargo relative XY RMS"),
-            ("cargo_max_relative_xy_mm", "Cargo max relative XY"),
-            ("cargo_cumulative_slip_mm", "Cargo cumulative slip"),
-            ("cargo_roll_rms_deg", "Cargo roll RMS"),
-            ("cargo_pitch_rms_deg", "Cargo pitch RMS"),
-            ("cargo_ang_speed_rms", "Cargo angular-speed RMS"),
-        ):
-            absolute = baseline[key] - candidate[key]
-            if abs(baseline[key]) < 1.0e-9:
-                print(
-                    f"[COMPARISON] {label}: {baseline[key]:.6g} -> "
-                    f"{candidate[key]:.6g}, percentage=n/a"
-                )
-            else:
-                improvement = 100.0 * absolute / abs(baseline[key])
-                print(
-                    f"[COMPARISON] {label}: {absolute:+.6g} absolute, "
-                    f"{improvement:+.2f}% improvement"
-                )
-
+    summaries = {mode: run_mode(env, mode, log_dir) for mode in modes}
     if args_cli.mode in ("both", "all"):
-        print_comparison(
+        _print_comparison(
             "C -> D, geometric contribution",
             summaries["no_leveling"],
             summaries["geometric"],
         )
     if args_cli.mode == "all":
-        print_comparison(
+        _print_comparison(
             "D -> E, Board-attitude feedback contribution",
             summaries["geometric"],
             summaries["feedback"],
         )
+
+
+def _run_robustness_suite(env, log_dir: Path) -> None:
+    raw_env = env.unwrapped
+    if raw_env.cargo is None:
+        raise RuntimeError("V7.4 robustness suite requires Cargo")
+    reference_masses = raw_env.cargo.root_physx_view.get_masses().clone()
+    reference_inertias = raw_env.cargo.root_physx_view.get_inertias().clone()
+    result_rows: list[dict[str, float | str]] = []
+
+    for condition in ROBUSTNESS_CONDITIONS:
+        _configure_robustness_condition(
+            raw_env, condition, reference_masses, reference_inertias
+        )
+        condition_dir = log_dir / str(condition["name"])
+        condition_dir.mkdir(parents=True, exist_ok=True)
+        summaries = {
+            mode: run_mode(
+                env,
+                mode,
+                condition_dir,
+                target_speed_override=float(condition["target_speed"]),
+            )
+            for mode in ("geometric", "feedback")
+        }
+        geometric = summaries["geometric"]
+        feedback = summaries["feedback"]
+        _print_comparison(
+            f"{condition['name']}: D -> E feedback contribution",
+            geometric,
+            feedback,
+        )
+
+        row: dict[str, float | str] = dict(condition)
+        for mode, summary in summaries.items():
+            for metric in ROBUSTNESS_METRICS:
+                row[f"{mode}_{metric}"] = summary[metric]
+        for metric in (
+            "roll_rms_deg",
+            "pitch_rms_deg",
+            "max_abs_roll_deg",
+            "max_abs_pitch_deg",
+            "board_rp_angular_speed_rms",
+            "board_vertical_accel_rms",
+        ):
+            baseline = geometric[metric]
+            candidate = feedback[metric]
+            difference = baseline - candidate
+            denominator = max(abs(baseline), 1.0e-12)
+            row[f"{metric}_improvement_pct"] = 100.0 * difference / denominator
+        result_rows.append(row)
+
+    summary_path = log_dir / "robustness_summary.csv"
+    with summary_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(result_rows[0]))
+        writer.writeheader()
+        writer.writerows(result_rows)
+
+    roll_improvements = [
+        float(row["roll_rms_deg_improvement_pct"]) for row in result_rows
+    ]
+    pitch_improvements = [
+        float(row["pitch_rms_deg_improvement_pct"]) for row in result_rows
+    ]
+    improved_count = sum(
+        roll > 0.0 and pitch > 0.0
+        for roll, pitch in zip(roll_improvements, pitch_improvements, strict=True)
+    )
+    print(
+        f"[ROBUSTNESS] feedback improved both roll and pitch RMS in "
+        f"{improved_count}/{len(result_rows)} conditions"
+    )
+    print(
+        f"[ROBUSTNESS] roll improvement mean/worst="
+        f"{sum(roll_improvements) / len(roll_improvements):.2f}%/"
+        f"{min(roll_improvements):.2f}%, pitch mean/worst="
+        f"{sum(pitch_improvements) / len(pitch_improvements):.2f}%/"
+        f"{min(pitch_improvements):.2f}%"
+    )
+    print(f"[ROBUSTNESS] summary CSV={summary_path}")
+
+
+def main() -> None:
+    log_dir = Path(args_cli.log_dir).expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    env = _make_environment()
+    try:
+        if args_cli.suite == "robustness":
+            _run_robustness_suite(env, log_dir)
+        else:
+            _run_single_suite(env, log_dir)
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":
