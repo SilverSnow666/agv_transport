@@ -15,7 +15,9 @@ sensor readings.
 
 The V7.4 robustness suite repeats D/E under controlled speed, terrain, and
 Cargo-mass variations. The terrain is analytic and deterministic, so changing
-the reset seed alone would not create a different road profile.
+the reset seed alone would not create a different road profile. V7.5 can run
+the same controller either in this script or through the reusable environment
+implementation, which makes numerical parity directly testable.
 """
 
 from __future__ import annotations
@@ -44,6 +46,12 @@ parser.add_argument(
     choices=("single", "robustness"),
     default="single",
     help="Run one requested mode set or the V7.4 D/E robustness matrix.",
+)
+parser.add_argument(
+    "--controller_source",
+    choices=("script", "environment"),
+    default="script",
+    help="Compute Lift targets in this benchmark script or in the reusable environment controller.",
 )
 parser.add_argument("--duration", type=float, default=12.0)
 parser.add_argument("--target_speed", type=float, default=0.10)
@@ -462,6 +470,9 @@ def _make_environment():
     # coupling so the dynamic board follows the translating supports; without
     # it the board stays behind and the comparison terminates on support loss.
     env_cfg.enable_virtual_friction_carry = True
+    # Each run selects the concrete mode immediately before reset. External is
+    # the compatibility path used by the original V7.3/V7.4 benchmark logic.
+    env_cfg.leveling_controller_mode = "external"
     env_cfg.seed = 0
     env_cfg.episode_length_s = max(float(args_cli.duration) + 2.0, float(env_cfg.episode_length_s))
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -504,6 +515,14 @@ def run_mode(
     env, mode: str, log_dir: Path, target_speed_override: float | None = None
 ) -> dict[str, float]:
     raw_env = env.unwrapped
+    environment_modes = {
+        "no_leveling": "neutral",
+        "geometric": "geometric",
+        "feedback": "geometric_feedback",
+    }
+    raw_env.cfg.leveling_controller_mode = (
+        environment_modes[mode] if args_cli.controller_source == "environment" else "external"
+    )
     with torch.inference_mode():
         env.reset(seed=0)
     if raw_env.cargo is None:
@@ -556,7 +575,7 @@ def run_mode(
     )
     print(
         f"[INFO] {mode}: target speed={target_speed:.4f} m/s, action={linear_action:.6f}, "
-        f"duration={args_cli.duration:.2f} s"
+        f"duration={args_cli.duration:.2f} s, controller source={args_cli.controller_source}"
     )
     if mode == "feedback":
         print(
@@ -570,29 +589,35 @@ def run_mode(
         )
 
     while simulation_app.is_running() and elapsed < float(args_cli.duration):
-        if mode == "feedback":
-            (
-                raw_target,
-                filtered_feedback_height,
-                feedback_roll_cmd,
-                feedback_pitch_cmd,
-            ) = _feedback_lift_target(raw_env, filtered_feedback_height)
-        elif mode == "geometric":
-            raw_target, _ = _geometric_lift_target(raw_env)
-            filtered_feedback_height.zero_()
-            feedback_roll_cmd.zero_()
-            feedback_pitch_cmd.zero_()
-        else:
-            raw_target = torch.full_like(raw_env.lift_height[0], neutral)
-            filtered_feedback_height.zero_()
-            feedback_roll_cmd.zero_()
-            feedback_pitch_cmd.zero_()
-        saturated = (raw_target < lift_min) | (raw_target > lift_max)
-        raw_env.lift_target_height[0] = torch.clamp(raw_target, min=lift_min, max=lift_max)
+        if args_cli.controller_source == "script":
+            if mode == "feedback":
+                (
+                    raw_target,
+                    filtered_feedback_height,
+                    feedback_roll_cmd,
+                    feedback_pitch_cmd,
+                ) = _feedback_lift_target(raw_env, filtered_feedback_height)
+            elif mode == "geometric":
+                raw_target, _ = _geometric_lift_target(raw_env)
+                filtered_feedback_height.zero_()
+                feedback_roll_cmd.zero_()
+                feedback_pitch_cmd.zero_()
+            else:
+                raw_target = torch.full_like(raw_env.lift_height[0], neutral)
+                filtered_feedback_height.zero_()
+                feedback_roll_cmd.zero_()
+                feedback_pitch_cmd.zero_()
+            saturated = (raw_target < lift_min) | (raw_target > lift_max)
+            raw_env.lift_target_height[0] = torch.clamp(raw_target, min=lift_min, max=lift_max)
         raw_env.base_z_disturbance[0] = 0.0
 
         with torch.inference_mode():
             _, _, terminated, truncated, _ = env.step(actions)
+        if args_cli.controller_source == "environment":
+            filtered_feedback_height = raw_env.leveling_feedback_height[0].clone()
+            feedback_roll_cmd = raw_env.last_leveling_roll_cmd[0].clone()
+            feedback_pitch_cmd = raw_env.last_leveling_pitch_cmd[0].clone()
+            saturated = raw_env.last_leveling_saturated[0].clone()
         elapsed += step_dt
         if bool(terminated[0]) or bool(truncated[0]):
             raise RuntimeError(

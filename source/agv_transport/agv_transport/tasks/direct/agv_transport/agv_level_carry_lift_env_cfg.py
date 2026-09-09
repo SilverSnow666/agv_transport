@@ -211,18 +211,3 @@ class AgvLevelCarryLiftVisualEnvCfg(AgvLevelCarryEnvCfg):
     lift_visual_base_color = (0.30, 0.32, 0.35)
     lift_visual_column_color = (0.62, 0.64, 0.67)
     lift_visual_head_color = (0.24, 0.26, 0.29)
-
-    # ------------------------------------------------------------------
-    # V7.3 Board-attitude feedback baseline
-    # ------------------------------------------------------------------
-    # The terrain test adds these PD corrections to the validated geometric
-    # support-height feedforward. Angle gains are dimensionless; derivative
-    # gains are seconds because Board angular velocity is measured in rad/s.
-    leveling_feedback_roll_kp = 0.80
-    leveling_feedback_pitch_kp = 0.80
-    leveling_feedback_roll_kd = 0.08
-    leveling_feedback_pitch_kd = 0.08
-    # Zero-mean per-support correction, bounded independently from the physical
-    # 0--100 mm Lift travel. This limits chatter and preserves mean Board height.
-    leveling_feedback_max_correction = 0.008
-    leveling_feedback_filter_alpha = 0.25

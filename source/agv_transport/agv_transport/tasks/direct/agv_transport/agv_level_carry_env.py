@@ -43,6 +43,13 @@ class AgvLevelCarryEnv(DirectRLEnv):
             (self.num_envs, 3), float(self.cfg.lift_neutral_height), device=self.device
         )
         self.lift_velocity = torch.zeros((self.num_envs, 3), device=self.device)
+        self.leveling_feedback_height = torch.zeros((self.num_envs, 3), device=self.device)
+        self.last_leveling_roll_cmd = torch.zeros(self.num_envs, device=self.device)
+        self.last_leveling_pitch_cmd = torch.zeros(self.num_envs, device=self.device)
+        self.last_leveling_saturated = torch.zeros(
+            (self.num_envs, 3), dtype=torch.bool, device=self.device
+        )
+        self._validate_leveling_controller_cfg()
         self.agv_terrain_roll = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_terrain_pitch = torch.zeros((self.num_envs, 3), device=self.device)
         self.agv_terrain_samples = torch.zeros((self.num_envs, 3, 4), device=self.device)
@@ -392,6 +399,110 @@ class AgvLevelCarryEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.prev_actions[:] = self.actions
         self.actions = torch.clamp(actions, -1.0, 1.0)
+        self._update_leveling_controller()
+
+    def _validate_leveling_controller_cfg(self) -> None:
+        allowed_modes = {"external", "neutral", "geometric", "geometric_feedback"}
+        mode = str(self.cfg.leveling_controller_mode)
+        if mode not in allowed_modes:
+            raise ValueError(
+                f"Unknown leveling_controller_mode={mode!r}; expected one of {sorted(allowed_modes)}"
+            )
+        gains = (
+            float(self.cfg.leveling_feedback_roll_kp),
+            float(self.cfg.leveling_feedback_pitch_kp),
+            float(self.cfg.leveling_feedback_roll_kd),
+            float(self.cfg.leveling_feedback_pitch_kd),
+        )
+        if any(value < 0.0 for value in gains):
+            raise ValueError(f"Leveling feedback gains must be non-negative, got {gains}")
+        max_correction = float(self.cfg.leveling_feedback_max_correction)
+        if max_correction <= 0.0:
+            raise ValueError(
+                "leveling_feedback_max_correction must be positive, "
+                f"got {max_correction}"
+            )
+        alpha = float(self.cfg.leveling_feedback_filter_alpha)
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError(
+                f"leveling_feedback_filter_alpha must be in (0, 1], got {alpha}"
+            )
+
+    def _geometric_lift_targets(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return Lift targets that equalize the three physical support-top heights."""
+        top_z = []
+        half_thickness = 0.5 * float(self.cfg.lift_plate_size[2])
+        for lift in self.lifts:
+            local_z = self._quat_rotate_z(lift.data.root_quat_w)
+            top_z.append(lift.data.root_pos_w[:, 2] + half_thickness * local_z[:, 2])
+        support_top_z = torch.stack(top_z, dim=1)
+        top_error = support_top_z.mean(dim=1, keepdim=True) - support_top_z
+
+        agv_quat = torch.stack([agv.data.root_quat_w for agv in self.agvs], dim=1)
+        axis_z = self._quat_rotate_z(agv_quat.reshape(-1, 4))[:, 2].reshape(self.num_envs, 3)
+        axis_z = axis_z.clamp_min(0.25)
+        return self.lift_height + top_error / axis_z, axis_z
+
+    def _update_leveling_controller(self) -> None:
+        """Update bounded Lift targets once per control step for the selected mode."""
+        mode = str(self.cfg.leveling_controller_mode)
+        if mode == "external":
+            return
+
+        self.last_leveling_roll_cmd.zero_()
+        self.last_leveling_pitch_cmd.zero_()
+        self.last_leveling_saturated.zero_()
+        if mode == "neutral":
+            raw_target = torch.full_like(self.lift_target_height, float(self.cfg.lift_neutral_height))
+            self.leveling_feedback_height.zero_()
+        elif mode in ("geometric", "geometric_feedback"):
+            raw_target, axis_z = self._geometric_lift_targets()
+            if mode == "geometric":
+                self.leveling_feedback_height.zero_()
+            else:
+                roll, pitch, _ = self._get_payload_rpy()
+                board_quat_inverse = self.payload.data.root_quat_w.clone()
+                board_quat_inverse[:, 1:4] *= -1.0
+                board_ang_vel_local = self._quat_rotate_vector(
+                    board_quat_inverse, self.payload.data.root_ang_vel_w
+                )
+                roll_cmd = -(
+                    float(self.cfg.leveling_feedback_roll_kp) * roll
+                    + float(self.cfg.leveling_feedback_roll_kd) * board_ang_vel_local[:, 0]
+                )
+                pitch_cmd = -(
+                    float(self.cfg.leveling_feedback_pitch_kp) * pitch
+                    + float(self.cfg.leveling_feedback_pitch_kd) * board_ang_vel_local[:, 1]
+                )
+
+                offsets = torch.tensor(
+                    self.cfg.support_offsets_xy,
+                    device=self.device,
+                    dtype=self.lift_height.dtype,
+                )
+                height = (
+                    -offsets[None, :, 0] * torch.tan(pitch_cmd).unsqueeze(1)
+                    + offsets[None, :, 1] * torch.tan(roll_cmd).unsqueeze(1)
+                )
+                height -= height.mean(dim=1, keepdim=True)
+                max_abs = torch.amax(torch.abs(height), dim=1, keepdim=True).clamp_min(1.0e-9)
+                height *= torch.clamp(
+                    float(self.cfg.leveling_feedback_max_correction) / max_abs, max=1.0
+                )
+
+                alpha = float(self.cfg.leveling_feedback_filter_alpha)
+                self.leveling_feedback_height.mul_(1.0 - alpha).add_(height, alpha=alpha)
+                raw_target += self.leveling_feedback_height / axis_z
+                self.last_leveling_roll_cmd[:] = roll_cmd
+                self.last_leveling_pitch_cmd[:] = pitch_cmd
+        else:
+            # Catch invalid runtime changes after construction as well.
+            raise ValueError(f"Unknown leveling_controller_mode={mode!r}")
+
+        lift_min = float(self.cfg.lift_min_height)
+        lift_max = float(self.cfg.lift_max_height)
+        self.last_leveling_saturated[:] = (raw_target < lift_min) | (raw_target > lift_max)
+        self.lift_target_height[:] = torch.clamp(raw_target, min=lift_min, max=lift_max)
 
     def _apply_action(self) -> None:
         """三台差速 AGV 的 kinematic 平面运动。
@@ -1209,6 +1320,10 @@ class AgvLevelCarryEnv(DirectRLEnv):
         self.lift_target_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.lift_velocity[env_ids] = 0.0
+        self.leveling_feedback_height[env_ids] = 0.0
+        self.last_leveling_roll_cmd[env_ids] = 0.0
+        self.last_leveling_pitch_cmd[env_ids] = 0.0
+        self.last_leveling_saturated[env_ids] = False
         self.agv_terrain_roll[env_ids] = 0.0
         self.agv_terrain_pitch[env_ids] = 0.0
         self.agv_terrain_samples[env_ids] = 0.0
@@ -1548,6 +1663,15 @@ class AgvLevelCarryEnv(DirectRLEnv):
                 1.0 - 2.0 * (qx * qx + qy * qy),
             ),
             dim=1,
+        )
+
+    @staticmethod
+    def _quat_rotate_vector(quat: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+        """Rotate vectors by scalar-first quaternions."""
+        quat_vector = quat[:, 1:4]
+        twice_cross = 2.0 * torch.cross(quat_vector, vector, dim=1)
+        return vector + quat[:, 0:1] * twice_cross + torch.cross(
+            quat_vector, twice_cross, dim=1
         )
 
     def _get_payload_rpy(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -78,6 +78,17 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     max_lift_speed = 0.04  # m/s
     lift_position_kp = 5.0
 
+    # V7.5 reusable Lift controller. Keep ``external`` as the compatibility
+    # default so existing tests and policies may continue writing targets.
+    # Other modes: neutral, geometric, geometric_feedback.
+    leveling_controller_mode = "external"
+    leveling_feedback_roll_kp = 0.80
+    leveling_feedback_pitch_kp = 0.80
+    leveling_feedback_roll_kd = 0.08
+    leveling_feedback_pitch_kd = 0.08
+    leveling_feedback_max_correction = 0.008
+    leveling_feedback_filter_alpha = 0.25
+
     # ------------------------- 纯视觉高度补偿 -------------------------
     # 根节点随较薄的碰撞体降低；补偿子节点原点，使平地上原始车型和车轮
     # 的世界高度保持不变。不是抬升车型内部的原生升降台。
