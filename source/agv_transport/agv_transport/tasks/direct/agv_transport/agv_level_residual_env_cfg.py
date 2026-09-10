@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from isaaclab.utils import configclass
 
 from .agv_level_carry_lift_env_cfg import AgvLevelCarryLiftVisualEnvCfg
@@ -39,16 +41,28 @@ class AgvLevelResidualEnvCfg(AgvLevelCarryLiftVisualEnvCfg):
     enable_visual_terrain_mesh = False
 
     # Reward is deliberately restricted to Board/Cargo stability and control
-    # effort. AGV progress is scripted and therefore is not rewarded.
+    # effort. Each physical value is normalized by an interpretable reference
+    # before weighting, so relevant terms remain visible to PPO even though the
+    # V7.5 baseline already has sub-degree errors. AGV progress is scripted and
+    # therefore is not rewarded.
     residual_alive_reward = 1.0
-    residual_board_angle_penalty_scale = 120.0
-    residual_board_angular_velocity_penalty_scale = 0.50
-    residual_board_vertical_velocity_penalty_scale = 0.50
-    residual_cargo_slip_penalty_scale = 12.0
-    residual_cargo_velocity_penalty_scale = 1.0
-    residual_cargo_tilt_penalty_scale = 20.0
-    residual_cargo_angular_velocity_penalty_scale = 0.10
-    residual_action_penalty_scale = 0.020
-    residual_action_rate_penalty_scale = 0.010
-    residual_lift_velocity_penalty_scale = 0.50
+    residual_board_angle_reference = math.radians(0.20)
+    residual_board_angular_velocity_reference = 0.010
+    residual_board_vertical_velocity_reference = 0.010
+    residual_cargo_slip_reference = 0.005
+    residual_cargo_velocity_reference = 0.020
+    residual_cargo_tilt_reference = math.radians(1.0)
+    residual_cargo_angular_velocity_reference = 0.050
+    residual_lift_velocity_reference = 0.010
+
+    residual_board_angle_penalty_scale = 1.00
+    residual_board_angular_velocity_penalty_scale = 0.05
+    residual_board_vertical_velocity_penalty_scale = 0.05
+    residual_cargo_slip_penalty_scale = 0.25
+    residual_cargo_velocity_penalty_scale = 0.05
+    residual_cargo_tilt_penalty_scale = 0.25
+    residual_cargo_angular_velocity_penalty_scale = 0.05
+    residual_action_penalty_scale = 0.010
+    residual_action_rate_penalty_scale = 0.005
+    residual_lift_velocity_penalty_scale = 0.020
     residual_failure_penalty = 25.0

@@ -97,6 +97,21 @@ REFERENCE_TOLERANCES = {
     "cargo_z": 5.0e-5,
 }
 
+REWARD_LOG_KEYS = (
+    "Residual/reward_mean",
+    "RewardTerms/board_angle",
+    "RewardTerms/board_angular_velocity",
+    "RewardTerms/board_vertical_velocity",
+    "RewardTerms/cargo_slip",
+    "RewardTerms/cargo_velocity",
+    "RewardTerms/cargo_tilt",
+    "RewardTerms/cargo_angular_velocity",
+    "RewardTerms/action",
+    "RewardTerms/action_rate",
+    "RewardTerms/lift_velocity",
+    "RewardTerms/failure",
+)
+
 
 def _make_environment():
     env_cfg = parse_env_cfg(
@@ -314,6 +329,8 @@ def _run_random(env) -> None:
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     elapsed = 0.0
     random_duration = min(float(args_cli.duration), 2.0)
+    reward_term_sums = {key: 0.0 for key in REWARD_LOG_KEYS}
+    reward_term_steps = 0
     while simulation_app.is_running() and elapsed < random_duration:
         actions = torch.empty(env.action_space.shape, device=raw_env.device).uniform_(-0.5, 0.5)
         with torch.inference_mode():
@@ -325,6 +342,10 @@ def _run_random(env) -> None:
             raise RuntimeError(
                 f"Randomized smoke test reset early at t={elapsed:.3f} s"
             )
+        reward_log = raw_env.extras["log"]
+        for key in REWARD_LOG_KEYS:
+            reward_term_sums[key] += float(reward_log[key])
+        reward_term_steps += 1
         elapsed += step_dt
 
     print(
@@ -335,6 +356,31 @@ def _run_random(env) -> None:
         f"{1000.0 * float(raw_env.randomized_terrain_amplitude.max()):.1f}] mm, "
         f"Cargo mass=[{float(raw_env.randomized_cargo_mass.min()):.2f}, "
         f"{float(raw_env.randomized_cargo_mass.max()):.2f}] kg"
+    )
+    reward_term_means = {
+        key: value / max(reward_term_steps, 1)
+        for key, value in reward_term_sums.items()
+    }
+    board_penalty = reward_term_means["RewardTerms/board_angle"]
+    action_penalty = reward_term_means["RewardTerms/action"]
+    if not -10.0 < board_penalty < -1.0e-3:
+        raise RuntimeError(
+            f"Normalized Board-angle reward term is poorly scaled: {board_penalty:.6f}"
+        )
+    if not -0.02 <= action_penalty < -1.0e-5:
+        raise RuntimeError(
+            f"Normalized residual-action reward term is poorly scaled: {action_penalty:.6f}"
+        )
+    print(
+        "[RESULT] normalized reward means: "
+        f"total={reward_term_means['Residual/reward_mean']:.4f}, "
+        f"Board angle={board_penalty:.4f}, "
+        f"Board rate={reward_term_means['RewardTerms/board_angular_velocity']:.4f}, "
+        f"Board vz={reward_term_means['RewardTerms/board_vertical_velocity']:.4f}, "
+        f"Cargo slip={reward_term_means['RewardTerms/cargo_slip']:.4f}, "
+        f"Cargo tilt={reward_term_means['RewardTerms/cargo_tilt']:.4f}, "
+        f"action={action_penalty:.4f}, "
+        f"Lift velocity={reward_term_means['RewardTerms/lift_velocity']:.4f}"
     )
 
     raw_env.cfg.residual_domain_randomization = False

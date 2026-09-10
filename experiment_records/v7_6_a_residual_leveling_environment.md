@@ -157,17 +157,81 @@ and Cargo remained supported without drop or tip for the full run.
 Python `py_compile` and `git diff --check` passed. Ruff is not installed in the
 active Isaac Lab environment.
 
+## V7.6-A.2 reward normalization
+
+The original reward multiplied raw radians, metres, and SI velocities directly
+by weights. Since the V7.5 controller already keeps errors small, most learning
+signals were orders of magnitude below the alive reward. Each physical term is
+now divided by a documented reference before its dimensionless weight is
+applied:
+
+| Quantity | Reference | Weight |
+|---|---:|---:|
+| Board roll/pitch | 0.20 deg | 1.00 |
+| Board roll/pitch angular velocity | 0.010 rad/s | 0.05 |
+| Board vertical velocity | 0.010 m/s | 0.05 |
+| Cargo planar slip | 5 mm | 0.25 |
+| Cargo relative velocity | 0.020 m/s | 0.05 |
+| Cargo relative roll/pitch | 1.0 deg | 0.25 |
+| Cargo relative angular velocity | 0.050 rad/s | 0.05 |
+| Lift velocity | 0.010 m/s | 0.02 |
+
+Normalized policy action and action-rate penalties retain weights 0.010 and
+0.005. Every contribution is exported under `RewardTerms/*`, while the existing
+diagnostic metrics remain in physical units.
+
+The 64-environment, two-second randomized scale check reported:
+
+```text
+mean total reward        = -0.0834 / step
+Board angle term         = -0.8893 / step
+Board angular-rate term  = -0.0016 / step
+Board vertical term      = -0.0986 / step
+Cargo slip term          = -0.0641 / step
+Cargo tilt term          = -0.0000 / step
+random action term       = -0.0008 / step
+Lift velocity term       = -0.0052 / step
+```
+
+This makes Board attitude the main optimization signal without making residual
+motion prohibitively expensive. The same run retained a 3.000 mm reset support
+gap, finite observations/rewards, no early termination, and correct Cargo-mass
+restoration. A subsequent 12-second zero-residual regression retained
+0.1328/0.1067 deg Board roll/pitch RMS and passed the V7.5 trajectory tolerance.
+
+## V7.6-B PPO smoke training
+
+```bat
+python scripts\skrl\train.py --task=Template-Agv-Level-Residual-Direct-v0 --num_envs=64 --headless --max_iterations=100
+```
+
+The 100-iteration (6,400-step) smoke run completed in 358.55 seconds without
+NaN, crash, or premature termination. The instantaneous mean reward increased
+from -0.2406 to 0.3410, and mean complete-episode return increased from -64.7
+to 335.6. Policy standard deviation decreased from 0.223 to 0.204 normalized
+action, equivalent to about 0.61 mm at the 3 mm residual limit. Ten periodic
+checkpoints plus `best_agent.pt` were written under:
+
+```text
+logs/skrl/agv_level_residual_direct/
+2026-09-10_17-49-26_ppo_torch_v7_6_b_residual_ppo_baseline/
+```
+
+This is a training-pipeline smoke result, not evidence that the learned policy
+outperforms the zero-residual V7.5 controller.
+
 ## Limitations and next step
 
 - AGVs, Lift plates, and terrain interaction remain the established kinematic
   and analytical proxies.
 - Cargo/support contact diagnostics are analytical geometry proxies, not PhysX
   contact-sensor measurements.
-- Reward scales and PPO hyperparameters are an initial baseline only.
-- No PPO training result is claimed in V7.6-A.
+- Reward normalization and PPO hyperparameters remain an initial baseline.
+- The short PPO run proves numerical and checkpoint stability only; it is not a
+  held-out policy evaluation.
 
-Before V7.6-B training, the next small stage is to normalize the reward terms by
-interpretable physical reference values and verify their measured per-step
-scales. Then train the three-action PPO baseline, compare it with a forced
-zero-residual policy on held-out randomized conditions, and report both
-stability gains and residual effort/saturation.
+The next stage is a reproducible evaluation path that loads a checkpoint and
+compares PPO residual control with forced zero residual on identical held-out
+terrain, speed, Cargo mass, and Cargo offset samples. It must report Board and
+Cargo stability together with residual RMS, residual saturation, and Lift
+effort before a longer training run is justified.

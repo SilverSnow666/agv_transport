@@ -58,7 +58,7 @@ agent:
 
   experiment:
     directory: "agv_level_residual_direct"
-    experiment_name: "v7_6_a_environment"
+    experiment_name: "v7_6_b_residual_ppo_baseline"
     write_interval: auto
     checkpoint_interval: auto
 

@@ -89,6 +89,18 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         mass_low, _ = self.cfg.residual_cargo_mass_range
         if float(mass_low) <= 0.0:
             raise ValueError("residual_cargo_mass_range must remain positive")
+        for name in (
+            "residual_board_angle_reference",
+            "residual_board_angular_velocity_reference",
+            "residual_board_vertical_velocity_reference",
+            "residual_cargo_slip_reference",
+            "residual_cargo_velocity_reference",
+            "residual_cargo_tilt_reference",
+            "residual_cargo_angular_velocity_reference",
+            "residual_lift_velocity_reference",
+        ):
+            if float(getattr(self.cfg, name)) <= 0.0:
+                raise ValueError(f"{name} must be positive")
 
     # ------------------------------------------------------------------
     # Residual action and scripted AGV motion
@@ -495,25 +507,50 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             cargo_relative_angular_speed,
         ) = self._cargo_relative_state()
 
-        board_angle_cost = torch.square(roll) + torch.square(pitch)
+        board_angle_reference = float(self.cfg.residual_board_angle_reference)
+        board_angle_cost = torch.square(roll / board_angle_reference) + torch.square(
+            pitch / board_angle_reference
+        )
         board_angular_velocity_cost = torch.sum(
-            torch.square(board_ang_vel_local[:, 0:2]), dim=1
+            torch.square(
+                board_ang_vel_local[:, 0:2]
+                / float(self.cfg.residual_board_angular_velocity_reference)
+            ),
+            dim=1,
         )
         board_vertical_velocity_cost = torch.square(
             self.payload.data.root_lin_vel_w[:, 2]
+            / float(self.cfg.residual_board_vertical_velocity_reference)
         )
         cargo_slip = cargo_relative_position[:, 0:2] - self.cargo_initial_relative_xy
-        cargo_slip_cost = torch.sum(torch.square(cargo_slip), dim=1)
+        cargo_slip_cost = torch.sum(
+            torch.square(cargo_slip / float(self.cfg.residual_cargo_slip_reference)),
+            dim=1,
+        )
         cargo_velocity_cost = torch.sum(
-            torch.square(cargo_relative_velocity[:, 0:2]), dim=1
+            torch.square(
+                cargo_relative_velocity[:, 0:2]
+                / float(self.cfg.residual_cargo_velocity_reference)
+            ),
+            dim=1,
         )
-        cargo_tilt_cost = torch.square(cargo_relative_roll) + torch.square(
-            cargo_relative_pitch
+        cargo_tilt_reference = float(self.cfg.residual_cargo_tilt_reference)
+        cargo_tilt_cost = torch.square(
+            cargo_relative_roll / cargo_tilt_reference
+        ) + torch.square(cargo_relative_pitch / cargo_tilt_reference)
+        cargo_angular_velocity_cost = torch.square(
+            cargo_relative_angular_speed
+            / float(self.cfg.residual_cargo_angular_velocity_reference)
         )
-        cargo_angular_velocity_cost = torch.square(cargo_relative_angular_speed)
         action_cost = torch.mean(torch.square(self.actions), dim=1)
         action_rate_cost = torch.mean(torch.square(self.actions - self.prev_actions), dim=1)
-        lift_velocity_cost = torch.mean(torch.square(self.lift_velocity), dim=1)
+        lift_velocity_cost = torch.mean(
+            torch.square(
+                self.lift_velocity
+                / float(self.cfg.residual_lift_velocity_reference)
+            ),
+            dim=1,
+        )
 
         (
             board_dropped,
@@ -533,22 +570,51 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             | cargo_tipped
         )
 
+        reward_alive = torch.full_like(
+            board_angle_cost, float(self.cfg.residual_alive_reward)
+        )
+        penalty_board_angle = -float(
+            self.cfg.residual_board_angle_penalty_scale
+        ) * board_angle_cost
+        penalty_board_angular_velocity = -float(
+            self.cfg.residual_board_angular_velocity_penalty_scale
+        ) * board_angular_velocity_cost
+        penalty_board_vertical_velocity = -float(
+            self.cfg.residual_board_vertical_velocity_penalty_scale
+        ) * board_vertical_velocity_cost
+        penalty_cargo_slip = -float(
+            self.cfg.residual_cargo_slip_penalty_scale
+        ) * cargo_slip_cost
+        penalty_cargo_velocity = -float(
+            self.cfg.residual_cargo_velocity_penalty_scale
+        ) * cargo_velocity_cost
+        penalty_cargo_tilt = -float(
+            self.cfg.residual_cargo_tilt_penalty_scale
+        ) * cargo_tilt_cost
+        penalty_cargo_angular_velocity = -float(
+            self.cfg.residual_cargo_angular_velocity_penalty_scale
+        ) * cargo_angular_velocity_cost
+        penalty_action = -float(self.cfg.residual_action_penalty_scale) * action_cost
+        penalty_action_rate = -float(
+            self.cfg.residual_action_rate_penalty_scale
+        ) * action_rate_cost
+        penalty_lift_velocity = -float(
+            self.cfg.residual_lift_velocity_penalty_scale
+        ) * lift_velocity_cost
+        penalty_failure = -float(self.cfg.residual_failure_penalty) * failure.float()
         reward = (
-            float(self.cfg.residual_alive_reward)
-            - float(self.cfg.residual_board_angle_penalty_scale) * board_angle_cost
-            - float(self.cfg.residual_board_angular_velocity_penalty_scale)
-            * board_angular_velocity_cost
-            - float(self.cfg.residual_board_vertical_velocity_penalty_scale)
-            * board_vertical_velocity_cost
-            - float(self.cfg.residual_cargo_slip_penalty_scale) * cargo_slip_cost
-            - float(self.cfg.residual_cargo_velocity_penalty_scale) * cargo_velocity_cost
-            - float(self.cfg.residual_cargo_tilt_penalty_scale) * cargo_tilt_cost
-            - float(self.cfg.residual_cargo_angular_velocity_penalty_scale)
-            * cargo_angular_velocity_cost
-            - float(self.cfg.residual_action_penalty_scale) * action_cost
-            - float(self.cfg.residual_action_rate_penalty_scale) * action_rate_cost
-            - float(self.cfg.residual_lift_velocity_penalty_scale) * lift_velocity_cost
-            - float(self.cfg.residual_failure_penalty) * failure.float()
+            reward_alive
+            + penalty_board_angle
+            + penalty_board_angular_velocity
+            + penalty_board_vertical_velocity
+            + penalty_cargo_slip
+            + penalty_cargo_velocity
+            + penalty_cargo_tilt
+            + penalty_cargo_angular_velocity
+            + penalty_action
+            + penalty_action_rate
+            + penalty_lift_velocity
+            + penalty_failure
         )
 
         self.extras["log"] = {
@@ -560,16 +626,38 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             "Residual/saturation_rate": self.last_residual_saturated.float().mean().detach(),
             "Board/roll_abs_mean": torch.abs(roll).mean().detach(),
             "Board/pitch_abs_mean": torch.abs(pitch).mean().detach(),
-            "Board/rp_angular_speed_mean": torch.sqrt(
-                board_angular_velocity_cost
+            "Board/rp_angular_speed_mean": torch.linalg.norm(
+                board_ang_vel_local[:, 0:2], dim=1
             ).mean().detach(),
             "Board/vertical_speed_abs_mean": torch.abs(
                 self.payload.data.root_lin_vel_w[:, 2]
             ).mean().detach(),
-            "Cargo/slip_from_reset_mean": torch.sqrt(cargo_slip_cost).mean().detach(),
-            "Cargo/relative_speed_mean": torch.sqrt(cargo_velocity_cost).mean().detach(),
+            "Cargo/slip_from_reset_mean": torch.linalg.norm(
+                cargo_slip, dim=1
+            ).mean().detach(),
+            "Cargo/relative_speed_mean": torch.linalg.norm(
+                cargo_relative_velocity[:, 0:2], dim=1
+            ).mean().detach(),
             "Cargo/relative_angular_speed_mean": cargo_relative_angular_speed.mean().detach(),
             "Support/contact_count_mean": contact_count.mean().detach(),
+            "RewardTerms/alive": reward_alive.mean().detach(),
+            "RewardTerms/board_angle": penalty_board_angle.mean().detach(),
+            "RewardTerms/board_angular_velocity": (
+                penalty_board_angular_velocity.mean().detach()
+            ),
+            "RewardTerms/board_vertical_velocity": (
+                penalty_board_vertical_velocity.mean().detach()
+            ),
+            "RewardTerms/cargo_slip": penalty_cargo_slip.mean().detach(),
+            "RewardTerms/cargo_velocity": penalty_cargo_velocity.mean().detach(),
+            "RewardTerms/cargo_tilt": penalty_cargo_tilt.mean().detach(),
+            "RewardTerms/cargo_angular_velocity": (
+                penalty_cargo_angular_velocity.mean().detach()
+            ),
+            "RewardTerms/action": penalty_action.mean().detach(),
+            "RewardTerms/action_rate": penalty_action_rate.mean().detach(),
+            "RewardTerms/lift_velocity": penalty_lift_velocity.mean().detach(),
+            "RewardTerms/failure": penalty_failure.mean().detach(),
             "Done/board_drop_rate": board_dropped.float().mean().detach(),
             "Done/board_tip_rate": board_tipped.float().mean().detach(),
             "Done/support_lost_rate": support_lost.float().mean().detach(),
