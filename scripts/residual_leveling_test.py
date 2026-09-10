@@ -268,16 +268,63 @@ def _run_random(env) -> None:
     if obs.shape != (args_cli.num_envs, 33):
         raise RuntimeError(f"Unexpected observation shape: {tuple(obs.shape)}")
 
+    clearance = float(raw_env.cfg.board_support_clearance)
+    all_env_ids = raw_env.payload._ALL_INDICES
+    support_surface_z, _ = raw_env._lift_support_surface_max_z(
+        all_env_ids, raw_env.lift_height
+    )
+    board_bottom_z = (
+        raw_env.payload.data.root_pos_w[:, 2]
+        - 0.5 * float(raw_env.cfg.payload_size[2])
+    )
+    support_gap = board_bottom_z.unsqueeze(1) - support_surface_z
+    support_gap_error = torch.max(torch.abs(support_gap - clearance))
+    cargo_relative_position = raw_env._cargo_relative_state()[0]
+    cargo_face_gap = (
+        cargo_relative_position[:, 2]
+        - 0.5 * float(raw_env.cfg.payload_size[2])
+        - 0.5 * float(raw_env.cfg.cargo_size[2])
+    )
+    cargo_gap_error = torch.max(
+        torch.abs(cargo_face_gap - float(raw_env.cfg.cargo_board_clearance))
+    )
+    if bool(torch.any(raw_env.last_reset_support_unreachable)):
+        raise RuntimeError("Randomized reset has no common reachable Lift support height")
+    if bool(torch.any(raw_env.last_reset_lift_saturated)):
+        raise RuntimeError("Randomized reset required a saturated Lift height")
+    if float(support_gap_error) > 1.0e-5:
+        raise RuntimeError(
+            "Randomized reset support gap mismatch: "
+            f"max error={1000.0 * float(support_gap_error):.6f} mm"
+        )
+    if float(cargo_gap_error) > 1.0e-6:
+        raise RuntimeError(
+            "Randomized reset Cargo face gap mismatch: "
+            f"max error={1000.0 * float(cargo_gap_error):.6f} mm"
+        )
+    print(
+        "[RESULT] randomized reset geometry: "
+        f"support gap=[{1000.0 * float(support_gap.min()):.3f}, "
+        f"{1000.0 * float(support_gap.max()):.3f}] mm, "
+        f"Cargo face gap={1000.0 * float(cargo_face_gap.max()):.3f} mm, "
+        f"Lift height=[{1000.0 * float(raw_env.lift_height.min()):.3f}, "
+        f"{1000.0 * float(raw_env.lift_height.max()):.3f}] mm"
+    )
+
     step_dt = float(raw_env.cfg.sim.dt) * int(raw_env.cfg.decimation)
     elapsed = 0.0
     random_duration = min(float(args_cli.duration), 2.0)
     while simulation_app.is_running() and elapsed < random_duration:
         actions = torch.empty(env.action_space.shape, device=raw_env.device).uniform_(-0.5, 0.5)
         with torch.inference_mode():
-            observation, reward, _, _, _ = env.step(actions)
+            observation, reward, terminated, truncated, _ = env.step(actions)
         values = torch.cat((observation["policy"].reshape(-1), reward.reshape(-1)))
         if not bool(torch.isfinite(values).all()):
             raise RuntimeError(f"NaN/Inf in randomized smoke test at t={elapsed:.3f} s")
+        if bool(torch.any(terminated)) or bool(torch.any(truncated)):
+            raise RuntimeError(
+                f"Randomized smoke test reset early at t={elapsed:.3f} s"
+            )
         elapsed += step_dt
 
     print(
@@ -288,6 +335,22 @@ def _run_random(env) -> None:
         f"{1000.0 * float(raw_env.randomized_terrain_amplitude.max()):.1f}] mm, "
         f"Cargo mass=[{float(raw_env.randomized_cargo_mass.min()):.2f}, "
         f"{float(raw_env.randomized_cargo_mass.max()):.2f}] kg"
+    )
+
+    raw_env.cfg.residual_domain_randomization = False
+    with torch.inference_mode():
+        env.reset(seed=7)
+    restored_masses = raw_env.cargo.root_physx_view.get_masses()
+    mass_error = torch.max(
+        torch.abs(restored_masses - float(raw_env.cfg.cargo_mass))
+    )
+    if float(mass_error) > 1.0e-6:
+        raise RuntimeError(
+            f"Cargo mass restore failed: max error={float(mass_error):.9g} kg"
+        )
+    print(
+        f"[RESULT] randomized-to-deterministic Cargo mass restore: "
+        f"{float(raw_env.cfg.cargo_mass):.3f} kg"
     )
 
 

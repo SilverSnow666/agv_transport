@@ -44,11 +44,23 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         )
         self.randomized_cargo_offset_xy = torch.zeros((self.num_envs, 2), device=self.device)
         self.cargo_initial_relative_xy = torch.zeros((self.num_envs, 2), device=self.device)
+        self.last_reset_support_top_z = torch.zeros((self.num_envs, 3), device=self.device)
+        self.last_reset_support_gap = torch.zeros((self.num_envs, 3), device=self.device)
+        self.last_reset_cargo_face_gap = torch.zeros(self.num_envs, device=self.device)
+        self.last_reset_lift_saturated = torch.zeros(
+            (self.num_envs, 3), device=self.device, dtype=torch.bool
+        )
+        self.last_reset_support_unreachable = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
 
         if self.cargo is None:
             raise RuntimeError("AgvLevelResidualEnv requires enable_cargo=True")
         self._cargo_reference_mass = float(self.cfg.cargo_mass)
         self._cargo_reference_inertias = self.cargo.root_physx_view.get_inertias().clone()
+        self._cargo_mass_is_randomized = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self._validate_residual_cfg()
 
     def _validate_residual_cfg(self) -> None:
@@ -194,6 +206,122 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         roll = torch.atan(slope_y * torch.cos(pitch))
         return samples.mean(dim=1), roll, pitch, samples
 
+    def _lift_support_surface_max_z(
+        self, env_ids: torch.Tensor, lift_heights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return each tilted Lift cuboid's highest world-Z point.
+
+        The V7.5 controller intentionally uses support-top center heights. A
+        reset needs the full cuboid extent as well: placing a horizontal Board
+        from center heights alone can start it inside the raised edge of a
+        tilted 0.28 m plate.
+        """
+        half_x = 0.5 * float(self.cfg.lift_plate_size[0])
+        half_y = 0.5 * float(self.cfg.lift_plate_size[1])
+        half_z = 0.5 * float(self.cfg.lift_plate_size[2])
+        agv_half_z = 0.5 * float(self.cfg.agv_size[2])
+        surface_max_z = []
+        axis_z = []
+        for index, agv in enumerate(self.agvs):
+            state = agv.data.root_state_w[env_ids]
+            qw, qx, qy, qz = state[:, 3:7].unbind(dim=1)
+            local_x_z = 2.0 * (qx * qz - qw * qy)
+            local_y_z = 2.0 * (qy * qz + qw * qx)
+            local_z_z = 1.0 - 2.0 * (qx * qx + qy * qy)
+            center_z = state[:, 2] + local_z_z * (
+                agv_half_z + lift_heights[:, index] + half_z
+            )
+            surface_max_z.append(
+                center_z
+                + half_x * torch.abs(local_x_z)
+                + half_y * torch.abs(local_y_z)
+                + half_z * torch.abs(local_z_z)
+            )
+            axis_z.append(local_z_z)
+        return torch.stack(surface_max_z, dim=1), torch.stack(axis_z, dim=1)
+
+    def _reset_randomized_support_stack(self, env_ids: torch.Tensor) -> None:
+        """Warm-start Lift, Board and Cargo on the randomized terrain."""
+        count = len(env_ids)
+        lift_min = float(self.cfg.lift_min_height)
+        lift_max = float(self.cfg.lift_max_height)
+        neutral = float(self.cfg.lift_neutral_height)
+
+        zero_heights = torch.zeros((count, 3), device=self.device)
+        surface_at_zero, axis_z = self._lift_support_surface_max_z(
+            env_ids, zero_heights
+        )
+        axis_z = axis_z.clamp_min(0.25)
+        minimum_surface = surface_at_zero + axis_z * lift_min
+        maximum_surface = surface_at_zero + axis_z * lift_max
+        common_low = torch.max(minimum_surface, dim=1).values
+        common_high = torch.min(maximum_surface, dim=1).values
+        self.last_reset_support_unreachable[env_ids] = common_low > common_high
+
+        neutral_surface = surface_at_zero + axis_z * neutral
+        common_surface = neutral_surface.mean(dim=1)
+        # An empty common range is not expected for the configured terrain.
+        # The midpoint still gives the least asymmetric bounded fallback and is
+        # exposed through last_reset_support_unreachable for validation.
+        bounded_low = torch.minimum(common_low, common_high)
+        bounded_high = torch.maximum(common_low, common_high)
+        common_surface = torch.clamp(common_surface, min=bounded_low, max=bounded_high)
+        common_surface = torch.where(
+            self.last_reset_support_unreachable[env_ids],
+            0.5 * (common_low + common_high),
+            common_surface,
+        )
+        raw_heights = (common_surface.unsqueeze(1) - surface_at_zero) / axis_z
+        lift_heights = torch.clamp(raw_heights, min=lift_min, max=lift_max)
+        self.last_reset_lift_saturated[env_ids] = torch.abs(
+            lift_heights - raw_heights
+        ) > 1.0e-7
+        self.lift_height[env_ids] = lift_heights
+        self.lift_target_height[env_ids] = lift_heights
+        self.lift_velocity[env_ids] = 0.0
+        self._update_lift_poses(env_ids)
+
+        support_surface_z, _ = self._lift_support_surface_max_z(
+            env_ids, lift_heights
+        )
+        board_bottom_z = torch.max(support_surface_z, dim=1).values + float(
+            self.cfg.board_support_clearance
+        )
+        board_pose = torch.zeros((count, 7), device=self.device)
+        payload_init_xy = torch.tensor(
+            self.cfg.payload_init_pos[:2], device=self.device, dtype=torch.float32
+        )
+        board_pose[:, :2] = self.scene.env_origins[env_ids, :2] + payload_init_xy
+        board_pose[:, 2] = board_bottom_z + 0.5 * float(self.cfg.payload_size[2])
+        board_pose[:, 3] = 1.0
+        zero_velocity = torch.zeros((count, 6), device=self.device)
+        self.payload.write_root_pose_to_sim(board_pose, env_ids=env_ids)
+        self.payload.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)
+        self.last_reset_support_top_z[env_ids] = support_surface_z
+        self.last_reset_support_gap[env_ids] = (
+            board_bottom_z.unsqueeze(1) - support_surface_z
+        )
+
+        cargo_pose = torch.zeros((count, 7), device=self.device)
+        cargo_pose[:, :2] = board_pose[:, :2] + self.randomized_cargo_offset_xy[env_ids]
+        cargo_pose[:, 2] = (
+            board_pose[:, 2]
+            + 0.5 * float(self.cfg.payload_size[2])
+            + 0.5 * float(self.cfg.cargo_size[2])
+            + float(self.cfg.cargo_board_clearance)
+        )
+        cargo_pose[:, 3] = 1.0
+        self.cargo.write_root_pose_to_sim(cargo_pose, env_ids=env_ids)
+        self.cargo.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)
+        self.cargo_initial_relative_xy[env_ids] = self.randomized_cargo_offset_xy[env_ids]
+        self.last_reset_cargo_face_gap[env_ids] = float(
+            self.cfg.cargo_board_clearance
+        )
+
+        # The first policy step starts from this terrain-aware warm start, not
+        # from the nominal 30 mm target inherited from the base reset.
+        self.base_leveling_target_height[env_ids] = lift_heights
+
     # ------------------------------------------------------------------
     # Residual policy observation
     # ------------------------------------------------------------------
@@ -331,8 +459,12 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         board_half_xy = 0.5 * torch.tensor(
             self.cfg.payload_size[:2], device=self.device, dtype=cargo_relative_position.dtype
         )
+        cargo_half_xy = 0.5 * torch.tensor(
+            self.cfg.cargo_size[:2], device=self.device, dtype=cargo_relative_position.dtype
+        )
         cargo_center_over_board = torch.all(
-            torch.abs(cargo_relative_position[:, :2]) <= board_half_xy, dim=1
+            torch.abs(cargo_relative_position[:, :2]) <= board_half_xy - cargo_half_xy,
+            dim=1,
         )
         cargo_dropped = (~cargo_center_over_board) | (cargo_relative_position[:, 2] < 0.0)
         cargo_tipped = torch.maximum(torch.abs(cargo_roll), torch.abs(cargo_pitch)) > float(
@@ -504,6 +636,18 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             self.randomized_cargo_mass[env_ids] = float(self.cfg.cargo_mass)
             self.randomized_cargo_offset_xy[env_ids] = 0.0
 
+    def _write_cargo_mass_and_inertia(
+        self, env_ids: torch.Tensor, masses_device: torch.Tensor
+    ) -> None:
+        """Write consistently scaled Cargo mass/inertia through CPU PhysX buffers."""
+        physx_indices = env_ids.to(device="cpu", dtype=torch.int32)
+        reference_indices = physx_indices.to(dtype=torch.long)
+        masses = masses_device.detach().to(device="cpu").unsqueeze(1)
+        mass_scale = masses / self._cargo_reference_mass
+        inertias = self._cargo_reference_inertias[reference_indices] * mass_scale
+        self.cargo.root_physx_view.set_masses(masses, physx_indices)
+        self.cargo.root_physx_view.set_inertias(inertias, physx_indices)
+
     def _reset_idx(self, env_ids: Sequence[int] | torch.Tensor | None) -> None:
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
@@ -516,36 +660,30 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         self.base_leveling_target_height[env_ids] = float(self.cfg.lift_neutral_height)
         self.last_residual_height[env_ids] = 0.0
         self.last_residual_saturated[env_ids] = False
+        self.last_reset_support_top_z[env_ids] = 0.0
+        self.last_reset_support_gap[env_ids] = 0.0
+        self.last_reset_cargo_face_gap[env_ids] = 0.0
+        self.last_reset_lift_saturated[env_ids] = False
+        self.last_reset_support_unreachable[env_ids] = False
 
         self.cargo_initial_relative_xy[env_ids] = self.randomized_cargo_offset_xy[env_ids]
         if self.cfg.residual_domain_randomization:
-            # Reposition the free Cargo without attaching it to the Board. The
-            # disabled path intentionally performs no extra PhysX writes so a
-            # zero residual remains trajectory-equivalent to the V7.5 task.
-            count = len(env_ids)
-            cargo_init = torch.tensor(
-                self.cfg.cargo_init_pos, device=self.device, dtype=torch.float32
+            self._write_cargo_mass_and_inertia(
+                env_ids, self.randomized_cargo_mass[env_ids]
             )
-            cargo_pose = torch.zeros((count, 7), device=self.device)
-            cargo_pose[:, :3] = self.scene.env_origins[env_ids] + cargo_init
-            cargo_pose[:, :2] += self.randomized_cargo_offset_xy[env_ids]
-            cargo_pose[:, 3] = 1.0
-            cargo_velocity = torch.zeros((count, 6), device=self.device)
-            self.cargo.write_root_pose_to_sim(cargo_pose, env_ids=env_ids)
-            self.cargo.write_root_velocity_to_sim(cargo_velocity, env_ids=env_ids)
-
-            # Scale inertia with mass so randomization changes the physical
-            # load rather than only replacing the scalar mass value. PhysX
-            # mass/inertia buffers and their indices are CPU tensors.
-            physx_indices = env_ids.to(device="cpu", dtype=torch.int32)
-            reference_indices = physx_indices.to(dtype=torch.long)
-            masses = (
-                self.randomized_cargo_mass[env_ids]
-                .detach()
-                .to(device="cpu")
-                .unsqueeze(1)
-            )
-            mass_scale = masses / self._cargo_reference_mass
-            inertias = self._cargo_reference_inertias[reference_indices] * mass_scale
-            self.cargo.root_physx_view.set_masses(masses, physx_indices)
-            self.cargo.root_physx_view.set_inertias(inertias, physx_indices)
+            self._cargo_mass_is_randomized[env_ids] = True
+            self._reset_randomized_support_stack(env_ids)
+        else:
+            # A fresh deterministic environment performs no extra PhysX writes,
+            # preserving the V7.5 zero-residual trajectory. If these same
+            # environment slots were randomized earlier, restore their mass.
+            restore_mask = self._cargo_mass_is_randomized[env_ids]
+            restore_ids = env_ids[restore_mask]
+            if len(restore_ids) > 0:
+                reference_masses = torch.full(
+                    (len(restore_ids),),
+                    self._cargo_reference_mass,
+                    device=self.device,
+                )
+                self._write_cargo_mass_and_inertia(restore_ids, reference_masses)
+                self._cargo_mass_is_randomized[restore_ids] = False

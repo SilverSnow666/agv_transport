@@ -76,6 +76,53 @@ The observation shape was `(8, 33)`. Observations and rewards remained finite.
 With seed 7, this reset sampled speed 0.101 to 0.175 m/s, terrain amplitude
 25.7 to 47.9 mm, and Cargo mass 3.71 to 6.20 kg.
 
+### V7.6-A.1 randomized reset consistency
+
+The original randomized path changed the analytical terrain before the base
+reset, so AGV Z/roll/pitch followed the new terrain while Board and Cargo still
+used fixed nominal Z coordinates. This could begin an episode with a Lift plate
+inside the Board or with a large support gap.
+
+The randomized-only warm start now:
+
+1. uses the randomized terrain pose already assigned to each AGV;
+2. computes the highest world-Z point of each fully tilted Lift cuboid;
+3. solves a common reachable support height and initializes all three Lift
+   actuators there;
+4. places a horizontal Board above those three physical surfaces with the
+   configured 3 mm reset clearance;
+5. places Cargo directly on the Board at its randomized XY offset.
+
+The deterministic path deliberately skips these additional pose writes, so the
+V7.5 zero-residual comparison is unchanged. Cargo mass and inertia are also
+restored if a previously randomized environment slot is later reset with
+randomization disabled.
+
+The 8-environment, 2-second randomized test reported:
+
+```text
+support gap       = 3.000 to 3.000 mm
+Cargo face gap    = 0.000 mm
+Lift height       = 24.628 to 38.964 mm
+early termination = none
+restored mass     = 4.000 kg
+```
+
+A separate 64-environment reset stress sample covered speed 0.082 to 0.180 m/s,
+terrain amplitude 20.4 to 49.9 mm, Cargo mass 3.04 to 7.67 kg, and Lift height
+21.683 to 41.641 mm. Every environment had the same 3 mm support gap, with no
+unreachable common support height or initial Lift saturation.
+
+The full combined validation also passed:
+
+```bat
+python scripts\residual_leveling_test.py --case all --duration 12 --num_envs 1 --headless
+```
+
+This retained the 0.1328/0.1067 deg zero-residual roll/pitch RMS and all three
++3.000 mm one-hot action mappings, then passed randomized reset geometry,
+finite-value, early-termination, and mass-restoration checks in one process.
+
 ### Zero-residual V7.5 equivalence
 
 ```bat
@@ -119,6 +166,8 @@ active Isaac Lab environment.
 - Reward scales and PPO hyperparameters are an initial baseline only.
 - No PPO training result is claimed in V7.6-A.
 
-The next stage is V7.6-B: train the three-action PPO baseline, compare it with a
-forced zero-residual policy on held-out randomized conditions, and report both
+Before V7.6-B training, the next small stage is to normalize the reward terms by
+interpretable physical reference values and verify their measured per-step
+scales. Then train the three-action PPO baseline, compare it with a forced
+zero-residual policy on held-out randomized conditions, and report both
 stability gains and residual effort/saturation.
