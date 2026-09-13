@@ -13,6 +13,7 @@ a more user-friendly way.
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
 import sys
 
 from isaaclab.app import AppLauncher
@@ -57,11 +58,33 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--residual-demo", action="store_true", help="Single-env residual PPO demo with matching visible terrain."
+)
+parser.add_argument("--demo-speed", type=float, default=0.10, help="Demo AGV speed in m/s.")
+parser.add_argument(
+    "--demo-amplitude", type=float, default=0.030,
+    help="Demo terrain amplitude in meters (not visual exaggeration).",
+)
+parser.add_argument("--demo-phase-x", type=float, default=1.17)
+parser.add_argument("--demo-phase-y", type=float, default=-2.03)
+parser.add_argument(
+    "--zero-residual", action="store_true", help="Demo E baseline instead of PPO residual (same checkpoint/config)."
+)
+parser.add_argument(
+    "--duration", type=float, default=None,
+    help="Stop after this many simulation seconds; otherwise play until closed.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.duration is not None:
+    if not math.isfinite(args_cli.duration) or args_cli.duration <= 0:
+        parser.error("--duration must be finite and positive")
+if args_cli.zero_residual and not args_cli.residual_demo:
+    parser.error("--zero-residual requires --residual-demo")
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -148,6 +171,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     experiment_cfg["seed"] = args_cli.seed if args_cli.seed is not None else experiment_cfg["seed"]
     env_cfg.seed = experiment_cfg["seed"]
 
+    if args_cli.residual_demo:
+        from residual_demo import configure_demo
+
+        configure_demo(env_cfg, args_cli)
+
     # specify directory for logging experiments (load checkpoint)
     log_root_path = os.path.join("logs", "skrl", experiment_cfg["agent"]["experiment"]["directory"])
     log_root_path = os.path.abspath(log_root_path)
@@ -171,6 +199,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    raw_env = env.unwrapped
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
@@ -185,7 +214,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
+            "video_folder": (
+                os.path.join(log_dir, "videos", "residual_demo", time.strftime("%Y%m%d_%H%M%S"))
+                if args_cli.residual_demo else os.path.join(log_dir, "videos", "play")
+            ),
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
@@ -211,6 +243,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # reset environment
     obs, _ = env.reset()
+    if args_cli.residual_demo:
+        from residual_demo import prepare_and_check_visuals
+
+        prepare_and_check_visuals(raw_env)
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -226,13 +262,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             # - single-agent (deterministic) actions
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
+            if args_cli.zero_residual:
+                actions = torch.zeros_like(actions)
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            obs, _, terminated, truncated, _ = env.step(actions)
+            if args_cli.residual_demo:
+                if not torch.isfinite(obs).all() or not torch.isfinite(actions).all():
+                    raise RuntimeError("Non-finite demo observation/action")
+                if torch.any(terminated | truncated):
+                    prepare_and_check_visuals(raw_env)
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        if args_cli.duration is not None and timestep * dt >= args_cli.duration:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
@@ -240,11 +285,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             time.sleep(sleep_time)
 
     # close the simulator
+    if args_cli.residual_demo:
+        print(f"[DEMO] Completed {timestep} steps ({timestep * dt:.3f} simulation seconds).")
     env.close()
 
 
 if __name__ == "__main__":
     # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        simulation_app.close()
