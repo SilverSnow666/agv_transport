@@ -54,3 +54,17 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_residual_cfg.yaml",
     },
 )
+
+# V7.6-E1: versioned reward-only refinement. The environment class, physical
+# model, observations, action range and randomization remain the V7.6 baseline.
+gym.register(
+    id="Template-Agv-Level-Residual-Smooth-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_residual_smooth_env_cfg:AgvLevelResidualSmoothEnvCfg"
+        ),
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_residual_smooth_cfg.yaml",
+    },
+)
