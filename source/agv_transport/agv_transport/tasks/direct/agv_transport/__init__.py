@@ -68,3 +68,20 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_residual_smooth_cfg.yaml",
     },
 )
+
+# V7.6-E2: single-factor follow-up to E1. Only the residual action-magnitude
+# penalty changes; all other reward, controller and physical settings inherit E1.
+gym.register(
+    id="Template-Agv-Level-Residual-ActionPenalty-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_residual_action_penalty_env_cfg:"
+            "AgvLevelResidualActionPenaltyEnvCfg"
+        ),
+        "skrl_cfg_entry_point": (
+            f"{agents.__name__}:skrl_ppo_residual_action_penalty_cfg.yaml"
+        ),
+    },
+)
