@@ -39,7 +39,11 @@ parser.add_argument(
     help="Append read-only pre-state and command decomposition diagnostics to trajectories.",
 )
 AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--common_mode_ablation", action="store_true",
+                    help="Add an inference-only bounded zero-mean PPO arm; enables control capture.")
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.common_mode_ablation:
+    args_cli.control_decomposition = True
 
 # Hydra must only see arguments that it owns.
 sys.argv = [sys.argv[0]] + hydra_args
@@ -457,6 +461,13 @@ def _run_controller(
                 actions = torch.zeros((1, 3), device=raw_env.device)
             else:
                 actions = _policy_actions(agent, observation)
+            if args_cli.common_mode_ablation:
+                from residual_common_mode import project_zero_mean
+
+                policy_actions = actions.clone()
+                projection_scale = torch.ones((1, 1), device=actions.device)
+                if controller == "F_ppo_zm":
+                    actions, projection_scale = project_zero_mean(actions)
             observation, reward, terminated, truncated, _ = wrapped_env.step(actions)
 
         if args_cli.control_decomposition and (bool(terminated[0]) or bool(truncated[0])):
@@ -492,6 +503,13 @@ def _run_controller(
         )
         if args_cli.control_decomposition:
             append_control_fields(rows[-1], raw_env, pre_control, step_dt)
+        if args_cli.common_mode_ablation:
+            rows[-1]["zero_mean_projection"] = int(controller == "F_ppo_zm")
+            rows[-1]["projection_scale"] = float(projection_scale[0, 0])
+            for j in range(3):
+                rows[-1][f"policy_action{j+1}_before_projection"] = float(policy_actions[0, j])
+            if controller == "F_ppo_zm" and float(current_residual.mean().abs()) > 1e-8:
+                raise RuntimeError("Applied residual is not zero mean")
 
         if bool(terminated[0]) or bool(truncated[0]):
             early_termination = elapsed + 0.5 * step_dt < float(args_cli.duration)
@@ -550,7 +568,8 @@ def _comparisons(summaries: list[dict]) -> list[dict[str, float | str]]:
 
 
 def _print_case_result(baseline: dict, policy: dict) -> None:
-    print(f"[RESULT] {baseline['case']}: E zero residual vs F PPO")
+    policy_label = "F PPO ZM" if policy["controller"] == "F_ppo_zm" else "F PPO"
+    print(f"[RESULT] {baseline['case']}: E zero residual vs {policy_label}")
     for metric in DISPLAY_METRICS:
         baseline_value = float(baseline[metric])
         policy_value = float(policy[metric])
@@ -616,7 +635,8 @@ def main(
         for case in _selected_cases():
             case_summaries = []
             initial_signatures = []
-            for controller in ("E_zero", "F_ppo"):
+            controllers = ("E_zero", "F_ppo", "F_ppo_zm") if args_cli.common_mode_ablation else ("E_zero", "F_ppo")
+            for controller in controllers:
                 rows, summary, initial_signature = _run_controller(
                     gym_env, wrapped_env, raw_env, runner.agent, case, controller
                 )
@@ -624,9 +644,10 @@ def main(
                 summaries.append(summary)
                 case_summaries.append(summary)
                 initial_signatures.append(initial_signature)
-            initial_difference = torch.max(
-                torch.abs(initial_signatures[0] - initial_signatures[1])
-            )
+            initial_difference = torch.stack([
+                torch.max(torch.abs(initial_signatures[0] - signature))
+                for signature in initial_signatures[1:]
+            ]).max()
             if float(initial_difference) > 1.0e-6:
                 raise RuntimeError(
                     f"{case.name} E/F initial states differ: "
@@ -642,6 +663,9 @@ def main(
                 f"{float(initial_difference):.3e}"
             )
             _print_case_result(case_summaries[0], case_summaries[1])
+            if args_cli.common_mode_ablation:
+                print("[ABLATION] Additional F_ppo_zm arm (bounded zero-mean projection)")
+                _print_case_result(case_summaries[0], case_summaries[2])
     finally:
         wrapped_env.close()
 
