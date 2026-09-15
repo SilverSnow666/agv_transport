@@ -34,6 +34,10 @@ parser.add_argument("--phase_x", type=float, default=1.17)
 parser.add_argument("--phase_y", type=float, default=-2.03)
 parser.add_argument("--log_dir", type=str, default="logs/v7_6_c")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
+parser.add_argument(
+    "--control_decomposition", action="store_true",
+    help="Append read-only pre-state and command decomposition diagnostics to trajectories.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -444,12 +448,21 @@ def _run_controller(
     early_termination = False
 
     while simulation_app.is_running() and elapsed < float(args_cli.duration):
+        if args_cli.control_decomposition:
+            from residual_control_metrics import capture_pre_step, append_control_fields
+
+            pre_control = capture_pre_step(raw_env)
         with torch.inference_mode():
             if controller == "E_zero":
                 actions = torch.zeros((1, 3), device=raw_env.device)
             else:
                 actions = _policy_actions(agent, observation)
             observation, reward, terminated, truncated, _ = wrapped_env.step(actions)
+
+        if args_cli.control_decomposition and (bool(terminated[0]) or bool(truncated[0])):
+            # DirectRLEnv auto-resets before returning. Do not mix reset state
+            # with the preceding episode's commands in diagnostic trajectories.
+            raise RuntimeError("Decomposition run ended/reset early; terminal state is unavailable")
 
         elapsed += step_dt
         current_vertical_velocity = float(raw_env.payload.data.root_lin_vel_w[0, 2])
@@ -477,6 +490,8 @@ def _run_controller(
                 residual_rate=residual_rate,
             )
         )
+        if args_cli.control_decomposition:
+            append_control_fields(rows[-1], raw_env, pre_control, step_dt)
 
         if bool(terminated[0]) or bool(truncated[0]):
             early_termination = elapsed + 0.5 * step_dt < float(args_cli.duration)
