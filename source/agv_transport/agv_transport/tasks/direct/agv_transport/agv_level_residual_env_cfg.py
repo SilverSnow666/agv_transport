@@ -63,6 +63,8 @@ class AgvLevelResidualEnvCfg(AgvLevelCarryLiftVisualEnvCfg):
     residual_cargo_tilt_penalty_scale = 0.25
     residual_cargo_angular_velocity_penalty_scale = 0.05
     residual_action_penalty_scale = 0.010
+    # Optional targeted regularizer. Zero preserves every pre-E3 task.
+    residual_common_mode_action_penalty_scale = 0.0
     residual_action_rate_penalty_scale = 0.005
     residual_lift_velocity_penalty_scale = 0.020
     residual_failure_penalty = 25.0

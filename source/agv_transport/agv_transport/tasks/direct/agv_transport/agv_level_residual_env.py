@@ -543,6 +543,11 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             / float(self.cfg.residual_cargo_angular_velocity_reference)
         )
         action_cost = torch.mean(torch.square(self.actions), dim=1)
+        common_mode_action = torch.mean(self.actions, dim=1)
+        common_mode_action_cost = torch.square(common_mode_action)
+        differential_action_cost = torch.mean(
+            torch.square(self.actions - common_mode_action.unsqueeze(1)), dim=1
+        )
         action_rate_cost = torch.mean(torch.square(self.actions - self.prev_actions), dim=1)
         lift_velocity_cost = torch.mean(
             torch.square(
@@ -595,6 +600,9 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             self.cfg.residual_cargo_angular_velocity_penalty_scale
         ) * cargo_angular_velocity_cost
         penalty_action = -float(self.cfg.residual_action_penalty_scale) * action_cost
+        penalty_common_mode_action = -float(
+            self.cfg.residual_common_mode_action_penalty_scale
+        ) * common_mode_action_cost
         penalty_action_rate = -float(
             self.cfg.residual_action_rate_penalty_scale
         ) * action_rate_cost
@@ -612,6 +620,7 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
             + penalty_cargo_tilt
             + penalty_cargo_angular_velocity
             + penalty_action
+            + penalty_common_mode_action
             + penalty_action_rate
             + penalty_lift_velocity
             + penalty_failure
@@ -620,6 +629,12 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         self.extras["log"] = {
             "Residual/reward_mean": reward.mean().detach(),
             "Residual/action_rms": torch.sqrt(action_cost.mean()).detach(),
+            "Metrics/common_mode_action_rms": torch.sqrt(
+                common_mode_action_cost.mean()
+            ).detach(),
+            "Metrics/differential_action_rms": torch.sqrt(
+                differential_action_cost.mean()
+            ).detach(),
             "Residual/height_rms_mm": (
                 1000.0 * torch.sqrt(torch.mean(torch.square(self.last_residual_height)))
             ).detach(),
@@ -655,6 +670,9 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
                 penalty_cargo_angular_velocity.mean().detach()
             ),
             "RewardTerms/action": penalty_action.mean().detach(),
+            "RewardTerms/common_mode_action": (
+                penalty_common_mode_action.mean().detach()
+            ),
             "RewardTerms/action_rate": penalty_action_rate.mean().detach(),
             "RewardTerms/lift_velocity": penalty_lift_velocity.mean().detach(),
             "RewardTerms/failure": penalty_failure.mean().detach(),

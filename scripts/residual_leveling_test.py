@@ -99,6 +99,9 @@ REFERENCE_TOLERANCES = {
 
 REWARD_LOG_KEYS = (
     "Residual/reward_mean",
+    "Residual/action_rms",
+    "Metrics/common_mode_action_rms",
+    "Metrics/differential_action_rms",
     "RewardTerms/board_angle",
     "RewardTerms/board_angular_velocity",
     "RewardTerms/board_vertical_velocity",
@@ -107,6 +110,7 @@ REWARD_LOG_KEYS = (
     "RewardTerms/cargo_tilt",
     "RewardTerms/cargo_angular_velocity",
     "RewardTerms/action",
+    "RewardTerms/common_mode_action",
     "RewardTerms/action_rate",
     "RewardTerms/lift_velocity",
     "RewardTerms/failure",
@@ -331,6 +335,7 @@ def _run_random(env) -> None:
     random_duration = min(float(args_cli.duration), 2.0)
     reward_term_sums = {key: 0.0 for key in REWARD_LOG_KEYS}
     reward_term_steps = 0
+    maximum_action_decomposition_error = 0.0
     while simulation_app.is_running() and elapsed < random_duration:
         actions = torch.empty(env.action_space.shape, device=raw_env.device).uniform_(-0.5, 0.5)
         with torch.inference_mode():
@@ -343,6 +348,19 @@ def _run_random(env) -> None:
                 f"Randomized smoke test reset early at t={elapsed:.3f} s"
             )
         reward_log = raw_env.extras["log"]
+        total_action_rms = float(reward_log["Residual/action_rms"])
+        common_action_rms = float(reward_log["Metrics/common_mode_action_rms"])
+        differential_action_rms = float(
+            reward_log["Metrics/differential_action_rms"]
+        )
+        action_decomposition_error = abs(
+            total_action_rms**2
+            - common_action_rms**2
+            - differential_action_rms**2
+        )
+        maximum_action_decomposition_error = max(
+            maximum_action_decomposition_error, action_decomposition_error
+        )
         for key in REWARD_LOG_KEYS:
             reward_term_sums[key] += float(reward_log[key])
         reward_term_steps += 1
@@ -363,6 +381,8 @@ def _run_random(env) -> None:
     }
     board_penalty = reward_term_means["RewardTerms/board_angle"]
     action_penalty = reward_term_means["RewardTerms/action"]
+    common_mode_penalty = reward_term_means["RewardTerms/common_mode_action"]
+    common_mode_scale = float(raw_env.cfg.residual_common_mode_action_penalty_scale)
     if not -10.0 < board_penalty < -1.0e-3:
         raise RuntimeError(
             f"Normalized Board-angle reward term is poorly scaled: {board_penalty:.6f}"
@@ -370,6 +390,22 @@ def _run_random(env) -> None:
     if not -0.02 <= action_penalty < -1.0e-5:
         raise RuntimeError(
             f"Normalized residual-action reward term is poorly scaled: {action_penalty:.6f}"
+        )
+    if maximum_action_decomposition_error > 2.0e-6:
+        raise RuntimeError(
+            "Residual action decomposition identity failed: "
+            f"maximum squared-RMS error={maximum_action_decomposition_error:.9g}"
+        )
+    if common_mode_scale == 0.0:
+        if abs(common_mode_penalty) > 1.0e-10:
+            raise RuntimeError(
+                "Disabled common-mode action reward term is non-zero: "
+                f"{common_mode_penalty:.9g}"
+            )
+    elif not -common_mode_scale <= common_mode_penalty < -1.0e-7:
+        raise RuntimeError(
+            "Common-mode action reward term is poorly scaled: "
+            f"scale={common_mode_scale:.6f}, mean={common_mode_penalty:.6f}"
         )
     print(
         "[RESULT] normalized reward means: "
@@ -380,7 +416,12 @@ def _run_random(env) -> None:
         f"Cargo slip={reward_term_means['RewardTerms/cargo_slip']:.4f}, "
         f"Cargo tilt={reward_term_means['RewardTerms/cargo_tilt']:.4f}, "
         f"action={action_penalty:.4f}, "
-        f"Lift velocity={reward_term_means['RewardTerms/lift_velocity']:.4f}"
+        f"common mode={common_mode_penalty:.4f}, "
+        f"common/differential action RMS="
+        f"{reward_term_means['Metrics/common_mode_action_rms']:.4f}/"
+        f"{reward_term_means['Metrics/differential_action_rms']:.4f}, "
+        f"Lift velocity={reward_term_means['RewardTerms/lift_velocity']:.4f}, "
+        f"decomposition max error={maximum_action_decomposition_error:.3e}"
     )
 
     raw_env.cfg.residual_domain_randomization = False

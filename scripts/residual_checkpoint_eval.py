@@ -105,6 +105,10 @@ DISPLAY_METRICS = (
     "cargo_cumulative_slip_mm",
     "lift_velocity_rms_m_s",
     "residual_rms_mm",
+    "residual_common_mode_rms_mm",
+    "residual_differential_rms_mm",
+    "lift_common_mode_velocity_rms_m_s",
+    "lift_differential_velocity_rms_m_s",
 )
 
 
@@ -326,6 +330,38 @@ def _summarize(
         )
         for index in range(1, 4)
     ]
+    residual_common_values = [
+        sum(float(row[f"residual{index}_m"]) for index in range(1, 4)) / 3.0
+        for row in rows
+    ]
+    lift_velocity_common_values = [
+        sum(float(row[f"lift{index}_velocity_m_s"]) for index in range(1, 4)) / 3.0
+        for row in rows
+    ]
+    residual_differential_energy = [
+        sum(
+            (
+                float(row[f"residual{index}_m"])
+                - residual_common_values[row_index]
+            )
+            ** 2
+            for index in range(1, 4)
+        )
+        / 3.0
+        for row_index, row in enumerate(rows)
+    ]
+    lift_velocity_differential_energy = [
+        sum(
+            (
+                float(row[f"lift{index}_velocity_m_s"])
+                - lift_velocity_common_values[row_index]
+            )
+            ** 2
+            for index in range(1, 4)
+        )
+        / 3.0
+        for row_index, row in enumerate(rows)
+    ]
     summary: dict[str, float | int | str] = {
         "case": case.name,
         "controller": controller,
@@ -390,6 +426,18 @@ def _summarize(
                 for row in rows
             )
             / len(rows)
+        ),
+        "residual_common_mode_rms_mm": 1000.0
+        * math.sqrt(
+            sum(value**2 for value in residual_common_values) / len(rows)
+        ),
+        "residual_differential_rms_mm": 1000.0
+        * math.sqrt(sum(residual_differential_energy) / len(rows)),
+        "lift_common_mode_velocity_rms_m_s": math.sqrt(
+            sum(value**2 for value in lift_velocity_common_values) / len(rows)
+        ),
+        "lift_differential_velocity_rms_m_s": math.sqrt(
+            sum(lift_velocity_differential_energy) / len(rows)
         ),
         "residual_max_abs_mm": 1000.0
         * max(

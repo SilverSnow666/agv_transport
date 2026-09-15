@@ -85,3 +85,19 @@ gym.register(
         ),
     },
 )
+
+# V7.6-E3: return to E1 and add only a soft common-mode action penalty.
+gym.register(
+    id="Template-Agv-Level-Residual-CommonMode-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_residual_common_mode_env_cfg:"
+            "AgvLevelResidualCommonModeEnvCfg"
+        ),
+        "skrl_cfg_entry_point": (
+            f"{agents.__name__}:skrl_ppo_residual_common_mode_cfg.yaml"
+        ),
+    },
+)
