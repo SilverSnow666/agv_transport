@@ -71,3 +71,6 @@ class AgvLevelResidualEnvCfg(AgvLevelCarryLiftVisualEnvCfg):
     residual_action_rate_penalty_scale = 0.005
     residual_lift_velocity_penalty_scale = 0.020
     residual_failure_penalty = 25.0
+    # Physics visualization modes may retain a failed/fallen Board so the
+    # failure can be observed instead of immediately resetting the episode.
+    residual_terminate_on_failure = True

@@ -8,7 +8,9 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObject
 from isaaclab.envs import DirectRLEnv
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.math import quat_box_minus
 from pxr import Gf, Sdf, Usd, UsdGeom, Vt
 
 from .agv_level_carry_env_cfg import AgvLevelCarryEnvCfg
@@ -105,6 +107,24 @@ class AgvLevelCarryEnv(DirectRLEnv):
         if self.cargo is not None:
             self.scene.rigid_objects["cargo"] = self.cargo
 
+        self.payload_contact_sensor = None
+        if bool(getattr(self.cfg, "enable_payload_contact_sensor", False)):
+            self.payload_contact_sensor = ContactSensor(
+                ContactSensorCfg(
+                    prim_path="/World/envs/env_.*/Payload",
+                    update_period=0.0,
+                    history_length=1,
+                    debug_vis=False,
+                    filter_prim_paths_expr=[
+                        "/World/envs/env_.*/Lift1",
+                        "/World/envs/env_.*/Lift2",
+                        "/World/envs/env_.*/Lift3",
+                        "/World/envs/env_.*/Cargo",
+                    ],
+                )
+            )
+            self.scene.sensors["payload_contact"] = self.payload_contact_sensor
+
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self._move_ground_plane_for_visual_terrain()
         self._spawn_visual_bumpy_terrain()
@@ -146,6 +166,25 @@ class AgvLevelCarryEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2500.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+    def get_payload_filtered_contact_forces(self) -> torch.Tensor:
+        """Return real PhysX contact-force magnitudes for Lift1/2/3 and Cargo.
+
+        This method deliberately does not fall back to the analytical support
+        proxy. A validation mode that requests physical contacts must either
+        receive the actual sensor data or fail loudly.
+        """
+        if self.payload_contact_sensor is None:
+            raise RuntimeError("Payload contact sensor is not enabled")
+        forces = self.payload_contact_sensor.data.force_matrix_w
+        if forces is None:
+            raise RuntimeError("Payload filtered contact-force matrix is unavailable")
+        if forces.ndim != 4 or forces.shape[1] != 1 or forces.shape[2] != 4:
+            raise RuntimeError(
+                "Unexpected payload contact-force shape; expected "
+                f"(num_envs, 1, 4, 3), got {tuple(forces.shape)}"
+            )
+        return torch.linalg.norm(forces[:, 0], dim=-1)
 
     def _configure_native_lift_visuals(self) -> None:
         """Cache the visual-only iwhub Lift transforms for runtime articulation.
@@ -594,8 +633,11 @@ class AgvLevelCarryEnv(DirectRLEnv):
         if bool(getattr(self.cfg, "enable_virtual_friction_carry", False)):
             self._apply_virtual_friction_carry(dt)
 
-    def _update_lift_poses(self, env_ids: torch.Tensor | None = None) -> None:
+    def _update_lift_poses(
+        self, env_ids: torch.Tensor | None = None, force_pose: bool = False
+    ) -> None:
         """Place each Lift along its AGV local +Z axis with the full AGV attitude."""
+        runtime_update = env_ids is None
         if env_ids is None:
             env_ids = self.payload._ALL_INDICES
 
@@ -612,11 +654,45 @@ class AgvLevelCarryEnv(DirectRLEnv):
             lift_pose[:, 3:7] = agv_state[:, 3:7]
 
             lift_velocity = torch.zeros((len(env_ids), 6), device=self.device)
-            lift_velocity[:, 0:2] = agv_state[:, 7:9]
+            lift_velocity[:, 0:3] = agv_state[:, 7:10]
             lift_velocity[:, 0:3] += local_z * self.lift_velocity[env_ids, i].unsqueeze(-1)
             lift_velocity[:, 3:6] = agv_state[:, 10:13]
-            lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
-            lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
+
+            drive_mode = str(getattr(self.cfg, "lift_drive_mode", "kinematic_pose"))
+            if drive_mode == "dynamic_velocity" and runtime_update and not force_pose:
+                current_state = lift.data.root_state_w[env_ids]
+                position_error = lift_pose[:, :3] - current_state[:, :3]
+                lift_velocity[:, :3] += (
+                    float(self.cfg.lift_dynamic_position_kp) * position_error
+                )
+                linear_norm = torch.linalg.norm(
+                    lift_velocity[:, :3], dim=1, keepdim=True
+                )
+                lift_velocity[:, :3] *= torch.clamp(
+                    float(self.cfg.lift_dynamic_max_linear_speed) / linear_norm.clamp_min(1.0e-9),
+                    max=1.0,
+                )
+
+                angular_error = quat_box_minus(lift_pose[:, 3:7], current_state[:, 3:7])
+                lift_velocity[:, 3:6] += (
+                    float(self.cfg.lift_dynamic_angular_kp) * angular_error
+                )
+                angular_norm = torch.linalg.norm(
+                    lift_velocity[:, 3:6], dim=1, keepdim=True
+                )
+                lift_velocity[:, 3:6] *= torch.clamp(
+                    float(self.cfg.lift_dynamic_max_angular_speed)
+                    / angular_norm.clamp_min(1.0e-9),
+                    max=1.0,
+                )
+                lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
+            elif drive_mode in {"kinematic_pose", "dynamic_velocity"}:
+                # Dynamic plates are teleported only during reset/fault setup;
+                # normal transport is velocity driven so contact friction is real.
+                lift.write_root_pose_to_sim(lift_pose, env_ids=env_ids)
+                lift.write_root_velocity_to_sim(lift_velocity, env_ids=env_ids)
+            else:
+                raise ValueError(f"Unknown lift_drive_mode={drive_mode!r}")
         self._update_native_lift_visuals(env_ids)
 
     def _apply_virtual_friction_carry(self, dt: float) -> None:

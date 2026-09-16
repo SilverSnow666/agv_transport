@@ -118,3 +118,20 @@ gym.register(
         ),
     },
 )
+
+# V7 physics validation: prescribed AGV/Lift motion is retained, while the
+# Board and Cargo are driven exclusively by real PhysX contacts and gravity.
+gym.register(
+    id="Template-Agv-Level-PhysicsContact-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_physics_contact_env_cfg:"
+            "AgvLevelPhysicsContactEnvCfg"
+        ),
+        "skrl_cfg_entry_point": (
+            f"{agents.__name__}:skrl_ppo_residual_cargo_observable_cfg.yaml"
+        ),
+    },
+)

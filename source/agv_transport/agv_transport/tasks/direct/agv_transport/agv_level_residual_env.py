@@ -702,10 +702,11 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        failure_parts = self._failure_state()[:6]
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for failure in failure_parts:
-            terminated |= failure
+        if bool(self.cfg.residual_terminate_on_failure):
+            failure_parts = self._failure_state()[:6]
+            for failure in failure_parts:
+                terminated |= failure
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, time_out
 

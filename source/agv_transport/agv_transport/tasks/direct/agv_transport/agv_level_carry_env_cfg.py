@@ -78,6 +78,16 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     max_lift_speed = 0.04  # m/s
     lift_position_kp = 5.0
 
+    # Runtime support-plate drive. Existing tasks retain pose-written
+    # kinematic plates. The contact-only validation task selects a dynamic
+    # velocity servo so tangential transport is transmitted through PhysX
+    # friction instead of teleporting the contact surface.
+    lift_drive_mode = "kinematic_pose"
+    lift_dynamic_position_kp = 80.0
+    lift_dynamic_angular_kp = 40.0
+    lift_dynamic_max_linear_speed = 1.0
+    lift_dynamic_max_angular_speed = 5.0
+
     # V7.5 reusable Lift controller. Keep ``external`` as the compatibility
     # default so existing tests and policies may continue writing targets.
     # Other modes: neutral, geometric, geometric_feedback.
@@ -218,6 +228,12 @@ class AgvLevelCarryEnvCfg(DirectRLEnvCfg):
     # 区域时，把 payload 平面速度软耦合到支撑平台平均速度，并用滑移误差做小幅修正。
     # 后续若升级为真实轮式 articulation 或可产生真实切向摩擦的动态支撑平台，可关闭此项。
     enable_virtual_friction_carry = False
+    # Opt-in real PhysX contact reporting for validation modes. The standard
+    # training tasks keep this disabled because their historical contact
+    # metrics are analytical proxies and thousands of contact sensors would be
+    # unnecessarily expensive.
+    enable_payload_contact_sensor = False
+    physics_contact_force_threshold = 1.0
     # 软约束版：训练早期允许至少两车有效支撑时产生有限虚拟摩擦，
     # 但 reward 会通过 contact/formation/slip quality 鼓励最终三车稳定支撑。
     virtual_friction_min_contacts = 2.0
