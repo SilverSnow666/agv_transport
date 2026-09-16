@@ -29,6 +29,12 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--duration", type=float, default=12.0)
+parser.add_argument(
+    "--slip_warmup",
+    type=float,
+    default=0.5,
+    help="Settling window excluded from the post-warmup Cargo path metric.",
+)
 parser.add_argument("--seed", type=int, default=137)
 parser.add_argument("--phase_x", type=float, default=1.17)
 parser.add_argument("--phase_y", type=float, default=-2.03)
@@ -91,6 +97,7 @@ COMPARISON_METRICS = (
     "board_z_range_mm",
     "cargo_relative_xy_rms_mm",
     "cargo_cumulative_slip_mm",
+    "cargo_post_warmup_cumulative_slip_mm",
     "cargo_relative_velocity_rms_m_s",
     "cargo_angular_velocity_rms_rad_s",
     "lift_velocity_rms_m_s",
@@ -103,6 +110,7 @@ DISPLAY_METRICS = (
     "board_vertical_acceleration_rms_m_s2",
     "cargo_relative_xy_rms_mm",
     "cargo_cumulative_slip_mm",
+    "cargo_post_warmup_cumulative_slip_mm",
     "lift_velocity_rms_m_s",
     "residual_rms_mm",
     "residual_common_mode_rms_mm",
@@ -362,6 +370,14 @@ def _summarize(
         / 3.0
         for row_index, row in enumerate(rows)
     ]
+    warmup_rows = [
+        row for row in rows if float(row["time_s"]) >= float(args_cli.slip_warmup)
+    ]
+    if not warmup_rows:
+        raise RuntimeError(
+            f"No samples remain after --slip_warmup={args_cli.slip_warmup:.6g} s"
+        )
+    slip_at_warmup = float(warmup_rows[0]["cargo_cumulative_slip_m"])
     summary: dict[str, float | int | str] = {
         "case": case.name,
         "controller": controller,
@@ -402,6 +418,12 @@ def _summarize(
         "cargo_relative_xy_rms_mm": 1000.0 * _rms(rows, "cargo_slip_m"),
         "cargo_cumulative_slip_mm": 1000.0
         * float(rows[-1]["cargo_cumulative_slip_m"]),
+        "cargo_initial_step_slip_mm": 1000.0
+        * float(rows[0]["cargo_cumulative_slip_m"]),
+        "cargo_slip_warmup_s": float(args_cli.slip_warmup),
+        "cargo_cumulative_slip_at_warmup_mm": 1000.0 * slip_at_warmup,
+        "cargo_post_warmup_cumulative_slip_mm": 1000.0
+        * (float(rows[-1]["cargo_cumulative_slip_m"]) - slip_at_warmup),
         "cargo_relative_velocity_rms_m_s": _rms(rows, "cargo_relative_speed_m_s"),
         "cargo_angular_velocity_rms_rad_s": _rms(
             rows, "cargo_relative_angular_speed_rad_s"
@@ -647,6 +669,10 @@ def main(
 ) -> None:
     if args_cli.duration <= 0.0:
         raise ValueError("--duration must be positive")
+    if not math.isfinite(args_cli.slip_warmup) or not (
+        0.0 <= args_cli.slip_warmup < args_cli.duration
+    ):
+        raise ValueError("--slip_warmup must be finite and in [0, duration)")
 
     checkpoint = _resolve_checkpoint()
     output_dir = Path(args_cli.log_dir).expanduser().resolve()

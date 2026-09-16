@@ -42,7 +42,8 @@ class ResidualMultiphaseEvalTests(unittest.TestCase):
             "nominal", "fast", "rough", "heavy", "offset", "combined"
         ))
         self.assertEqual(set(self.module.METRICS), {
-            "roll", "pitch", "board_rp_speed", "lift_speed", "cargo_slip"
+            "roll", "pitch", "board_rp_speed", "lift_speed", "cargo_slip",
+            "cargo_post_warmup_slip",
         })
         self.assertEqual(self.module.E1_CHECKPOINT.name, "best_agent.pt")
 
@@ -63,6 +64,18 @@ class ResidualMultiphaseEvalTests(unittest.TestCase):
                         [{"case": "rough", "controller": "F_ppo", "value": value}],
                         {"case", "controller"},
                     )
+
+    def test_post_warmup_slip_excludes_settling_path(self):
+        rows = [
+            {"controller": "E_zero", "time_s": "0.1", "cargo_cumulative_slip_m": "0.003"},
+            {"controller": "E_zero", "time_s": "0.5", "cargo_cumulative_slip_m": "0.0032"},
+            {"controller": "E_zero", "time_s": "1.0", "cargo_cumulative_slip_m": "0.0037"},
+        ]
+        self.assertAlmostEqual(
+            self.module._post_warmup_cumulative_slip(rows, "E_zero", 0.5), 0.5
+        )
+        with self.assertRaises(RuntimeError):
+            self.module._post_warmup_cumulative_slip(rows, "F_ppo", 0.5)
 
     def test_manifest_and_outputs_from_full_run_are_consistent(self):
         output = ROOT / "logs/v7_6_f/multiphase_stress"

@@ -39,6 +39,7 @@ METRICS = {
     "board_rp_speed": "board_rp_angular_velocity_rms_rad_s",
     "lift_speed": "lift_velocity_rms_m_s",
     "cargo_slip": "cargo_cumulative_slip_mm",
+    "cargo_post_warmup_slip": "cargo_post_warmup_cumulative_slip_mm",
 }
 
 
@@ -78,6 +79,19 @@ def _validate_numeric_rows(rows: list[dict[str, str]], excluded: set[str]) -> No
                 raise RuntimeError(f"Non-finite {key}={value}")
 
 
+def _post_warmup_cumulative_slip(
+    trajectories: list[dict[str, str]], controller: str, warmup_s: float
+) -> float:
+    rows = [row for row in trajectories if row["controller"] == controller]
+    post = [row for row in rows if float(row["time_s"]) >= warmup_s]
+    if not rows or not post:
+        raise RuntimeError(f"Missing {controller} samples after {warmup_s:.6g} s")
+    return 1000.0 * (
+        float(rows[-1]["cargo_cumulative_slip_m"])
+        - float(post[0]["cargo_cumulative_slip_m"])
+    )
+
+
 def _analyze(output: Path, manifest: dict) -> None:
     runs: list[dict] = []
     for phase in manifest["phases"]:
@@ -104,8 +118,19 @@ def _analyze(output: Path, manifest: dict) -> None:
                 "case": case,
             }
             for label, metric in METRICS.items():
-                e_value = float(baseline[metric])
-                f_value = float(policy[metric])
+                if metric in baseline and metric in policy:
+                    e_value = float(baseline[metric])
+                    f_value = float(policy[metric])
+                elif metric == "cargo_post_warmup_cumulative_slip_mm":
+                    warmup = float(manifest.get("slip_warmup_s", 0.5))
+                    e_value = _post_warmup_cumulative_slip(
+                        trajectories, "E_zero", warmup
+                    )
+                    f_value = _post_warmup_cumulative_slip(
+                        trajectories, "F_ppo", warmup
+                    )
+                else:
+                    raise KeyError(metric)
                 result[f"{label}_e"] = e_value
                 result[f"{label}_e1"] = f_value
                 result[f"{label}_improvement_pct"] = (
@@ -216,6 +241,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=("stress", "all"), default="stress")
     parser.add_argument("--duration", type=float, default=12.0)
+    parser.add_argument("--slip_warmup", type=float, default=0.5)
+    parser.add_argument("--task", type=str, default=E1_TASK)
     parser.add_argument("--checkpoint", type=Path, default=E1_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=ROOT / "logs/v7_6_f/multiphase_stress")
     parser.add_argument("--headless", action="store_true")
@@ -228,6 +255,8 @@ def main() -> None:
         return
     if not math.isfinite(args.duration) or args.duration <= 0.0:
         parser.error("--duration must be positive and finite")
+    if not math.isfinite(args.slip_warmup) or not 0.0 <= args.slip_warmup < args.duration:
+        parser.error("--slip_warmup must be finite and in [0, duration)")
     checkpoint = args.checkpoint.resolve()
     if not checkpoint.is_file():
         parser.error(f"Checkpoint does not exist: {checkpoint}")
@@ -235,11 +264,12 @@ def main() -> None:
         parser.error("Output directory must be empty; use --analyze_only to reanalyze")
     cases = ALL_CASES if args.suite == "all" else ("rough", "combined")
     manifest = {
-        "task": E1_TASK,
+        "task": args.task,
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": _sha256(checkpoint),
         "training_seed": _checkpoint_training_seed(checkpoint),
         "duration_s": args.duration,
+        "slip_warmup_s": args.slip_warmup,
         "suite": args.suite,
         "cases": cases,
         "phases": PHASES,
@@ -263,10 +293,11 @@ def main() -> None:
                 sys.executable,
                 "-u",
                 str(ROOT / "scripts/residual_checkpoint_eval.py"),
-                "--task", E1_TASK,
+                "--task", args.task,
                 "--checkpoint", str(checkpoint),
                 "--case", case,
                 "--duration", str(args.duration),
+                "--slip_warmup", str(args.slip_warmup),
                 "--seed", str(phase["seed"]),
                 "--phase_x", str(phase["phase_x"]),
                 "--phase_y", str(phase["phase_y"]),
