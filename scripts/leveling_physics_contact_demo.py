@@ -305,6 +305,11 @@ def main() -> None:
         "[GEOMETRY] free-contact Lift pads=180 x 160 x 15 mm, matched to visible heads; "
         "Board joints/attachments=NONE"
     )
+    print(
+        "[MATERIAL] dry wooden crate on plywood Board: "
+        f"static/dynamic friction={raw.cfg.wood_contact_static_friction:.2f}/"
+        f"{raw.cfg.wood_contact_dynamic_friction:.2f}"
+    )
     elapsed = 0.0
     next_report = 0.0
     with torch.inference_mode():

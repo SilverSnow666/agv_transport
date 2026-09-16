@@ -52,10 +52,29 @@ class AgvLevelPhysicsContactEnvCfg(AgvLevelResidualCargoObservableEnvCfg):
     lift_dynamic_max_linear_speed = 2.0
     lift_dynamic_max_angular_speed = 30.0
 
+    # Dry wooden crate on a plywood/formwork Board. USDA Wood Handbook values
+    # put smooth dry-wood kinetic friction commonly around 0.3--0.5, with
+    # static friction higher. Keep this material isolated from trained tasks.
+    wood_contact_static_friction = 0.50
+    wood_contact_dynamic_friction = 0.35
+    _wood_contact_material = sim_utils.RigidBodyMaterialCfg(
+        static_friction=wood_contact_static_friction,
+        dynamic_friction=wood_contact_dynamic_friction,
+        restitution=0.0,
+    )
+
     # ContactSensor requires PhysxContactReportAPI on the sensor body. Copy the
     # versioned thin-Board config so the H2 task remains untouched.
     payload_cfg = _BASE_CFG.payload_cfg.replace(
-        spawn=_BASE_CFG.payload_cfg.spawn.replace(activate_contact_sensors=True)
+        spawn=_BASE_CFG.payload_cfg.spawn.replace(
+            activate_contact_sensors=True,
+            physics_material=_wood_contact_material,
+        )
+    )
+    cargo_cfg = _BASE_CFG.cargo_cfg.replace(
+        spawn=_BASE_CFG.cargo_cfg.spawn.replace(
+            physics_material=_wood_contact_material,
+        )
     )
 
     # Unlike the training task's pose-written kinematic supports, these plates

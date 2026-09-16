@@ -49,6 +49,14 @@ the Board bridge widely tilted supports. There is no ball joint, fixed joint,
 attachment, suction or other Board constraint: gravity, collision and friction
 are the complete mechanical coupling between each Lift and the Board.
 
+For the Cargo-to-Board interface, both the wooden crate and plywood/formwork
+Board use `0.50 / 0.35` static/dynamic friction in this validation task. The
+USDA Wood Handbook reports kinetic friction around `0.3--0.5` for smooth dry
+wood against hard smooth surfaces and notes that static friction is generally
+higher. The original `0.80 / 0.65` Cargo material remains unchanged in legacy
+training tasks so this physical correction does not silently invalidate prior
+PPO experiments.
+
 Because each Lift head is mechanically mounted to an AGV in the real system,
 the contact task uses a stiff bounded velocity servo between the prescribed AGV
 pose and its Lift rigid body. This is an AGV-to-Lift actuator model, not a
@@ -66,7 +74,7 @@ python scripts\leveling_physics_contact_demo.py ^
   --target_speed 0.10 ^
   --terrain_amplitude 0.050 ^
   --controller geometric_feedback ^
-  --log_path logs\v7_physics_contact\final_feedback_5s.csv ^
+  --log_path logs\v7_physics_contact\wood_friction_feedback_5s.csv ^
   --headless
 ```
 
@@ -101,7 +109,7 @@ python scripts\leveling_physics_contact_demo.py ^
   --terrain_amplitude 0.050 ^
   --controller neutral ^
   --force_front_support_loss_at 2 ^
-  --log_path logs\v7_physics_contact\matched_pad_support_loss_7s.csv ^
+  --log_path logs\v7_physics_contact\wood_friction_support_loss_7s.csv ^
   --headless
 ```
 
@@ -112,12 +120,12 @@ Result:
 | Real Lift contacts | 3 | 1 |
 | Board pitch | about 0.34 deg | 12.26 deg final |
 | Maximum Board tilt | - | 12.45 deg |
-| Maximum Cargo relative XY displacement | - | about 1.5 mm |
+| Maximum Cargo relative XY displacement | - | 16.64 mm |
 
 The Board tips forward until its front edge reaches the flat ground plane. The
-Cargo does not slide appreciably because the configured static friction is
-0.80 and a 12.3 degree slope is below its static-friction angle. This is an
-expected physical outcome, not hidden stabilization.
+Cargo slides about 16.64 mm during the impact transient, then stops because the
+settled 12.3 degree slope remains below its 26.6 degree static-friction angle.
+This is an expected stick-slip outcome, not hidden stabilization.
 
 ## Visual commands
 

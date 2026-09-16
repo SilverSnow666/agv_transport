@@ -56,6 +56,8 @@ class PhysicsContactConfigTest(unittest.TestCase):
         self.assertEqual(assignments["lift_dynamic_position_kp"], 160.0)
         self.assertEqual(assignments["lift_dynamic_angular_kp"], 240.0)
         self.assertEqual(assignments["lift_dynamic_max_angular_speed"], 30.0)
+        self.assertEqual(assignments["wood_contact_static_friction"], 0.50)
+        self.assertEqual(assignments["wood_contact_dynamic_friction"], 0.35)
         source = CFG.read_text(encoding="utf-8")
         self.assertIn("activate_contact_sensors=True", source)
         self.assertEqual(source.count("kinematic_enabled=False"), 1)
@@ -65,6 +67,8 @@ class PhysicsContactConfigTest(unittest.TestCase):
         self.assertIn("lift1_cfg = _BASE_CFG.lift1_cfg.replace", source)
         self.assertIn("lift2_cfg = _BASE_CFG.lift2_cfg.replace", source)
         self.assertIn("lift3_cfg = _BASE_CFG.lift3_cfg.replace", source)
+        self.assertIn("cargo_cfg = _BASE_CFG.cargo_cfg.replace", source)
+        self.assertEqual(source.count("physics_material=_wood_contact_material"), 2)
 
     def test_task_registration_is_versioned(self) -> None:
         source = (TASK_DIR / "__init__.py").read_text(encoding="utf-8")
