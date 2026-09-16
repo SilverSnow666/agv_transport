@@ -13,6 +13,10 @@ class AgvLevelResidualEnvCfg(AgvLevelCarryLiftVisualEnvCfg):
 
     action_space = 3
     observation_space = 33
+    # RL training tasks require the validated V7.5 controller baseline. A
+    # non-training physics visualization task may opt out to compare neutral,
+    # geometric and feedback behavior with zero residual actions.
+    residual_require_geometric_feedback = True
     episode_length_s = 16.0
 
     enable_cargo = True

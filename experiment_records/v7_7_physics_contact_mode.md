@@ -108,14 +108,23 @@ expected physical outcome, not hidden stabilization.
 Normal contact-only transport:
 
 ```bat
-python scripts\leveling_physics_contact_demo.py --duration 20 --target_speed 0.10 --terrain_amplitude 0.050 --real_time
+python scripts\leveling_physics_contact_demo.py --duration 20 --target_speed 0.10 --terrain_amplitude 0.050 --controller neutral --real_time
 ```
+
+`neutral` is the visual default so terrain-induced Board motion is easy to
+see. Use `--controller geometric_feedback` to enable the active leveling
+controller in the same contact-only plant.
 
 Visible support-loss demonstration:
 
 ```bat
 python scripts\leveling_physics_contact_demo.py --duration 10 --target_speed 0 --terrain_amplitude 0.050 --force_front_support_loss_at 3 --real_time
 ```
+
+The demo also copies the requested amplitude and phase into the visual mesh
+configuration before scene construction. Its fallback plane is placed 30 mm
+below the deepest sinusoidal valley, so the negative terrain half is no longer
+hidden by a coincident flat ground plane.
 
 ## Known modelling boundary
 

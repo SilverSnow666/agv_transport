@@ -64,7 +64,10 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         self._validate_residual_cfg()
 
     def _validate_residual_cfg(self) -> None:
-        if str(self.cfg.leveling_controller_mode) != "geometric_feedback":
+        if (
+            bool(self.cfg.residual_require_geometric_feedback)
+            and str(self.cfg.leveling_controller_mode) != "geometric_feedback"
+        ):
             raise ValueError("Residual task requires leveling_controller_mode='geometric_feedback'")
         if float(self.cfg.residual_height_limit) <= 0.0:
             raise ValueError("residual_height_limit must be positive")

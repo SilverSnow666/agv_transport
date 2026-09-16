@@ -50,6 +50,7 @@ class PhysicsContactConfigTest(unittest.TestCase):
         assignments = _literal_assignments(CFG, "AgvLevelPhysicsContactEnvCfg")
         self.assertTrue(assignments["enable_payload_contact_sensor"])
         self.assertFalse(assignments["residual_terminate_on_failure"])
+        self.assertFalse(assignments["residual_require_geometric_feedback"])
         self.assertEqual(assignments["lift_drive_mode"], "dynamic_velocity")
         source = CFG.read_text(encoding="utf-8")
         self.assertIn("activate_contact_sensors=True", source)
@@ -70,6 +71,19 @@ class PhysicsContactConfigTest(unittest.TestCase):
         self.assertIn("torch.linalg.norm(forces[:, 0], dim=-1)", source)
         self.assertIn('drive_mode == "dynamic_velocity"', source)
         self.assertIn("lift.write_root_velocity_to_sim", source)
+
+    def test_demo_aligns_visual_and_prescribed_terrain(self) -> None:
+        source = (ROOT / "scripts/leveling_physics_contact_demo.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cfg.bump_amplitude = args_cli.terrain_amplitude", source)
+        self.assertIn("cfg.bump_phase_x = args_cli.phase_x", source)
+        self.assertIn("cfg.bump_phase_y = args_cli.phase_y", source)
+        self.assertIn(
+            "cfg.visual_terrain_ground_z = -(args_cli.terrain_amplitude + 0.03)",
+            source,
+        )
+        self.assertNotIn("cfg.visual_terrain_ground_z = 0.0", source)
 
 
 if __name__ == "__main__":

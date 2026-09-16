@@ -34,6 +34,7 @@ class AgvLevelPhysicsContactEnvCfg(AgvLevelResidualCargoObservableEnvCfg):
     enable_payload_contact_sensor = True
     physics_contact_force_threshold = 1.0
     residual_terminate_on_failure = False
+    residual_require_geometric_feedback = False
     episode_length_s = 120.0
     lift_drive_mode = "dynamic_velocity"
 

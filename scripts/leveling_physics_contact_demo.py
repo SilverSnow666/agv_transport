@@ -30,7 +30,11 @@ parser.add_argument("--phase_y", type=float, default=-0.49)
 parser.add_argument(
     "--controller",
     choices=("neutral", "geometric", "geometric_feedback"),
-    default="geometric_feedback",
+    default="neutral",
+    help=(
+        "Lift controller. The default neutral mode makes the unassisted physical "
+        "response visible; select geometric_feedback to demonstrate active leveling."
+    ),
 )
 parser.add_argument(
     "--force_front_support_loss_at",
@@ -147,7 +151,15 @@ def _make_env():
     cfg.enable_visual_terrain_mesh = True
     cfg.visual_terrain_height_scale = 1.0
     cfg.visual_terrain_z_offset = 0.0
-    cfg.visual_terrain_ground_z = 0.0
+    # The visual mesh is generated before reset from the scalar cfg fields,
+    # while the per-environment terrain uses the deterministic randomization
+    # ranges below. Keep both descriptions identical.
+    cfg.bump_amplitude = args_cli.terrain_amplitude
+    cfg.bump_phase_x = args_cli.phase_x
+    cfg.bump_phase_y = args_cli.phase_y
+    # The infinite fallback plane must remain below the deepest visual valley;
+    # placing it at z=0 hides the negative half of the sinusoidal mesh.
+    cfg.visual_terrain_ground_z = -(args_cli.terrain_amplitude + 0.03)
     cfg.residual_domain_randomization = True
     cfg.residual_speed_range = (args_cli.target_speed,) * 2
     cfg.residual_terrain_amplitude_range = (args_cli.terrain_amplitude,) * 2
@@ -236,7 +248,8 @@ def main() -> None:
     print(
         "[PHYSICS] contact-only mode: virtual carry/damping/alignment=OFF; "
         f"controller={args_cli.controller}, speed={args_cli.target_speed:.3f} m/s, "
-        f"terrain={1000.0 * args_cli.terrain_amplitude:.1f} mm"
+        f"terrain={1000.0 * args_cli.terrain_amplitude:.1f} mm, "
+        f"fallback ground z={raw.cfg.visual_terrain_ground_z:.3f} m"
     )
     elapsed = 0.0
     next_report = 0.0
