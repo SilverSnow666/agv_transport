@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 import numpy as np
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,17 @@ def _write(path: Path, rows: list[dict]) -> None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _checkpoint_training_seed(path: Path) -> int:
+    agent_cfg = path.parent.parent / "params/agent.yaml"
+    if not agent_cfg.is_file():
+        raise FileNotFoundError(f"Checkpoint training config is missing: {agent_cfg}")
+    config = yaml.safe_load(agent_cfg.read_text(encoding="utf-8"))
+    seed = config.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError(f"Invalid training seed in {agent_cfg}: {seed!r}")
+    return seed
 
 
 def _validate_numeric_rows(rows: list[dict[str, str]], excluded: set[str]) -> None:
@@ -226,6 +238,7 @@ def main() -> None:
         "task": E1_TASK,
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": _sha256(checkpoint),
+        "training_seed": _checkpoint_training_seed(checkpoint),
         "duration_s": args.duration,
         "suite": args.suite,
         "cases": cases,

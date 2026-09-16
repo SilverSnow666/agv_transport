@@ -46,6 +46,11 @@ class ResidualMultiphaseEvalTests(unittest.TestCase):
         })
         self.assertEqual(self.module.E1_CHECKPOINT.name, "best_agent.pt")
 
+    def test_e1_checkpoint_training_seed_is_read_from_saved_config(self):
+        if not self.module.E1_CHECKPOINT.is_file():
+            self.skipTest("E1 checkpoint is not available")
+        self.assertEqual(self.module._checkpoint_training_seed(self.module.E1_CHECKPOINT), 42)
+
     def test_numeric_validation_rejects_nonfinite_values(self):
         self.module._validate_numeric_rows(
             [{"case": "rough", "controller": "F_ppo", "value": "1.0"}],
