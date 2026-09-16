@@ -399,6 +399,12 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
         heights = torch.stack(top_z, dim=1)
         return heights - heights.mean(dim=1, keepdim=True)
 
+    def _cargo_xy_observation(self, cargo_relative_position: torch.Tensor) -> torch.Tensor:
+        cargo_xy = cargo_relative_position[:, 0:2]
+        if bool(self.cfg.residual_observe_cargo_slip_from_reset):
+            cargo_xy = cargo_xy - self.cargo_initial_relative_xy
+        return cargo_xy
+
     def _get_observations(self) -> dict:
         roll, pitch, _ = self._get_payload_rpy()
         board_quat_inverse = self.payload.data.root_quat_w.clone()
@@ -428,7 +434,7 @@ class AgvLevelResidualEnv(AgvLevelCarryLiftVisualEnv):
                 self._support_top_relative_heights(),
                 self.agv_terrain_roll,
                 self.agv_terrain_pitch,
-                cargo_relative_position[:, 0:2],
+                self._cargo_xy_observation(cargo_relative_position),
                 cargo_relative_velocity[:, 0:2],
                 cargo_relative_roll.unsqueeze(1),
                 cargo_relative_pitch.unsqueeze(1),

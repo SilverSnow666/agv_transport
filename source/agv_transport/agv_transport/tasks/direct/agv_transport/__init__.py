@@ -101,3 +101,20 @@ gym.register(
         ),
     },
 )
+
+# V7.6-H2: return to E1 and change only Cargo XY observation semantics from
+# absolute Board-frame position to displacement from the randomized reset pose.
+gym.register(
+    id="Template-Agv-Level-Residual-CargoObservable-Direct-v0",
+    entry_point=f"{__name__}.agv_level_residual_env:AgvLevelResidualEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.agv_level_residual_cargo_observable_env_cfg:"
+            "AgvLevelResidualCargoObservableEnvCfg"
+        ),
+        "skrl_cfg_entry_point": (
+            f"{agents.__name__}:skrl_ppo_residual_cargo_observable_cfg.yaml"
+        ),
+    },
+)

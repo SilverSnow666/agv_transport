@@ -26,6 +26,9 @@ class AgvLevelResidualEnvCfg(AgvLevelCarryLiftVisualEnvCfg):
     # disturbance and controls three bounded Lift residuals.
     residual_scripted_speed = 0.10
     residual_height_limit = 0.003
+    # Backward-compatible observation semantics. Versioned Cargo-aware tasks
+    # replace current Cargo XY with displacement from the randomized reset pose.
+    residual_observe_cargo_slip_from_reset = False
 
     # Independent per-environment reset randomization. The visual terrain mesh
     # is disabled because one cloned mesh cannot represent different analytical

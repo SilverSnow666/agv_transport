@@ -41,11 +41,17 @@ class ResidualCargoTradeoffTests(unittest.TestCase):
             / "source/agv_transport/agv_transport/tasks/direct/agv_transport"
             / "agv_level_residual_env.py"
         ).read_text(encoding="utf-8")
-        observation_body = source.split("def _get_observations", 1)[1].split(
-            "# Stability reward and termination", 1
+        helper = source.split("def _cargo_xy_observation", 1)[1].split(
+            "def _get_observations", 1
         )[0]
-        self.assertIn("cargo_relative_position[:, 0:2]", observation_body)
-        self.assertNotIn("cargo_initial_relative_xy", observation_body)
+        self.assertIn("cargo_relative_position[:, 0:2]", helper)
+        self.assertIn("cargo_initial_relative_xy", helper)
+        base_cfg = (
+            ROOT
+            / "source/agv_transport/agv_transport/tasks/direct/agv_transport"
+            / "agv_level_residual_env_cfg.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("residual_observe_cargo_slip_from_reset = False", base_cfg)
 
     def test_pearson_handles_linear_and_constant_inputs(self):
         self.assertAlmostEqual(self.module._pearson([1, 2, 3], [2, 4, 6]), 1.0)
