@@ -41,34 +41,50 @@ ideal actuator model, but unlike the old pose-written kinematic plates it
 transmits tangential motion through PhysX friction. No Board velocity, pose or
 attitude is overwritten.
 
+The contact-validation task also replaces the controller-development task's
+historical `0.28 x 0.28 m` Lift proxy with a `0.18 x 0.16 x 0.015 m` contact
+pad matching the configured visible Lift head. Its static/dynamic friction is
+`0.80 / 0.65`. This removes the hidden oversized platform that previously let
+the Board bridge widely tilted supports. There is no ball joint, fixed joint,
+attachment, suction or other Board constraint: gravity, collision and friction
+are the complete mechanical coupling between each Lift and the Board.
+
+Because each Lift head is mechanically mounted to an AGV in the real system,
+the contact task uses a stiff bounded velocity servo between the prescribed AGV
+pose and its Lift rigid body. This is an AGV-to-Lift actuator model, not a
+Lift-to-Board constraint. It reduced the normal-run mean AGV/Lift attitude
+tracking error to about `0.65 deg` without preventing Board tip or support loss.
+
 ## Verification runs
 
 ### Contact-only transport
 
 ```bat
 python scripts\leveling_physics_contact_demo.py ^
-  --duration 3 ^
+  --duration 5 ^
   --settle_duration 1 ^
   --target_speed 0.10 ^
-  --terrain_amplitude 0.030 ^
+  --terrain_amplitude 0.050 ^
   --controller geometric_feedback ^
-  --log_path logs\v7_physics_contact\dynamic_transport_3s.csv ^
+  --log_path logs\v7_physics_contact\final_feedback_5s.csv ^
   --headless
 ```
 
 Result:
 
-| Metric | Result |
-|---|---:|
-| Initial settled Lift contacts | 3 |
-| Minimum real Lift contacts | 3 |
-| Board forward displacement | 0.3008 m |
-| Expected carrier displacement | about 0.300 m |
-| Maximum Board roll/pitch magnitude | 0.2237 deg |
-| Virtual carry/stabilization active | never |
+| Metric | Neutral | Geometric + feedback |
+|---|---:|---:|
+| Roll RMS | 0.45 deg | 0.14 deg |
+| Pitch RMS | 0.44 deg | 0.10 deg |
+| Maximum Board roll/pitch magnitude | 0.68 deg | 0.23 deg |
+| Minimum real Lift contacts | 3 | 3 |
+| Board forward displacement | 0.497 m | 0.497 m |
+| Mean AGV/Lift attitude tracking error | 0.67 deg | 0.65 deg |
+| Virtual carry/stabilization active | never | never |
 
 This confirms that the moving support plates carry the Board through actual
-contact friction rather than the virtual velocity rewrite.
+contact friction rather than the virtual velocity rewrite. It also produces a
+clear same-plant distinction between fixed-height and active-leveling modes.
 
 ### Front support departure
 
@@ -83,9 +99,9 @@ python scripts\leveling_physics_contact_demo.py ^
   --settle_duration 1 ^
   --target_speed 0 ^
   --terrain_amplitude 0.050 ^
-  --controller geometric_feedback ^
+  --controller neutral ^
   --force_front_support_loss_at 2 ^
-  --log_path logs\v7_physics_contact\dynamic_support_loss_7s.csv ^
+  --log_path logs\v7_physics_contact\matched_pad_support_loss_7s.csv ^
   --headless
 ```
 
@@ -93,14 +109,14 @@ Result:
 
 | Metric | Before loss | After loss |
 |---|---:|---:|
-| Real Lift contacts | 3 | 2 |
-| Board pitch | about 0.23 deg | 7.74 deg final |
-| Maximum Board tilt | - | 7.78 deg |
-| Maximum Cargo relative XY displacement | - | 0.057 mm |
+| Real Lift contacts | 3 | 1 |
+| Board pitch | about 0.34 deg | 12.26 deg final |
+| Maximum Board tilt | - | 12.45 deg |
+| Maximum Cargo relative XY displacement | - | about 1.5 mm |
 
 The Board tips forward until its front edge reaches the flat ground plane. The
 Cargo does not slide appreciably because the configured static friction is
-0.80 and a 7.7 degree slope is well below its static-friction angle. This is an
+0.80 and a 12.3 degree slope is below its static-friction angle. This is an
 expected physical outcome, not hidden stabilization.
 
 ## Visual commands
@@ -114,6 +130,18 @@ python scripts\leveling_physics_contact_demo.py --duration 20 --target_speed 0.1
 `neutral` is the visual default so terrain-induced Board motion is easy to
 see. Use `--controller geometric_feedback` to enable the active leveling
 controller in the same contact-only plant.
+
+To reveal the real collision pads and compare their orientation with the
+visible Lift heads and AGVs:
+
+```bat
+python scripts\leveling_physics_contact_demo.py --duration 20 --controller neutral --show_lift_collision_proxies --real_time
+```
+
+The CSV records the actual simulated roll/pitch of all three AGVs and all
+three Lift rigid bodies. This makes it possible to verify numerically that the
+collision pads tilt with the carriers; the debug boxes are not visual-only
+decorations.
 
 Visible support-loss demonstration:
 

@@ -52,9 +52,16 @@ class PhysicsContactConfigTest(unittest.TestCase):
         self.assertFalse(assignments["residual_terminate_on_failure"])
         self.assertFalse(assignments["residual_require_geometric_feedback"])
         self.assertEqual(assignments["lift_drive_mode"], "dynamic_velocity")
+        self.assertEqual(assignments["lift_plate_size"], (0.18, 0.16, 0.015))
+        self.assertEqual(assignments["lift_dynamic_position_kp"], 160.0)
+        self.assertEqual(assignments["lift_dynamic_angular_kp"], 240.0)
+        self.assertEqual(assignments["lift_dynamic_max_angular_speed"], 30.0)
         source = CFG.read_text(encoding="utf-8")
         self.assertIn("activate_contact_sensors=True", source)
         self.assertEqual(source.count("kinematic_enabled=False"), 1)
+        self.assertEqual(source.count("size=lift_plate_size"), 3)
+        self.assertIn("static_friction=0.80", source)
+        self.assertIn("dynamic_friction=0.65", source)
         self.assertIn("lift1_cfg = _BASE_CFG.lift1_cfg.replace", source)
         self.assertIn("lift2_cfg = _BASE_CFG.lift2_cfg.replace", source)
         self.assertIn("lift3_cfg = _BASE_CFG.lift3_cfg.replace", source)
@@ -84,6 +91,13 @@ class PhysicsContactConfigTest(unittest.TestCase):
             source,
         )
         self.assertNotIn("cfg.visual_terrain_ground_z = 0.0", source)
+        self.assertIn("--show_lift_collision_proxies", source)
+        self.assertIn(
+            "cfg.debug_show_lift_collision_proxies = args_cli.show_lift_collision_proxies",
+            source,
+        )
+        self.assertIn('"agv1_roll_deg"', source)
+        self.assertIn('"lift1_roll_deg"', source)
 
 
 if __name__ == "__main__":

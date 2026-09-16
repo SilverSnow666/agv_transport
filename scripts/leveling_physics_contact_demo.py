@@ -52,6 +52,14 @@ parser.add_argument(
     action="store_true",
     help="Pace the simulation near wall-clock time for visual inspection.",
 )
+parser.add_argument(
+    "--show_lift_collision_proxies",
+    action="store_true",
+    help=(
+        "Show the actual Lift collision boxes. Their pose should follow the "
+        "visible Lift heads and AGV terrain attitude."
+    ),
+)
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -107,9 +115,30 @@ CSV_FIELDS = (
     "lift1_height_m",
     "lift2_height_m",
     "lift3_height_m",
+    "agv1_roll_deg",
+    "agv1_pitch_deg",
+    "agv2_roll_deg",
+    "agv2_pitch_deg",
+    "agv3_roll_deg",
+    "agv3_pitch_deg",
+    "lift1_roll_deg",
+    "lift1_pitch_deg",
+    "lift2_roll_deg",
+    "lift2_pitch_deg",
+    "lift3_roll_deg",
+    "lift3_pitch_deg",
     "virtual_carry_active",
     "virtual_stabilization_active",
 )
+
+
+def _quat_to_roll_pitch_deg(quat: torch.Tensor) -> tuple[float, float]:
+    """Convert one Isaac Lab wxyz quaternion to roll/pitch in degrees."""
+    w, x, y, z = (float(value) for value in quat)
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    pitch = math.asin(sin_pitch)
+    return math.degrees(roll), math.degrees(pitch)
 
 
 def _validate_args() -> None:
@@ -151,6 +180,7 @@ def _make_env():
     cfg.enable_visual_terrain_mesh = True
     cfg.visual_terrain_height_scale = 1.0
     cfg.visual_terrain_z_offset = 0.0
+    cfg.debug_show_lift_collision_proxies = args_cli.show_lift_collision_proxies
     # The visual mesh is generated before reset from the scalar cfg fields,
     # while the per-environment terrain uses the deterministic randomization
     # ranges below. Keep both descriptions identical.
@@ -188,6 +218,8 @@ def _assert_isolation(raw) -> None:
         raise RuntimeError("Physical mode requires the real Payload contact sensor")
     if str(raw.cfg.lift_drive_mode) != "dynamic_velocity":
         raise RuntimeError("Physical mode requires dynamic velocity-driven Lift plates")
+    if tuple(float(value) for value in raw.cfg.lift_plate_size) != (0.18, 0.16, 0.015):
+        raise RuntimeError("Physical mode must match Lift collision pads to visible heads")
 
 
 def _row(raw, elapsed: float, forced: bool) -> dict[str, float]:
@@ -201,6 +233,12 @@ def _row(raw, elapsed: float, forced: bool) -> dict[str, float]:
         *raw._compute_move_frame(raw.payload.data.root_pos_w[:, :2], raw._get_target_xy()),
     )
     analytical_count = raw._compute_support_contact_flags(analytical_targets)[0].sum()
+    agv_attitudes = [
+        _quat_to_roll_pitch_deg(agv.data.root_state_w[0, 3:7]) for agv in raw.agvs
+    ]
+    lift_attitudes = [
+        _quat_to_roll_pitch_deg(lift.data.root_state_w[0, 3:7]) for lift in raw.lifts
+    ]
     return {
         "time_s": elapsed,
         "front_support_forced_lost": float(forced),
@@ -228,6 +266,18 @@ def _row(raw, elapsed: float, forced: bool) -> dict[str, float]:
         "lift1_height_m": float(raw.lift_height[0, 0]),
         "lift2_height_m": float(raw.lift_height[0, 1]),
         "lift3_height_m": float(raw.lift_height[0, 2]),
+        "agv1_roll_deg": agv_attitudes[0][0],
+        "agv1_pitch_deg": agv_attitudes[0][1],
+        "agv2_roll_deg": agv_attitudes[1][0],
+        "agv2_pitch_deg": agv_attitudes[1][1],
+        "agv3_roll_deg": agv_attitudes[2][0],
+        "agv3_pitch_deg": agv_attitudes[2][1],
+        "lift1_roll_deg": lift_attitudes[0][0],
+        "lift1_pitch_deg": lift_attitudes[0][1],
+        "lift2_roll_deg": lift_attitudes[1][0],
+        "lift2_pitch_deg": lift_attitudes[1][1],
+        "lift3_roll_deg": lift_attitudes[2][0],
+        "lift3_pitch_deg": lift_attitudes[2][1],
         "virtual_carry_active": float(raw.last_virtual_carry_active[0]),
         "virtual_stabilization_active": float(raw.last_virtual_stabilization_active[0]),
     }
@@ -250,6 +300,10 @@ def main() -> None:
         f"controller={args_cli.controller}, speed={args_cli.target_speed:.3f} m/s, "
         f"terrain={1000.0 * args_cli.terrain_amplitude:.1f} mm, "
         f"fallback ground z={raw.cfg.visual_terrain_ground_z:.3f} m"
+    )
+    print(
+        "[GEOMETRY] free-contact Lift pads=180 x 160 x 15 mm, matched to visible heads; "
+        "Board joints/attachments=NONE"
     )
     elapsed = 0.0
     next_report = 0.0

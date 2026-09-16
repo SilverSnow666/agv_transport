@@ -21,6 +21,12 @@ _BASE_CFG = AgvLevelResidualCargoObservableEnvCfg()
 class AgvLevelPhysicsContactEnvCfg(AgvLevelResidualCargoObservableEnvCfg):
     """H2 geometry/controller with contact-only Payload and Cargo dynamics."""
 
+    # Keep the physical contact patch aligned with the visible Lift head.  The
+    # inherited 280 x 280 mm proxy was deliberately generous for controller
+    # development, but it makes a free Board unrealistically bridge three wide
+    # platforms.  This override is isolated to the contact-validation task.
+    lift_plate_size = (0.18, 0.16, 0.015)
+
     enable_virtual_friction_carry = False
     virtual_friction_coupling = 0.0
     slip_correction_gain = 0.0
@@ -37,6 +43,14 @@ class AgvLevelPhysicsContactEnvCfg(AgvLevelResidualCargoObservableEnvCfg):
     residual_require_geometric_feedback = False
     episode_length_s = 120.0
     lift_drive_mode = "dynamic_velocity"
+    # The support head is mechanically part of its AGV/Lift actuator, not a
+    # free 5 kg plate. Use a stiff bounded servo so Board contact cannot rotate
+    # it independently of the prescribed carrier attitude. This constraint is
+    # only between AGV and Lift; the Board remains completely unattached.
+    lift_dynamic_position_kp = 160.0
+    lift_dynamic_angular_kp = 240.0
+    lift_dynamic_max_linear_speed = 2.0
+    lift_dynamic_max_angular_speed = 30.0
 
     # ContactSensor requires PhysxContactReportAPI on the sensor body. Copy the
     # versioned thin-Board config so the H2 task remains untouched.
@@ -51,14 +65,31 @@ class AgvLevelPhysicsContactEnvCfg(AgvLevelResidualCargoObservableEnvCfg):
         kinematic_enabled=False,
         disable_gravity=True,
         solver_position_iteration_count=8,
-        solver_velocity_iteration_count=2,
+        solver_velocity_iteration_count=4,
+    )
+    _contact_lift_material = sim_utils.RigidBodyMaterialCfg(
+        static_friction=0.80,
+        dynamic_friction=0.65,
+        restitution=0.0,
     )
     lift1_cfg = _BASE_CFG.lift1_cfg.replace(
-        spawn=_BASE_CFG.lift1_cfg.spawn.replace(rigid_props=_dynamic_lift_props)
+        spawn=_BASE_CFG.lift1_cfg.spawn.replace(
+            size=lift_plate_size,
+            rigid_props=_dynamic_lift_props,
+            physics_material=_contact_lift_material,
+        )
     )
     lift2_cfg = _BASE_CFG.lift2_cfg.replace(
-        spawn=_BASE_CFG.lift2_cfg.spawn.replace(rigid_props=_dynamic_lift_props)
+        spawn=_BASE_CFG.lift2_cfg.spawn.replace(
+            size=lift_plate_size,
+            rigid_props=_dynamic_lift_props,
+            physics_material=_contact_lift_material,
+        )
     )
     lift3_cfg = _BASE_CFG.lift3_cfg.replace(
-        spawn=_BASE_CFG.lift3_cfg.spawn.replace(rigid_props=_dynamic_lift_props)
+        spawn=_BASE_CFG.lift3_cfg.spawn.replace(
+            size=lift_plate_size,
+            rigid_props=_dynamic_lift_props,
+            physics_material=_contact_lift_material,
+        )
     )
